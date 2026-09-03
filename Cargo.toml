@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/w9pt", "crates/w9pt-storage"]
+resolver = "3"

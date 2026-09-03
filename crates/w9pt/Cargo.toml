@@ -1,0 +1,25 @@
+[package]
+name = "w9pt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Runtime-free Sans-I/O server core for stock 9P2000.L"
+license = "Apache-2.0"
+readme = "../../README.md"
+keywords = ["9p", "filesystem", "sans-io"]
+categories = ["filesystem", "network-programming"]
+
+[dependencies]
+
+# The core intentionally has no normal dependencies. Runtime, transport, object-store,
+# filesystem-adapter, clock, and native-errno crates belong in host/backend crates.
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+struct_excessive_bools = "allow"
