@@ -2,11 +2,11 @@
 
 An embeddable 9P filesystem framework for pluggable storage backends.
 
-`w9pt` translates stock `9P2000.L` requests into owned, backend-neutral filesystem and policy effects. `w9pt-storage` prepares immutable file content for caller-provided object stores; a future filesystem metadata layer will publish those references with inode and namespace state.
+`w9pt` translates stock `9P2000.L` requests into owned, backend-neutral filesystem and policy effects. `w9pt-storage` prepares immutable file content for caller-provided object stores, and `w9pt-fs-state` defines the authoritative metadata, transaction, mutation-replay, lease, fencing, and cache-invalidation contract that publishes those references with inode and namespace state.
 
 ## Status
 
-The Sans-I/O core implements framing, negotiation, the declared base/Linux operation matrix, tags, fids, out-of-order completions, cancellation, explicit shutdown, capabilities, and stable Linux errno replies. The storage crate implements bounded `raw` and sparse 32 KiB `block-split` content layouts over a runtime-neutral target contract. Transport, target SDK, and authoritative filesystem-metadata adapters remain separate future crates.
+The Sans-I/O core implements framing, negotiation, the declared base/Linux operation matrix, tags, fids, out-of-order completions, cancellation, explicit shutdown, capabilities, and stable Linux errno replies. The storage crate implements bounded `raw` and sparse 32 KiB `block-split` content layouts over a runtime-neutral target contract. The state crate provides checked portable records, bounded consistent reads, declarative serializable commits, deterministic memory authority, and reusable adapter conformance. Transport, target SDK, filesystem semantic-engine integration, durable session state, and production SQLite/PostgreSQL/etcd/SlateDB adapters remain future work.
 
 ## Goals
 

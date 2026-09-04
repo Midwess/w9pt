@@ -1,0 +1,23 @@
+[package]
+name = "w9pt-fs-state"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Authoritative filesystem state contract for w9pt"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["9p", "filesystem", "database", "distributed"]
+categories = ["filesystem", "database"]
+
+[dependencies]
+w9pt-storage = { path = "../w9pt-storage" }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+struct_excessive_bools = "allow"

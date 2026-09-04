@@ -75,6 +75,13 @@ name = "w9pt"
 version = "0.1.0"
 
 [[package]]
+name = "w9pt-fs-state"
+version = "0.1.0"
+dependencies = [
+ "w9pt-storage",
+]
+
+[[package]]
 name = "w9pt-storage"
 version = "0.1.0"
 dependencies = [
