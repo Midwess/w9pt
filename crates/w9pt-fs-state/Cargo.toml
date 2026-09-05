@@ -1,8 +1,9 @@
 [package]
 name = "w9pt-fs-state"
-version = "0.1.0"
+version = "0.1.0-dev"
+publish = false
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94.1"
 description = "Authoritative filesystem state contract for w9pt"
 license = "Apache-2.0"
 readme = "README.md"
@@ -10,7 +11,7 @@ keywords = ["9p", "filesystem", "database", "distributed"]
 categories = ["filesystem", "database"]
 
 [dependencies]
-w9pt-storage = { path = "../w9pt-storage" }
+w9pt-fs-storage = { path = "../w9pt-fs-storage" }
 
 [lints.rust]
 missing_docs = "warn"

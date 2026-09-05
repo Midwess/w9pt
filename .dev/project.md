@@ -4,7 +4,22 @@
 
 - Name: `w9pt`
 - License: Apache-2.0
-- Stage: research, architecture, and initial Rust crate scaffold
+- Stage: active unreleased development; APIs and persisted formats are not compatibility-stable
+
+## Development Compatibility Policy
+
+- No released version or supported persistent deployment exists yet.
+- Rust APIs, crate names, configuration, database schemas, private object keys,
+  fingerprints, and persistent encodings may be changed in place.
+- Do not add legacy aliases, dual readers/writers, old-schema detection/import,
+  compatibility shims, deprecation periods, or migration paths for development
+  builds.
+- After an incompatible change, rebuild dependents and recreate development
+  databases and private object prefixes from empty state.
+- Version tags, checksums, and migration ledgers validate the current build's
+  data; they do not promise acceptance of data written by earlier builds.
+- Backward compatibility begins only after an explicit release proposal defines
+  the supported API and persistent-format baseline.
 
 ## Purpose
 
@@ -88,19 +103,14 @@ Rules:
 9. The core must not depend on Tokio, async-std, smol, a WebSocket implementation, or an S3 SDK.
 10. Time, randomness, authentication decisions, and cancellation outcomes enter as caller-supplied values/events.
 
-## Initial S3 direction
+## S3 direction
 
-The S3 backend is expected to use:
-
-- an opaque private prefix;
-- immutable packed data segments;
-- fixed-size logical extents and copy-on-write updates;
-- stable inode/directory metadata separate from S3 key names;
-- an object-backed transactional metadata structure or explicitly selected metadata service;
-- ranged reads, bounded local caches, and read coalescing;
-- conditional writes for immutable creation/publication/fencing;
-- data-before-metadata flush ordering;
-- crash-safe garbage collection and compaction.
+The first concrete target adapter uses an opaque private prefix, immutable raw
+or sparse 32 KiB block-split content objects, exact range reads, and conditional
+single-key writes. Stable inode/directory metadata and current `ContentRef`
+publication remain in the authoritative state store rather than S3 keys.
+Packing, bounded caches, read coalescing, garbage collection, and compaction are
+future optimization/maintenance proposals.
 
 Direct external mutation of the private S3 prefix is out of scope. Import/export interoperability can be layered separately.
 
@@ -136,21 +146,73 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
 
 ### Filesystem state store contract (`add-filesystem-state-store`, 2026-09-02)
 
-- The authoritative filesystem-state boundary belongs in a new `w9pt-fs-state` crate that depends on portable `w9pt-storage` content values but not on `w9pt` protocol/session types.
+- The authoritative filesystem-state boundary belongs in `w9pt-fs-state`, which depends on portable `w9pt-fs-storage` content values but not on `w9pt` protocol/session types.
 - The public store interface uses consistent bounded reads plus one typed declarative serializable commit rather than generic KV operations or a database transaction callback.
 - Authoritative records cover stable inodes and namespace entries, persistent directory cookies, content roots, opens, open-unlinked pins, orphans, locks, xattrs, mutation results, leases, and fencing.
-- Mutation replay checks the durable result ledger before current-fence validation, returning an exact recorded result only for an identical fingerprint and client incarnation.
+- Mutation replay checks the durable result ledger before adapter-limit/current-fence validation and uses the finalized mutation ID, fingerprint, client incarnation, and retention identity to return the exact recorded result.
 - Writer topology is explicit: future PostgreSQL-style adapters may support serializable multi-writer commits, while SQLite- or SlateDB-style adapters may use one fenced writer without weakening atomicity or durability semantics.
 - Clocks, IDs, runtimes, clients, and adapter schemas remain explicit caller/adapter dependencies. No SDK, executor, SQL schema, or target layout belongs in the contract crate.
-- The first implementation includes a deterministic memory authority and reusable conformance suite; SQLite, PostgreSQL, etcd, SlateDB, the filesystem engine, and durable session state remain separate proposals.
+- The first implementation includes a deterministic memory authority and reusable conformance suite; the PostgreSQL adapter is implemented separately, while SQLite, etcd, SlateDB, the filesystem engine, and durable session state remain future proposals.
 
-### PostgreSQL state adapter (`add-postgres-state-adapter`, 2026-09-03)
+### PostgreSQL state adapter (`add-postgres-state-adapter`; SeaORM/public code-first revisions 2026-09-05)
 
-- The first clustered adapter is `w9pt-fs-state-postgres`, implementing the finalized state-store contract over a caller-owned SQLx `PgPool` and advertising serializable multi-writer topology.
-- Implementation is blocked until `add-filesystem-state-store` is approved and complete; adapter schema must follow the finalized public records and conformance API.
-- Use SQLx exactly `0.8.6` with default features disabled because the workspace remains on Rust 1.85 and current SQLx 0.9 requires Rust 1.86.
-- Support PostgreSQL 15–18 current minors, primary-only authoritative transactions, a fixed fully qualified schema, explicit embedded migrations, and checked full-range unsigned numeric conversion.
-- Read batches use one primary `SERIALIZABLE READ ONLY` snapshot; state commits use ledger-first short `SERIALIZABLE READ WRITE` transactions and deterministic semantic record locking.
+- The first clustered adapter is `w9pt-fs-state-postgres`, implementing the finalized state-store contract over a caller-owned SeaORM `DatabaseConnection` and advertising serializable multi-writer topology.
+- Callers construct connections and own DSNs, credentials, TLS, pool sizing, routing, and Tokio lifecycle; the adapter rejects disconnected or non-PostgreSQL connections.
+- Pin SeaORM exactly `1.1.20` with default features disabled and `sqlx-postgres` plus `runtime-tokio`; this originally preserved Rust 1.85 and remains compatible after the explicitly approved workspace move to Rust 1.94.1. The adapter has no direct SQLx dependency, imports, types, or test APIs, while SeaORM's PostgreSQL backend remains transitively SQLx 0.8-backed.
+- Support PostgreSQL 15–18 current minors, primary-only authoritative transactions, fixed fully qualified `public.w9pt_fs_state_*` relations, CLI-scaffolded code-first migrations, and checked full-range unsigned numeric conversion.
+- A private per-filesystem authority head owns the revision-one empty baseline and revision allocation independently of the optional public `FilesystemRecord`, allowing lease acquisition before filesystem bootstrap.
+- Read batches use one SeaORM `SERIALIZABLE READ ONLY` transaction and every finalized keyset cursor; state commits use a short primary serializable fixed-size ledger probe before adapter preflight, then ledger-first short `SERIALIZABLE READ WRITE` transactions and deterministic semantic record locking.
 - A failed `COMMIT` response is potentially committed and is resolved only by bounded retry of the identical mutation through the authoritative result ledger.
-- PostgreSQL database time owns lease expiry, while permanently retained monotonically increasing fencing tokens provide safety.
-- Version 1 stores normalized filesystem state and inode `ContentRef` fields only. Per-block PostgreSQL mappings, file payloads, session state, replica reads, synchronous-standby durability, and deployment automation remain separate proposals.
+- Version-1 lease ticks are exact Unix-epoch microseconds stored as `NUMERIC(20,0)`; production time is captured once from PostgreSQL per transaction, deterministic conformance uses a test-only database clock row, and permanently retained fencing tokens provide safety.
+- Change polling returns the finalized `ChangePollOutcome` variants and `ChangeBatch::{next,current_revision}` semantics without an adapter-specific `has_more` field.
+- Exact SeaORM CLI 1.1.20 supplied database-introspection evidence and the initial `MigrationTrait` scaffold. SeaQuery builders define tables, columns, keys, and indexes; reviewed PostgreSQL DDL retains named checks and deferred foreign keys that SeaQuery 0.32 cannot model.
+- Explicit migrations validate a bounded custom source-checksum ledger and invoke code-first migrations inside one bounded `READ COMMITTED READ WRITE` SeaORM transaction protected by the fixed `pg_advisory_xact_lock`; schema changes and the migration ledger commit or roll back together regardless of caller session defaults.
+- Earlier development SQL layouts are unsupported and have no detection, import,
+  relocation, upgrade, or dual-schema behavior.
+- Adapter conformance runs through independently constructed SeaORM connections and is required on PostgreSQL 15, 16, 17, and 18.
+- The current unreleased version-1 schema has 16 prefixed tables, 130 columns,
+  172 constraints, and 23 indexes. It may be replaced directly during
+  development; checksum drift fails closed and requires an operator-driven reset,
+  with no compatibility migration. Per-block PostgreSQL mappings, file payloads,
+  session state, replica reads, synchronous-standby durability, and deployment
+  automation remain separate proposals.
+
+### S3 target adapter (`add-s3-target-store`, 2026-09-05)
+
+- `w9pt-fs-storage-s3` implements the backend-neutral `TargetStore` over a
+  caller-created AWS SDK S3 client; no AWS, Tokio, HTTP, TLS, credential, or S3
+  dependency enters the protocol, semantic, state, or content-layout crates.
+- The security-gate decision raised the workspace MSRV to Rust 1.94.1 and pins
+  `aws-sdk-s3` exactly at 1.145.0 with the current default HTTPS client and
+  retry-disabled conditional mutations.
+- The supported writable profile is an Amazon S3 general-purpose bucket.
+  Compatible providers fail closed until their exact deployment passes the full
+  qualification suite.
+- Construction produces an unqualified target with no writable guarantees; two
+  independently configured clients must pass the checked live target and
+  concurrency probes before `TargetGuarantees::REQUIRED` is advertised.
+- Complete reads use HEAD plus `GET If-Match`; ranges require exact `206` and
+  `Content-Range`; ETags are bounded opaque concurrency tokens rather than
+  content hashes.
+- Immutable and mutable conditional writes preserve response-loss ambiguity for
+  exact upper-layer readback. Clustered filesystem metadata remains the sole
+  publisher of current `ContentRef`.
+- The host owns credentials, region, endpoint/addressing, verified TLS/SigV4,
+  Tokio runtime, bucket provisioning, IAM, lifecycle, versioning, cost, and
+  deployment policy.
+
+### SeaweedFS repository integration (`add-seaweedfs-storage-integration-tests`, 2026-09-06)
+
+- The digest-pinned SeaweedFS 4.42 Compose job builds two independent S3
+  clients, runs target behavior probes, then creates a private external-test
+  guarantee wrapper solely for `ContentRepository` composition.
+- The live matrix covers Raw and bounded four-logical-block BlockSplit
+  lifecycles, sparse/zero blocks, boundary reads and writes, truncate/
+  re-extension, immutable reuse, independent reopen, abandoned preparations,
+  discarded publication results, and stale-CAS/reprepare ordering.
+- Ordinary SeaweedFS targets remain unqualified with `TargetGuarantees::NONE`,
+  and the compatible-provider profile remains explicitly unsupported.
+- Results are behavioral evidence only. The single-node tmpfs job makes no
+  durability, restart, response-loss, multi-node, TLS/SigV4, lifecycle, or
+  production-support claim; deterministic SDK replay remains authoritative for
+  transport ambiguity.

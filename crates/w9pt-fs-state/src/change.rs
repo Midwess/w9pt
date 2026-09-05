@@ -12,7 +12,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ChangeOrigin {
     /// Serializable filesystem mutation and its durable result-ledger identity.
-    Mutation(w9pt_storage::MutationId),
+    Mutation(w9pt_fs_storage::MutationId),
     /// Idempotent writer-lease operation.
     Lease(LeaseOperationId),
 }
@@ -397,7 +397,7 @@ mod tests {
         let event = ChangeEvent::new(
             filesystem_id,
             StateRevision::new(2).unwrap(),
-            ChangeOrigin::Mutation(w9pt_storage::MutationId::from_u128(4)),
+            ChangeOrigin::Mutation(w9pt_fs_storage::MutationId::from_u128(4)),
             vec![RecordKey::Inode(
                 filesystem_id,
                 crate::InodeId::from_u128(3),
@@ -429,7 +429,7 @@ mod tests {
         let event = ChangeEvent::new(
             second,
             StateRevision::new(2).unwrap(),
-            ChangeOrigin::Mutation(w9pt_storage::MutationId::from_u128(3)),
+            ChangeOrigin::Mutation(w9pt_fs_storage::MutationId::from_u128(3)),
             vec![RecordKey::Inode(second, crate::InodeId::from_u128(4))],
             limits,
         )
@@ -454,7 +454,7 @@ mod tests {
         let loose_event = ChangeEvent::new(
             first,
             StateRevision::new(2).unwrap(),
-            ChangeOrigin::Mutation(w9pt_storage::MutationId::from_u128(5)),
+            ChangeOrigin::Mutation(w9pt_fs_storage::MutationId::from_u128(5)),
             vec![RecordKey::DirectoryEntry(
                 first,
                 crate::InodeId::from_u128(6),
@@ -480,7 +480,7 @@ mod tests {
             ChangeEvent::new(
                 first,
                 StateRevision::new(2).unwrap(),
-                ChangeOrigin::Mutation(w9pt_storage::MutationId::from_u128(7)),
+                ChangeOrigin::Mutation(w9pt_fs_storage::MutationId::from_u128(7)),
                 vec![RecordKey::DirectoryEntry(
                     first,
                     crate::InodeId::from_u128(8),

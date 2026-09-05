@@ -467,11 +467,11 @@ impl Session {
                 self.config.limits.max_in_flight_tags,
                 LimitKind::InFlightTags,
             )?;
-            if needs_cancel {
-                if let Err(error) = self.queue_effect(Effect::Cancel { operation_id, kind }) {
-                    Accounting::release(&mut self.accounting.in_flight_tags, 1);
-                    return Err(error);
-                }
+            if needs_cancel
+                && let Err(error) = self.queue_effect(Effect::Cancel { operation_id, kind })
+            {
+                Accounting::release(&mut self.accounting.in_flight_tags, 1);
+                return Err(error);
             }
             let target = self
                 .pending_by_tag

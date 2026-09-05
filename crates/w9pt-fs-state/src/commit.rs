@@ -8,11 +8,11 @@ use core::{fmt, num::NonZeroU64};
 use std::collections::BTreeSet;
 
 use crate::{
-    ClientIncarnationId, DataGeneration, DirectoryGeneration, FilesystemId, InodeGeneration,
-    InodeId, InodeKind, InodeRecord, InodeTimes, LockId, MutationRecord, MutationResult,
-    MutationRetention, RecordFamily, RecordKey, RecordRevision, RecordValidationError,
-    RequestFingerprint, StateLimitError, StateLimitKind, StateLimits, StateRecord, StateRevision,
-    WriterFence,
+    ClientIncarnationId, DataGeneration, DirectoryGeneration, FilesystemId, GroupId,
+    InodeGeneration, InodeId, InodeKind, InodeRecord, InodeTimes, LockId, MutationRecord,
+    MutationResult, MutationRetention, PrincipalId, RecordFamily, RecordKey, RecordRevision,
+    RecordValidationError, RequestFingerprint, StateLimitError, StateLimitKind, StateLimits,
+    StateRecord, StateRevision, UnixTimestamp, WriterFence,
 };
 
 /// Normative phases of every commit implementation.
@@ -52,7 +52,7 @@ pub const COMMIT_PROTOCOL_ORDER: [CommitProtocolPhase; 8] = [
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationContext {
     /// Globally stable mutation identity.
-    pub mutation_id: w9pt_storage::MutationId,
+    pub mutation_id: w9pt_fs_storage::MutationId,
     /// Fingerprint of the complete semantic request.
     pub fingerprint: RequestFingerprint,
     /// Stable client/session lineage.
@@ -64,7 +64,7 @@ pub struct MutationContext {
 impl MutationContext {
     /// Creates the complete durable identity of one semantic mutation request.
     pub const fn new(
-        mutation_id: w9pt_storage::MutationId,
+        mutation_id: w9pt_fs_storage::MutationId,
         fingerprint: RequestFingerprint,
         client_incarnation: ClientIncarnationId,
         retention: MutationRetention,
@@ -133,7 +133,7 @@ pub enum Precondition {
         /// Stable regular-file inode.
         inode_id: InodeId,
         /// Observed content identity or distinguished new-file base.
-        expected: w9pt_storage::BaseContentIdentity,
+        expected: w9pt_fs_storage::BaseContentIdentity,
     },
     /// Inode hard-link count must match exactly.
     LinkCount {
@@ -147,6 +147,11 @@ pub enum Precondition {
         /// Stable inode identity.
         inode_id: InodeId,
         /// Observed open-pin count.
+        expected: u64,
+    },
+    /// Filesystem export/policy generation must match the authorization decision.
+    FilesystemPolicyGeneration {
+        /// Observed nonzero policy generation.
         expected: u64,
     },
     /// Current active writer authority must match exactly.
@@ -198,23 +203,79 @@ impl CounterAdjustment {
     }
 }
 
+/// Selected inode fields applied atomically with immutable content publication.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InodeAttributeUpdate {
+    /// Replacement permission and special mode bits when selected.
+    pub mode: Option<u32>,
+    /// Replacement canonical owner when selected.
+    pub owner: Option<PrincipalId>,
+    /// Replacement canonical group when selected.
+    pub group: Option<GroupId>,
+    /// Replacement access timestamp when selected.
+    pub accessed: Option<UnixTimestamp>,
+    /// Replacement modification timestamp when selected.
+    pub modified: Option<UnixTimestamp>,
+    /// Replacement metadata-change timestamp when selected.
+    pub changed: Option<UnixTimestamp>,
+    /// Replacement creation timestamp when selected.
+    pub created: Option<UnixTimestamp>,
+}
+
+impl InodeAttributeUpdate {
+    /// Selects every timestamp from one complete checked timestamp set.
+    pub const fn all_times(times: InodeTimes) -> Self {
+        Self {
+            mode: None,
+            owner: None,
+            group: None,
+            accessed: Some(times.accessed),
+            modified: Some(times.modified),
+            changed: Some(times.changed),
+            created: Some(times.created),
+        }
+    }
+
+    /// Applies selected timestamps while preserving every unselected value.
+    pub const fn apply_times(&self, current: InodeTimes) -> InodeTimes {
+        InodeTimes {
+            accessed: match self.accessed {
+                Some(value) => value,
+                None => current.accessed,
+            },
+            modified: match self.modified {
+                Some(value) => value,
+                None => current.modified,
+            },
+            changed: match self.changed {
+                Some(value) => value,
+                None => current.changed,
+            },
+            created: match self.created {
+                Some(value) => value,
+                None => current.created,
+            },
+        }
+    }
+}
+
 /// Dedicated handoff from immutable content preparation to inode publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishContent {
     /// Stable regular-file inode receiving the prepared version.
     pub inode_id: InodeId,
     /// Exact authoritative base against which preparation was performed.
-    pub expected_base: w9pt_storage::BaseContentIdentity,
+    pub expected_base: w9pt_fs_storage::BaseContentIdentity,
     /// Proof and portable reference returned after immutable dependencies were stored.
-    pub prepared: w9pt_storage::PreparedContent,
+    pub prepared: w9pt_fs_storage::PreparedContent,
     /// Logical size published into the inode record.
     pub logical_size: u64,
     /// Data generation published into the inode record.
     pub data_generation: DataGeneration,
     /// Next inode metadata generation published with content.
     pub inode_generation: InodeGeneration,
-    /// Complete timestamp set published atomically with content and size.
-    pub times: InodeTimes,
+    /// Selected inode fields published atomically with content and size.
+    pub attributes: InodeAttributeUpdate,
 }
 
 /// Dedicated atomic publication of one complete xattr staging record.
@@ -249,6 +310,10 @@ pub enum PublishContentError {
     InodeGenerationMismatch,
     /// Checked generation arithmetic overflowed.
     GenerationOverflow,
+    /// Selected mode contains bits outside the supported permission/special mask.
+    InvalidSelectedMode,
+    /// A selected owner or group exceeds the receiving adapter's record limits.
+    Limit(StateLimitError),
 }
 
 impl fmt::Display for PublishContentError {
@@ -331,6 +396,11 @@ pub enum StateChange {
         /// Number of cookies allocated from the pre-state high-water mark.
         count: NonZeroU64,
     },
+    /// Allocate a consecutive range of non-reused inode QID paths.
+    AdvanceQidPath {
+        /// Number of QID paths allocated from the pre-state high-water mark.
+        count: NonZeroU64,
+    },
     /// Increment the filesystem policy generation.
     BumpFilesystemPolicyGeneration,
     /// Increment an inode metadata generation.
@@ -369,9 +439,9 @@ impl StateChange {
     pub fn primary_key(&self, filesystem_id: FilesystemId) -> RecordKey {
         match self {
             Self::Insert { key, .. } | Self::Replace { key, .. } | Self::Delete(key) => key.clone(),
-            Self::AdvanceDirectoryCookie { .. } | Self::BumpFilesystemPolicyGeneration => {
-                RecordKey::Filesystem(filesystem_id)
-            }
+            Self::AdvanceDirectoryCookie { .. }
+            | Self::AdvanceQidPath { .. }
+            | Self::BumpFilesystemPolicyGeneration => RecordKey::Filesystem(filesystem_id),
             Self::BumpInodeGeneration(inode_id)
             | Self::BumpDirectoryGeneration(inode_id)
             | Self::AdjustLinkCount { inode_id, .. } => RecordKey::Inode(filesystem_id, *inode_id),
@@ -517,17 +587,51 @@ impl CommitRequest {
         }
 
         let mut targets = BTreeSet::new();
+        let mut filesystem_target_seen = false;
+        let mut filesystem_target_only_allocations = true;
+        let mut directory_allocation_seen = false;
+        let mut qid_allocation_seen = false;
         let mut lock_count = 0usize;
         let mut open_pin_count = 0usize;
         let mut xattr_count = 0usize;
         for change in &self.changes {
+            let is_filesystem_allocation = match change {
+                StateChange::AdvanceDirectoryCookie { .. } => {
+                    if directory_allocation_seen {
+                        return Err(MalformedCommit::DuplicateChangeTarget(
+                            RecordKey::Filesystem(self.filesystem_id),
+                        ));
+                    }
+                    directory_allocation_seen = true;
+                    true
+                }
+                StateChange::AdvanceQidPath { .. } => {
+                    if qid_allocation_seen {
+                        return Err(MalformedCommit::DuplicateChangeTarget(
+                            RecordKey::Filesystem(self.filesystem_id),
+                        ));
+                    }
+                    qid_allocation_seen = true;
+                    true
+                }
+                _ => false,
+            };
             for key in change.affected_keys(self.filesystem_id) {
                 if key.filesystem_id() != self.filesystem_id {
                     return Err(MalformedCommit::KeyOutsideFilesystem(key));
                 }
                 key.validate_against_limits(limits)
                     .map_err(MalformedCommit::Limit)?;
-                if !targets.insert(key.clone()) {
+                let inserted = targets.insert(key.clone());
+                if key.family() == RecordFamily::Filesystem {
+                    if filesystem_target_seen
+                        && !(is_filesystem_allocation && filesystem_target_only_allocations)
+                    {
+                        return Err(MalformedCommit::DuplicateChangeTarget(key));
+                    }
+                    filesystem_target_seen = true;
+                    filesystem_target_only_allocations &= is_filesystem_allocation;
+                } else if !inserted {
                     return Err(MalformedCommit::DuplicateChangeTarget(key));
                 }
                 match key.family() {
@@ -580,7 +684,7 @@ impl CommitRequest {
                     return Err(MalformedCommit::StoreOwnedRecord(key.clone()));
                 }
                 StateChange::PublishContent(publication) => {
-                    validate_publish_shape(publication, &self.mutation)
+                    validate_publish_shape(publication, &self.mutation, limits)
                         .map_err(MalformedCommit::InvalidPublication)?;
                 }
                 StateChange::PublishXattrStaging(publication) => {
@@ -652,6 +756,7 @@ impl CommitRequest {
 fn validate_publish_shape(
     publication: &PublishContent,
     mutation: &MutationContext,
+    limits: StateLimits,
 ) -> Result<(), PublishContentError> {
     let identity = publication.prepared.identity();
     if identity.mutation_id() != mutation.mutation_id {
@@ -665,6 +770,31 @@ fn validate_publish_shape(
     }
     if publication.data_generation.get() != publication.prepared.content().generation() {
         return Err(PublishContentError::DataGenerationMismatch);
+    }
+    if publication
+        .attributes
+        .mode
+        .is_some_and(|mode| mode & !0o7777 != 0)
+    {
+        return Err(PublishContentError::InvalidSelectedMode);
+    }
+    if let Some(owner) = &publication.attributes.owner {
+        limits
+            .require_bytes(
+                StateLimitKind::Principal,
+                owner.as_bytes().len(),
+                limits.max_principal_bytes(),
+            )
+            .map_err(PublishContentError::Limit)?;
+    }
+    if let Some(group) = &publication.attributes.group {
+        limits
+            .require_bytes(
+                StateLimitKind::Group,
+                group.as_bytes().len(),
+                limits.max_group_bytes(),
+            )
+            .map_err(PublishContentError::Limit)?;
     }
     Ok(())
 }
@@ -685,7 +815,15 @@ fn estimate_change(change: &StateChange) -> Option<usize> {
             .checked_add(record.retained_bytes()?),
         StateChange::Delete(key) => 64usize.checked_add(key.retained_bytes()?),
         StateChange::PublishContent(publication) => {
-            512usize.checked_add(publication.prepared.content().manifest_key().as_str().len())
+            let mut bytes = 512usize
+                .checked_add(publication.prepared.content().manifest_key().as_str().len())?;
+            if let Some(owner) = &publication.attributes.owner {
+                bytes = bytes.checked_add(owner.as_bytes().len())?;
+            }
+            if let Some(group) = &publication.attributes.group {
+                bytes = bytes.checked_add(group.as_bytes().len())?;
+            }
+            Some(bytes)
         }
         StateChange::PublishXattrStaging(publication) => {
             192usize.checked_add(publication.name.as_bytes().len())
@@ -765,6 +903,8 @@ pub enum CommitConflictKind {
     LinkCount,
     /// Durable open-pin count differed.
     OpenPinCount,
+    /// Filesystem export/policy generation differed.
+    FilesystemPolicyGeneration,
     /// Explicit fence precondition differed from the request fence.
     ExactFence,
     /// A requested byte-range lock conflicts with an existing lock.
@@ -806,6 +946,8 @@ pub enum MalformedCommit {
     EmptyChanges,
     /// Directory cookie insertion was not tied to the pre-state allocation high-water mark.
     DirectoryCookieAllocation,
+    /// Inode insertion was not tied to the pre-state QID-path allocation high-water mark.
+    QidPathAllocation,
     /// A persistent generation or allocation counter did not move as required.
     NonMonotonicTransition,
     /// A namespace mutation omitted the parent directory generation transition.
@@ -844,6 +986,9 @@ impl fmt::Display for MalformedCommit {
             Self::EmptyChanges => formatter.write_str("commit change set is empty"),
             Self::DirectoryCookieAllocation => formatter.write_str(
                 "directory cookie insertion is not coupled to its allocation high-water mark",
+            ),
+            Self::QidPathAllocation => formatter.write_str(
+                "inode QID path insertion is not coupled to its allocation high-water mark",
             ),
             Self::NonMonotonicTransition => {
                 formatter.write_str("persistent generation or counter transition is not monotonic")
@@ -910,7 +1055,7 @@ mod tests {
     #[test]
     fn exact_replay_includes_fingerprint_and_client_incarnation() {
         let filesystem_id = FilesystemId::from_u128(1);
-        let mutation_id = w9pt_storage::MutationId::from_u128(2);
+        let mutation_id = w9pt_fs_storage::MutationId::from_u128(2);
         let fingerprint = RequestFingerprint::blake3(b"complete request");
         let client = ClientIncarnationId::from_u128(3);
         let context =
@@ -964,16 +1109,16 @@ mod tests {
     #[test]
     fn prepared_content_is_bound_to_mutation_base_file_size_and_generations() {
         let limits = StateLimits::default();
-        let file_id = w9pt_storage::FileId::from_u128(1);
-        let mutation_id = w9pt_storage::MutationId::from_u128(2);
-        let repository = w9pt_storage::ContentRepository::new(
-            w9pt_storage::testing::MemoryTarget::new(),
+        let file_id = w9pt_fs_storage::FileId::from_u128(1);
+        let mutation_id = w9pt_fs_storage::MutationId::from_u128(2);
+        let repository = w9pt_fs_storage::ContentRepository::new(
+            w9pt_fs_storage::testing::MemoryTarget::new(),
             "test",
-            w9pt_storage::CreationDefaults::new(w9pt_storage::StorageMethod::Raw),
-            w9pt_storage::StorageLimits::default(),
+            w9pt_fs_storage::CreationDefaults::new(w9pt_fs_storage::StorageMethod::Raw),
+            w9pt_fs_storage::StorageLimits::default(),
         )
         .unwrap();
-        let prepared = w9pt_storage::testing::block_on(repository.prepare_create(
+        let prepared = w9pt_fs_storage::testing::block_on(repository.prepare_create(
             file_id,
             mutation_id,
             0,
@@ -989,6 +1134,7 @@ mod tests {
         };
         let inode = InodeRecord::new(
             InodeId::from_u128(3),
+            crate::QidPath::new(1).unwrap(),
             RecordRevision::new(1).unwrap(),
             0o644,
             PrincipalId::new(b"owner".to_vec(), limits).unwrap(),
@@ -1006,12 +1152,12 @@ mod tests {
         .unwrap();
         let publication = PublishContent {
             inode_id: inode.inode_id(),
-            expected_base: w9pt_storage::BaseContentIdentity::NEW_FILE,
+            expected_base: w9pt_fs_storage::BaseContentIdentity::NEW_FILE,
             logical_size: 3,
             data_generation: DataGeneration::new(1).unwrap(),
             prepared,
             inode_generation: InodeGeneration::new(2).unwrap(),
-            times,
+            attributes: InodeAttributeUpdate::all_times(times),
         };
         let context = MutationContext::new(
             mutation_id,
@@ -1024,7 +1170,7 @@ mod tests {
             Ok(())
         );
         let wrong_mutation = MutationContext::new(
-            w9pt_storage::MutationId::from_u128(9),
+            w9pt_fs_storage::MutationId::from_u128(9),
             context.fingerprint,
             context.client_incarnation,
             context.retention,
@@ -1033,12 +1179,54 @@ mod tests {
             validate_publish_content(&publication, &wrong_mutation, &inode),
             Err(PublishContentError::MutationIdMismatch)
         );
+        let mut invalid_mode = publication.clone();
+        invalid_mode.attributes.mode = Some(0o10_000);
+        assert_eq!(
+            validate_publish_shape(&invalid_mode, &context, limits),
+            Err(PublishContentError::InvalidSelectedMode)
+        );
+
+        let mut loose_values = limits.values();
+        loose_values.max_principal_bytes += 1;
+        let loose = StateLimits::new(loose_values).unwrap();
+        let mut oversized_owner = publication.clone();
+        oversized_owner.attributes.owner =
+            Some(PrincipalId::new(vec![b'o'; loose_values.max_principal_bytes], loose).unwrap());
+        assert!(matches!(
+            validate_publish_shape(&oversized_owner, &context, limits),
+            Err(PublishContentError::Limit(StateLimitError {
+                kind: StateLimitKind::Principal,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn selected_timestamp_updates_preserve_unselected_fields() {
+        let original = InodeTimes {
+            accessed: UnixTimestamp::new(1, 0).unwrap(),
+            modified: UnixTimestamp::new(2, 0).unwrap(),
+            changed: UnixTimestamp::new(3, 0).unwrap(),
+            created: UnixTimestamp::new(4, 0).unwrap(),
+        };
+        let replacement = UnixTimestamp::new(9, 0).unwrap();
+        let update = InodeAttributeUpdate {
+            modified: Some(replacement),
+            ..InodeAttributeUpdate::default()
+        };
+        assert_eq!(
+            update.apply_times(original),
+            InodeTimes {
+                modified: replacement,
+                ..original
+            }
+        );
     }
 
     #[test]
     fn semantic_commit_outcomes_keep_ambiguity_and_rejections_distinct() {
         let mutation = MutationContext::new(
-            w9pt_storage::MutationId::from_u128(1),
+            w9pt_fs_storage::MutationId::from_u128(1),
             RequestFingerprint::blake3(b"request"),
             ClientIncarnationId::from_u128(2),
             MutationRetention::new(3),
@@ -1055,7 +1243,7 @@ mod tests {
         let limits = StateLimits::default();
         let filesystem_id = FilesystemId::from_u128(1);
         let mutation = MutationContext::new(
-            w9pt_storage::MutationId::from_u128(2),
+            w9pt_fs_storage::MutationId::from_u128(2),
             RequestFingerprint::blake3(b"delete"),
             ClientIncarnationId::from_u128(3),
             MutationRetention::new(4),

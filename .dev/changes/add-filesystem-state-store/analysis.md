@@ -2,9 +2,9 @@
 
 ## Current State
 
-- The workspace contains `w9pt` and `w9pt-storage`; no crate owns authoritative filesystem metadata or cross-session coordination.
+- The workspace contains `w9pt` and `w9pt-fs-storage`; no crate owns authoritative filesystem metadata or cross-session coordination.
 - `w9pt` is a dependency-free Sans-I/O protocol/session state machine. It emits high-level filesystem requests using opaque `ObjectHandle`, `OpenHandle`, and `XattrHandle` values, but those handles are not persistent database records.
-- `w9pt-storage` prepares immutable file content and returns portable `PreparedContent`/`ContentRef` values. Its object-head publisher is explicitly standalone-only; clustered publication belongs in an authoritative inode transaction.
+- `w9pt-fs-storage` prepares immutable file content and returns portable `PreparedContent`/`ContentRef` values. Its object-head publisher is explicitly standalone-only; clustered publication belongs in an authoritative inode transaction.
 - The repository has no archived `.dev/specs/` baseline yet. Normative implemented behavior remains in the completed `complete-sans-io-core` and `add-storage-methods` change packages plus `AGENTS.md`.
 - The Git history contains only the initial repository commit. Current Rust crates and `.dev` documents are uncommitted user work and must be preserved.
 
@@ -27,7 +27,7 @@ SQLite/local-file, PostgreSQL, etcd, SlateDB, the filesystem semantic engine, an
 
 ### Runtime-neutral target contract
 
-`w9pt-storage::TargetStore` establishes the local pattern for:
+`w9pt-fs-storage::TargetStore` establishes the local pattern for:
 
 - associated adapter errors;
 - return-position future methods without a mandatory executor;
@@ -40,7 +40,7 @@ SQLite/local-file, PostgreSQL, etcd, SlateDB, the filesystem semantic engine, an
 
 ### Strong portable values
 
-`w9pt-storage` already provides fixed-width caller-supplied identifiers, checked constructors, validated limits, typed failures, deterministic operation fingerprints, and reconstructible `ContentRef` values. The state crate should reuse those content values where their semantics match and define distinct state-mutation fingerprints for the complete filesystem operation.
+`w9pt-fs-storage` already provides fixed-width caller-supplied identifiers, checked constructors, validated limits, typed failures, deterministic operation fingerprints, and reconstructible `ContentRef` values. The state crate should reuse those content values where their semantics match and define distinct state-mutation fingerprints for the complete filesystem operation.
 
 ### Capabilities are promises
 
@@ -53,12 +53,12 @@ The existing `w9pt` file attributes, directory entries, QIDs, lock requests, and
 ## Layering and Dependencies
 
 ```text
-w9pt                         w9pt-fs-state -> w9pt-storage
+w9pt                         w9pt-fs-state -> w9pt-fs-storage
   \                               /
    \-> future filesystem engine <-/
 ```
 
-- `w9pt-fs-state` depends on `w9pt-storage` for immutable content publication values.
+- `w9pt-fs-state` depends on `w9pt-fs-storage` for immutable content publication values.
 - It does not depend on `w9pt`, so database adapters do not inherit protocol parsing, session state, or wire-shaped types.
 - `w9pt` remains unchanged and dependency-free.
 - The future filesystem engine depends on all three layers and maps 9P requests into state reads, content preparation, and state commits.
@@ -111,7 +111,7 @@ A conflict is not a committed result. The future semantic engine rereads authori
 
 ## Domain Model Notes
 
-- `InodeId` and `w9pt_storage::FileId` remain distinct strong types. A regular inode stores an explicit content-file identity binding; no undocumented numeric cast connects them.
+- `InodeId` and `w9pt_fs_storage::FileId` remain distinct strong types. A regular inode stores an explicit content-file identity binding; no undocumented numeric cast connects them.
 - A regular-file inode's logical size must match the selected `ContentRef`.
 - Directory cookies are allocated stable values, not collection indexes or name hashes.
 - Open records are portable and refer to stable IDs rather than SDK or process handles.

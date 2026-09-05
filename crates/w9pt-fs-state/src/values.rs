@@ -63,6 +63,20 @@ nonzero_counter!(
     "Monotonic generation of one directory namespace."
 );
 nonzero_counter!(LockGeneration, "Monotonic generation of one lock record.");
+nonzero_counter!(
+    QidPath,
+    "Stable nonzero 9P QID path allocated once within one filesystem."
+);
+
+impl QidPath {
+    /// Advances the allocation high-water mark by a nonzero count without wrapping.
+    pub const fn checked_advance(self, count: u64) -> Result<Self, CounterOverflow> {
+        match self.0.checked_add(count) {
+            Some(value) => Ok(Self(value)),
+            None => Err(CounterOverflow { field: "QidPath" }),
+        }
+    }
+}
 
 /// Caller-defined monotonic boundary before which a mutation result must remain retained.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -210,7 +224,7 @@ impl RequestFingerprint {
 
     /// Computes a BLAKE3-256 fingerprint of caller-canonical request bytes.
     pub fn blake3(canonical_request: &[u8]) -> Self {
-        Self(*w9pt_storage::Digest::blake3(canonical_request).as_bytes())
+        Self(*w9pt_fs_storage::Digest::blake3(canonical_request).as_bytes())
     }
 
     /// Returns the canonical bytes.
@@ -298,6 +312,15 @@ mod tests {
                 .is_err()
         );
         assert!(DirectoryCookie::new(u64::MAX).checked_next().is_err());
+        assert_eq!(
+            QidPath::new(0),
+            Err(InvalidValue::Zero { field: "QidPath" })
+        );
+        assert_eq!(
+            QidPath::new(1).unwrap().checked_advance(2).unwrap().get(),
+            3
+        );
+        assert!(QidPath::new(u64::MAX).unwrap().checked_next().is_err());
     }
 
     #[test]

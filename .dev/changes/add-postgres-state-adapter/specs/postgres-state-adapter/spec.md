@@ -3,37 +3,38 @@
 ## ADDED Requirements
 
 ### Requirement: Finalized State Contract Dependency
-The system SHALL implement the finalized `w9pt-fs-state::FilesystemStateStore` contract without redefining its semantic records, outcomes, limits, or invariants.
+The system SHALL implement the approved `w9pt-fs-state::FilesystemStateStore` contract without redefining its semantic records, outcomes, limits, ordering, or invariants.
 
-#### Scenario: Prerequisite remains draft or incomplete
-- WHEN implementation is requested before `add-filesystem-state-store` is approved and complete
-- THEN the PostgreSQL adapter change remains blocked
-- AND no provisional duplicate trait or schema is introduced
+#### Scenario: Reconciled implementation begins
+- GIVEN `add-filesystem-state-store` is approved and complete
+- WHEN PostgreSQL adapter implementation begins
+- THEN every adapter type, SQL column, constraint, cursor, outcome, and conformance test follows the finalized public model
+- AND no provisional duplicate state contract is introduced
 
-#### Scenario: State contract is finalized
-- WHEN implementation begins after the prerequisite completes
-- THEN every adapter type, SQL column, constraint, and conformance test is reconciled against the final public model
-- AND incompatible assumptions are resolved before migration SQL is published
+#### Scenario: Future contract drift is detected
+- WHEN the finalized public state model changes incompatibly before the adapter is complete
+- THEN implementation pauses for an explicit reconciliation
+- AND published migration SQL is not allowed to silently reinterpret the changed model
 
 ### Requirement: PostgreSQL Adapter Dependency Isolation
-The system SHALL provide `w9pt-fs-state-postgres` as a runtime-specific adapter crate without adding PostgreSQL, SQLx, Tokio, or TLS dependencies to `w9pt-fs-state`, `w9pt-storage`, or `w9pt`.
+The system SHALL provide `w9pt-fs-state-postgres` as a runtime-specific adapter crate without adding PostgreSQL, SQLx, Tokio, or TLS dependencies to `w9pt-fs-state`, `w9pt-fs-storage`, or `w9pt`.
 
 #### Scenario: Adapter crate is compiled
 - WHEN `w9pt-fs-state-postgres` is selected
 - THEN it depends on `w9pt-fs-state` and SQLx exactly `0.8.6` with default features disabled
-- AND it does not depend on `w9pt`, an object-store SDK, a testcontainer library, or deployment tooling
+- AND it does not depend on `w9pt`, an object-store SDK, testcontainers, or deployment tooling
 
 #### Scenario: Adapter is not selected
 - WHEN an application uses another state adapter
 - THEN PostgreSQL, SQLx, and Tokio dependencies are not pulled into the backend-neutral state or protocol crates
-- AND the application retains its selected runtime/dependency boundary
+- AND the application retains its chosen runtime boundary
 
 ### Requirement: Caller-Owned Pool and Connection Policy
 The system SHALL accept a caller-created SQLx `PgPool` and SHALL not read credentials, connection URLs, TLS roots, pool sizes, or environment configuration implicitly.
 
 #### Scenario: Adapter is opened
 - WHEN a caller supplies a pool and checked adapter configuration
-- THEN the adapter validates the pool target and schema and constructs a state-store implementation
+- THEN the adapter validates the target, schema, clock mode, and durability boundary
 - AND pool/runtime lifecycle remains caller-owned
 
 #### Scenario: TLS is required
@@ -43,21 +44,21 @@ The system SHALL accept a caller-created SQLx `PgPool` and SHALL not read creden
 
 #### Scenario: Migrations are pending
 - WHEN `open` observes a missing or unsupported schema version
-- THEN it fails with a typed configuration/migration error
+- THEN it fails with a typed configuration or migration error
 - AND it does not apply DDL automatically
 
 ### Requirement: Supported PostgreSQL Versions and Primary Authority
 The system SHALL support maintained PostgreSQL 15, 16, 17, and 18 minor releases using PostgreSQL 15-compatible SQL and SHALL execute authoritative operations only on a writable primary.
 
-#### Scenario: Supported primary is used
-- WHEN a transaction runs on PostgreSQL 15–18 and `pg_is_in_recovery()` is false
+#### Scenario: Supported writable primary is used
+- WHEN a transaction runs on PostgreSQL 15–18 with recovery disabled and the connection is not routed to a write-disabled authority
 - THEN the adapter may execute the validated state operation
-- AND it uses only SQL supported by PostgreSQL 15
+- AND write transactions verify they are writable while read batches remain intentionally `READ ONLY`
 
-#### Scenario: Standby or readonly route is selected
-- WHEN any acquired connection reports recovery/readonly primary status
+#### Scenario: Standby or read-only route is selected
+- WHEN any acquired connection reports recovery mode or a read-only transaction
 - THEN the state operation fails explicitly before authoritative results or mutations are returned
-- AND the adapter does not serve stale replica state as linearizable
+- AND the adapter does not serve replica state as linearizable
 
 #### Scenario: Unsupported server version is used
 - WHEN the server major version is outside 15–18
@@ -65,71 +66,123 @@ The system SHALL support maintained PostgreSQL 15, 16, 17, and 18 minor releases
 - AND migrations or runtime writes are not attempted
 
 ### Requirement: Explicit Embedded Checksummed Migrations
-The system SHALL use explicit embedded versioned migrations for a fixed schema and SHALL detect migration drift before serving state operations.
+The system SHALL use explicit embedded versioned migrations for a fixed production schema and SHALL detect migration drift before serving state operations.
 
 #### Scenario: Fresh database is migrated
 - WHEN an authorized caller invokes `migrate`
-- THEN the adapter serializes migration runners with the fixed migration advisory lock
-- AND applies and records each embedded version/checksum transactionally
+- THEN the adapter serializes migration runners with the fixed advisory lock
+- AND applies and records each embedded version and checksum transactionally
 
 #### Scenario: Migration is invoked repeatedly
-- WHEN all embedded migrations are already recorded with matching checksums
+- WHEN all embedded migrations are recorded with matching checksums
 - THEN `migrate` reports no pending changes
 - AND existing state remains unchanged
 
 #### Scenario: Applied checksum or version differs
 - WHEN the database contains checksum drift, a version gap, or an unknown newer migration
-- THEN migration/open fails closed
+- THEN migration and `open` fail closed
 - AND the adapter does not reinterpret the existing schema
 
+### Requirement: Private Authority Head and Empty Bootstrap
+The system SHALL keep private revision/change-history state separate from the optional public `FilesystemRecord` and SHALL model an unseen filesystem as an empty authority at revision one.
+
+#### Scenario: Empty authority is read
+- WHEN no private authority-head row or public filesystem record exists
+- THEN a read observes authoritative revision one and an absent filesystem point result
+- AND change polling uses revision one as both current and oldest baseline
+
+#### Scenario: Lease precedes filesystem creation
+- WHEN a writer acquires or renews a lease before the public filesystem record exists
+- THEN the adapter lazily creates and advances only the private authority head
+- AND `ReadQuery::Filesystem` remains absent
+
+#### Scenario: Filesystem is bootstrapped
+- GIVEN a valid writer lease exists for an empty authority
+- WHEN a commit requires `RecordAbsent(RecordKey::Filesystem(...))` and inserts the public filesystem/root records
+- THEN the precondition succeeds if no public record exists
+- AND the private head allocates the commit revision independently
+
+#### Scenario: Public filesystem record is deleted
+- WHEN a semantic commit deletes the public filesystem record
+- THEN private revisions, retained changes, mutation results, and greatest fence values are not implicitly deleted
+- AND no private row is exposed as a public state record
+
 ### Requirement: Fixed Fully Qualified Normalized Schema
-The system SHALL store each authoritative record family in normalized permanent logged tables under the fixed fully qualified schema `w9pt_fs_state_v1`.
+The system SHALL store each finalized authoritative record family in normalized permanent logged tables under `w9pt_fs_state_v1` while keeping adapter-private coordination rows distinct.
 
 #### Scenario: Runtime statement executes
-- WHEN the adapter reads or mutates state
-- THEN every table, index, constraint, and migration-ledger reference is fully qualified
-- AND correctness does not depend on `search_path` or a configurable SQL identifier
+- WHEN the adapter reads or mutates production state
+- THEN every object reference is fixed and fully qualified
+- AND correctness does not depend on `search_path`, locale, or a configurable SQL identifier
+
+#### Scenario: Semantic key is stored
+- WHEN a public record is persisted
+- THEN its primary key matches finalized `RecordKey` exactly, including `(filesystem, inode, lock)` for locks and `(filesystem, inode, name)` for xattrs
+- AND no stronger identity uniqueness is invented by the adapter
 
 #### Scenario: Semantic records are deleted
-- WHEN a commit removes namespace, open, orphan, lock, xattr, mutation, lease, or change records
-- THEN every deletion is explicit in the semantic change set
-- AND cascading SQL behavior does not create unreported authoritative changes
+- WHEN a commit removes a namespace, open, pin, orphan, lock, xattr, staging, mutation, or active lease record
+- THEN every public deletion is explicit in the semantic transition
+- AND cascading SQL behavior does not create hidden authoritative changes
 
 #### Scenario: Direct malformed row is attempted
-- WHEN SQL bypasses Rust validation and violates an ID, bound, enum, range, or relationship invariant
+- WHEN SQL bypasses Rust validation and violates a stable ID, bound, enum, range, optional-field, or relationship constraint
 - THEN a named database constraint rejects the row
-- AND no malformed authoritative record becomes readable
+- AND no malformed public record becomes readable
 
 ### Requirement: Lossless Portable Value Mapping
-The system SHALL losslessly encode every public state value without locale-dependent ordering, signed narrowing, precision loss, or unchecked conversion.
+The system SHALL losslessly encode every finalized public state value without locale-dependent ordering, signed narrowing, precision loss, or unchecked conversion.
 
 #### Scenario: Full unsigned boundary is stored
 - WHEN a public field contains `0`, `i64::MAX`, `i64::MAX + 1`, or `u64::MAX`
-- THEN the adapter round-trips it through constrained `NUMERIC(20,0)` and checked canonical decimal conversion
-- AND no unchecked signed cast is used
+- THEN the adapter round-trips it through constrained `NUMERIC(20,0)` and canonical decimal conversion
+- AND no unchecked signed or floating-point cast is used
 
 #### Scenario: Stable ID or digest is stored
 - WHEN a fixed-width ID, fingerprint, or digest is written
 - THEN PostgreSQL stores exact bytes under an `octet_length` constraint
 - AND decoding rejects every incorrect width
 
-#### Scenario: Namespace name is ordered
-- WHEN directory or xattr names are compared or paginated
-- THEN PostgreSQL uses their bounded byte representation and binary order
-- AND database collation does not change uniqueness or ordering
+#### Scenario: Byte string is ordered
+- WHEN entry names, xattr names, or semantic byte identities are compared or paginated
+- THEN PostgreSQL uses bounded `BYTEA` and binary ordering
+- AND database collation does not change identity or ordering
+
+#### Scenario: Content reference is reconstructed
+- WHEN an inode row contains published content
+- THEN all `ContentRef` fields are present and reconstructed through `ContentRef::from_persisted`
+- AND partial optional field sets or inode/content summary mismatches are rejected
+
+### Requirement: Exact Database Lease Ticks
+The system SHALL define version-1 lease ticks as unsigned Unix-epoch microseconds, persist deadlines as `NUMERIC(20,0)`, and derive production time from PostgreSQL.
+
+#### Scenario: Production time is evaluated
+- WHEN a lease operation or non-replayed commit needs authoritative time
+- THEN the transaction evaluates `clock_timestamp()` exactly once and converts it to a checked integral microsecond tick
+- AND every expiry comparison in that operation uses the captured tick
+
+#### Scenario: Deadline is persisted
+- WHEN a grant or renewal calculates a deadline
+- THEN checked tick addition produces an exact `LeaseDeadline` value stored as numeric
+- AND `TIMESTAMPTZ` precision or range cannot narrow the public value
+
+#### Scenario: Deterministic conformance time is used
+- WHEN the feature-gated PostgreSQL conformance harness opens independent clients
+- THEN they obtain time from one test-only database-resident integer tick row
+- AND `advance_time` updates that row with checked arithmetic and no correctness-bearing shared process RAM
 
 ### Requirement: Validated Primary-WAL Durability
 The system SHALL advertise only primary-WAL durable metadata and SHALL validate the PostgreSQL settings and table properties required for that boundary.
 
 #### Scenario: Durable adapter opens
-- WHEN the server is primary, `fsync` and `full_page_writes` are enabled, state tables are logged, and transaction-local `synchronous_commit = on` can be enforced
-- THEN the adapter advertises its primary-WAL durability contract
+- WHEN the server is writable primary, `fsync` and `full_page_writes` are enabled, state tables are logged, and transaction-local `synchronous_commit = on` can be enforced
+- THEN the adapter advertises the complete production state-store contract
 - AND successful mutation acknowledgment follows SQL `COMMIT`
 
 #### Scenario: Durability setting is weaker
-- WHEN required settings are disabled or runtime privileges cannot enforce the commit mode
+- WHEN a required setting is disabled or the runtime role cannot enforce commit mode
 - THEN `open` fails explicitly
-- AND the deployment does not advertise `DurableMetadata` through this adapter
+- AND the deployment cannot advertise durable metadata through this adapter
 
 #### Scenario: Synchronous-standby durability is expected
 - WHEN a deployment requires acknowledged data to survive primary loss through a synchronous standby
@@ -137,237 +190,296 @@ The system SHALL advertise only primary-WAL durable metadata and SHALL validate 
 - AND does not infer it from primary-WAL durability
 
 ### Requirement: One-Snapshot Serializable Read Batches
-The system SHALL execute each state read batch through one primary-only `SERIALIZABLE READ ONLY` transaction and return one authoritative revision.
+The system SHALL execute each state read batch through one primary-only `SERIALIZABLE READ ONLY` transaction and return exact finalized read outcomes.
 
 #### Scenario: Batch contains multiple queries
-- WHEN one request reads related inode, namespace, open, lock, lease, or mutation records
-- THEN all results come from the same PostgreSQL transaction snapshot
+- WHEN one request reads related records or scans
+- THEN all results come from the same PostgreSQL transaction snapshot and authoritative revision
 - AND they remain positionally associated with their queries
 
 #### Scenario: Freshness floor is satisfied
-- WHEN `AtLeast(R)` is requested and the filesystem revision is at least `R`
-- THEN the adapter returns the snapshot and observed revision
-- AND does not require a historical snapshot exactly equal to `R`
+- WHEN `AtLeast(R)` is requested and current revision is at least `R`
+- THEN the adapter returns `ReadOutcome::Snapshot`
+- AND it need not return a historical snapshot exactly equal to `R`
 
-#### Scenario: Freshness floor or primary check fails
-- WHEN the observed revision is below `R` or the connection is a standby
-- THEN the adapter returns a typed non-authoritative/freshness result
-- AND it does not return the batch as successful
+#### Scenario: Freshness floor is not satisfied
+- WHEN current revision is below `R`
+- THEN the adapter returns `ReadOutcome::RevisionUnavailable`
+- AND it does not return partial batch data
 
-### Requirement: Bounded Keyset State Scans
-The system SHALL implement every ordered state scan with bounded keyset pagination rather than offset-based pagination.
+#### Scenario: Receiving adapter has tighter limits
+- WHEN a request was constructed under limits looser than the adapter contract
+- THEN the adapter returns `ReadOutcome::MalformedRequest`
+- AND no unbounded query is executed
+
+### Requirement: Exact Bounded Keyset State Scans
+The system SHALL implement every finalized `RecordScan` using its exact exclusive cursor and bounded keyset order rather than offset pagination.
 
 #### Scenario: Directory page is requested
-- WHEN a caller supplies a stable directory cookie/name cursor and item/byte bounds
-- THEN the adapter returns the next entries ordered by `(cookie, name)`
-- AND concurrent unrelated rows do not shift an offset cursor
+- WHEN a caller supplies a parent inode and exclusive `DirectoryCookie`
+- THEN entries are returned in unique cookie order for that parent
+- AND no name component is required in the resume cursor
 
-#### Scenario: Other record page is requested
-- WHEN locks, xattrs, opens, orphans, leases, or mutations are scanned
-- THEN the adapter uses the record family's stable key suffix as the resume key
-- AND enforces result bounds before returning the page
+#### Scenario: Composite scans are requested
+- WHEN open pins, locks, or xattrs are scanned
+- THEN their orders are respectively `(inode, open)`, `(inode, lock)`, and `(inode, name-bytes)`
+- AND the returned `ScanResume` matches the final complete record
 
-#### Scenario: Result would exceed a configured bound
-- WHEN a query would materialize too many records or bytes
-- THEN it returns a bounded page or typed limit error
-- AND it does not first allocate the oversized result
+#### Scenario: Identity scans are requested
+- WHEN inodes, opens, orphans, xattr staging records, mutations, or active writer leases are scanned
+- THEN the adapter orders them by their finalized identity cursor
+- AND released private fence rows are not returned as active writer leases
+
+#### Scenario: Next record cannot fit
+- WHEN the next complete record exceeds the requested scan byte bound
+- THEN the adapter returns `ReadOutcome::ScanBoundTooSmall` with the query position and required bytes
+- AND it does not allocate or split the oversized record page
 
 ### Requirement: Serializable Ledger-First Atomic Commits
-The system SHALL map each semantic commit to one short primary-only `SERIALIZABLE READ WRITE` transaction with ledger-first replay and all-or-nothing record publication.
+The system SHALL follow the finalized ledger-first protocol and map each new semantic commit to one short primary-only `SERIALIZABLE READ WRITE` transaction.
+
+#### Scenario: Retained mutation is submitted under tighter current limits
+- WHEN the short primary serializable fixed-size ledger probe finds a retained mutation before adapter-limit or fence validation
+- THEN the adapter classifies and returns its exact replay or mismatch
+- AND it does not reject an exact replay because current limits or lease state changed
+
+#### Scenario: Ledger probe is absent
+- WHEN no retained mutation exists
+- THEN the adapter validates the complete request against its contract limits
+- AND repeats ledger lookup first inside every write attempt before current-state validation
 
 #### Scenario: New commit succeeds
 - WHEN the mutation is absent, its fence is current, and all preconditions and invariants match
-- THEN all normalized record changes, one filesystem revision, record revisions, exact terminal result, and one change event commit atomically
+- THEN all public changes, one private authority revision, record revisions, exact terminal result, and one whole change event commit atomically
 - AND acknowledgment occurs only after SQL `COMMIT` succeeds
 
-#### Scenario: One semantic precondition fails
-- WHEN any record absence/revision, generation, content base, link count, open pin, or fence differs
+#### Scenario: Semantic validation fails
+- WHEN any typed precondition or cross-record invariant fails
 - THEN the SQL transaction rolls back without a mutation-result row
-- AND the adapter returns the corresponding typed conflict/rejection
-
-#### Scenario: Commit affects multiple record families
-- WHEN create, rename, link/unlink, open-unlinked, lock, xattr, setattr, or content publication spans multiple tables
-- THEN no observer can read a partial transition
-- AND every changed row receives the same new record revision
+- AND the adapter returns the exact finalized semantic conflict or malformed outcome
 
 ### Requirement: Deterministic PostgreSQL Lock Ordering
-The system SHALL sort and deduplicate affected semantic record keys and acquire PostgreSQL row/predicate protection in canonical order.
+The system SHALL mirror finalized `RecordKey::Ord`, lock existing semantic rows in that order, and protect absent predicates serializably.
 
 #### Scenario: Existing records are affected
-- WHEN a commit changes multiple existing rows
-- THEN their rows are locked in canonical `RecordKey` order after the filesystem revision/fence rows
-- AND two adapters derive the same lock order from the same request
+- WHEN a commit changes records from multiple families
+- THEN it locks the private authority head, the writer-fence row, and then public records in canonical semantic-key order
+- AND independent adapters derive the same order from the same request
 
 #### Scenario: Absent row is required
-- WHEN a precondition requires a directory entry, inode, open, lock, xattr, or mutation row to be absent
-- THEN the adapter performs the predicate read inside the serializable transaction
+- WHEN a precondition requires a semantic row to be absent
+- THEN the adapter performs the corresponding predicate read inside the serializable transaction
 - AND named uniqueness constraints protect the insert race
 
+#### Scenario: Lock conflict is evaluated
+- WHEN a requested lock overlaps an incompatible existing lock on the same inode
+- THEN the adapter selects the conflicting lock in canonical `LockId` order
+- AND returns the finalized `CommitConflictKind::LockConflict`
+
 #### Scenario: Duplicate affected key is submitted
-- WHEN preflight finds duplicate or contradictory keys in one commit
-- THEN it rejects the request before opening the SQL transaction
-- AND it does not rely on database deadlock behavior to resolve malformed input
+- WHEN finalized preflight finds duplicate change targets
+- THEN it returns `CommitOutcome::MalformedRequest` before transactional state work
+- AND database deadlock behavior is not used to resolve malformed input
 
 ### Requirement: Per-Filesystem Revision Ordering
-The system SHALL allocate checked monotonic revisions through a per-filesystem row so commits and change events have one authoritative order.
+The system SHALL allocate checked monotonic revisions through the private per-filesystem authority head.
 
-#### Scenario: Two commits target one filesystem
-- WHEN both reach the publication phase concurrently
-- THEN locking the filesystem row establishes one revision order
-- AND each successful commit receives a distinct increasing revision
+#### Scenario: Two changes target one filesystem
+- WHEN two successful commits or lease transitions reach publication concurrently
+- THEN locking the authority head establishes one revision order
+- AND each receives a distinct increasing revision
 
-#### Scenario: Commits target different filesystems
-- WHEN unrelated filesystem IDs commit concurrently
+#### Scenario: Changes target different filesystems
+- WHEN unrelated filesystem IDs change concurrently
 - THEN they do not contend on one global revision row
 - AND each filesystem maintains its own ordering domain
 
 #### Scenario: Revision would overflow
-- WHEN incrementing the full-range numeric revision exceeds the state contract maximum
-- THEN the transaction returns a typed exhaustion error and rolls back
+- WHEN incrementing the public revision domain would exceed `u64::MAX`
+- THEN the operation fails explicitly and rolls back
 - AND the revision never wraps or repeats
 
-### Requirement: Exact Mutation Replay and Mismatch Rejection
-The system SHALL read the mutation ledger before validating the current lease/fence and SHALL preserve exact idempotency across pools, processes, and expired writers.
+### Requirement: Exact Finalized Mutation Replay
+The system SHALL classify retained mutations exclusively through `MutationContext::classify_record` before current fence validation.
 
 #### Scenario: Matching mutation is retried
-- GIVEN a committed mutation remains retained
-- WHEN another pool submits the same mutation ID, fingerprint, client incarnation, changes, and result
-- THEN the adapter returns exact `AlreadyCommitted`
-- AND it does not reapply changes or reject the now-expired original fence
+- WHEN mutation ID, request fingerprint, client incarnation, and retention match a retained record
+- THEN the adapter returns exact `CommitOutcome::AlreadyCommitted`
+- AND it returns the recorded result without reapplying state or validating the old fence
 
-#### Scenario: Mutation identity differs
-- WHEN the same retained mutation ID is submitted with a different fingerprint, client incarnation, change set, or result identity
-- THEN the adapter returns a hard mismatch
-- AND it does not return the old result or apply the new request
+#### Scenario: Finalized replay identity differs
+- WHEN one of mutation ID, fingerprint, client incarnation, or retention differs
+- THEN the adapter returns the corresponding finalized `MutationMismatch`
+- AND it does not invent adapter-specific change-set or submitted-result mismatch variants
 
 #### Scenario: Concurrent first inserts race
 - WHEN two clients attempt the same new mutation concurrently
-- THEN named mutation uniqueness and ledger reread resolve to one commit and one exact replay
-- AND no raw SQL uniqueness error escapes as ambiguous filesystem behavior
+- THEN serializable retry plus named mutation uniqueness resolves to one commit and one fresh ledger classification
+- AND no raw uniqueness error escapes as filesystem behavior
 
-### Requirement: Prepared ContentRef Publication Only
-The system SHALL persist only state-validated `PreparedContent`/`ContentRef` fields with the inode and SHALL not store or publish bulk target content.
+### Requirement: Dedicated Content and Xattr Publication
+The system SHALL implement the finalized prepared-content and xattr-staging transitions without storing target content or allowing generic publication bypasses.
 
 #### Scenario: Prepared content is valid
-- GIVEN immutable payloads and the manifest were already acknowledged durable
-- WHEN the state commit validates mutation, file identity, base, size, and generation
-- THEN the inode's `ContentRef`, size, timestamps, and data revision commit together
+- GIVEN immutable payloads and the manifest are already durable
+- WHEN `PublishContent` validates mutation, base, file identity, size, data generation, inode generation, and timestamps
+- THEN the inode `ContentRef` and summaries commit atomically
 - AND PostgreSQL performs no target-object operation
 
-#### Scenario: Content preparation is inconsistent
-- WHEN the prepared mutation, file ID, base reference, logical size, or generation disagrees with authoritative state
-- THEN the serializable transaction rejects publication
+#### Scenario: Prepared content is inconsistent
+- WHEN any finalized content-publication invariant disagrees with authoritative state
+- THEN the transaction returns the finalized malformed outcome
 - AND the old inode content remains current
+
+#### Scenario: Xattr staging is published
+- WHEN `PublishXattrStaging` references a complete matching staging record
+- THEN staging removal and xattr insertion/replacement occur atomically
+- AND generic delete/insert changes cannot bypass the dedicated validation
 
 #### Scenario: Per-block mapping is requested
 - WHEN a deployment wants PostgreSQL-resident block or extent mappings
-- THEN version 1 reports that model as outside this adapter contract
-- AND requires a separate approved state/content-index proposal before schema changes
+- THEN version 1 lacks that operation
+- AND requires a separate approved state/content-index proposal
 
 ### Requirement: Exact SQLSTATE and Constraint Classification
-The system SHALL classify PostgreSQL failures through SQLSTATE, transaction phase, and known named constraints without matching localized server messages.
+The system SHALL classify PostgreSQL failures through SQLSTATE, operation phase, and known named constraints without localized message matching.
 
 #### Scenario: Serializable transaction aborts definitively
 - WHEN PostgreSQL returns `40001` or `40P01`
-- THEN the adapter may retry the identical transaction within its configured bound
-- AND never changes the mutation identity, content, or semantic preconditions
+- THEN the adapter may retry the identical request within its configured bound
+- AND never changes mutation identity, content, result, or semantic preconditions
 
 #### Scenario: Known constraint rejects a race
 - WHEN a named uniqueness, foreign-key, check, or numeric constraint rejects a request
-- THEN the adapter maps only recognized constraint names to the documented semantic outcome
-- AND unknown constraints remain adapter invariant errors
+- THEN only recognized constraint names map to documented outcomes
+- AND unknown constraints remain adapter invariant failures
 
 #### Scenario: Retry bound is exhausted
 - WHEN definitive aborts repeat to the configured maximum
-- THEN the adapter returns explicit retry exhaustion/conflict
-- AND it does not loop indefinitely or silently weaken isolation
+- THEN the adapter returns an explicit adapter failure or finalized conflict as specified by phase
+- AND it does not loop indefinitely or weaken isolation
 
 ### Requirement: Ambiguous COMMIT Recovery
-The system SHALL treat an uncertain SQL `COMMIT` response as potentially committed and resolve it only through bounded replay of the identical mutation request.
+The system SHALL treat an uncertain SQL `COMMIT` response as potentially committed and resolve it only through bounded replay of the same owned mutation request.
 
 #### Scenario: Commit succeeded but response was lost
-- WHEN a fresh primary transaction finds the matching mutation ledger record
-- THEN the adapter returns the exact retained committed result
-- AND it does not apply the state changes twice
+- WHEN a fresh primary ledger probe finds the matching retained mutation
+- THEN the adapter returns its exact committed result
+- AND it does not apply changes twice
 
 #### Scenario: Commit did not occur
-- WHEN exact recovery finds no retained mutation and the same request remains semantically valid
-- THEN only that identical request may be attempted again
-- AND no new mutation ID or blind rebase is generated
+- WHEN exact recovery finds no retained mutation and the same request remains valid
+- THEN only that request may be attempted again
+- AND no new mutation ID or semantic rebase is generated
 
 #### Scenario: Recovery cannot determine status
-- WHEN fresh-primary connection/recovery attempts reach their configured bound
-- THEN the adapter returns an explicit ambiguous-mutation error
+- WHEN fresh-primary recovery attempts reach their configured bound
+- THEN the adapter returns `CommitOutcome::Ambiguous(AmbiguousCommit)`
 - AND it does not claim rollback or success
 
 ### Requirement: Database-Time Leases and Monotonic Fencing
-The system SHALL implement idempotent lease operations using PostgreSQL time and permanently retained monotonically increasing fence counters.
+The system SHALL implement finalized idempotent lease operations using authoritative database ticks and permanently retained monotonically increasing fence counters.
+
+#### Scenario: Lease operation is replayed
+- WHEN a retained lease-operation ID is found
+- THEN its finalized request fingerprint is checked before duration, current lease, or fence validation
+- AND the exact `AlreadyApplied` or retained rejection behavior is returned
 
 #### Scenario: Scope is newly acquired or taken over
-- WHEN the scope is free or its prior lease expired according to database time
-- THEN acquisition locks the scope row and allocates a token greater than all prior tokens
-- AND records the exact lease-operation result for replay
+- WHEN the scope is free or expired at the captured database tick
+- THEN acquisition allocates a token greater than every prior token and publishes an active lease record
+- AND it emits one lease-origin revision event
 
-#### Scenario: Lease is renewed or released
-- WHEN the exact lease ID, holder, and token match
-- THEN renew preserves the token while extending its deadline or release clears active fields
-- AND neither operation resets/deletes the greatest fence counter
+#### Scenario: Lease is renewed
+- WHEN the exact current unexpired fence is renewed
+- THEN the token is preserved and the deadline never shortens
+- AND one lease-origin revision event is emitted
+
+#### Scenario: Lease is released
+- WHEN the exact current unexpired fence is released
+- THEN active lease fields are cleared while the greatest token remains
+- AND the public writer-lease record becomes absent with one lease-origin revision event
+
+#### Scenario: Lease operation is rejected
+- WHEN acquire, renew, or release returns a finalized rejection
+- THEN the adapter retains only the bounded replay information required by the finalized protocol
+- AND it does not emit a false public revision event
 
 #### Scenario: Stale writer commits
-- WHEN a non-replayed commit carries an expired, replaced, wrong-holder, or lower token
-- THEN the adapter rejects the commit inside its serializable transaction
-- AND the stale process cannot mutate newer state
+- WHEN a non-replayed commit presents an expired, replaced, wrong-holder, wrong-lease, or wrong-token fence
+- THEN the adapter returns `StaleFence` or `ExpiredLease` as finalized
+- AND the stale process cannot mutate state
 
-### Requirement: Bounded Revision Change Polling
-The system SHALL implement primary-only bounded keyset polling of whole committed revisions with explicit retained-history gaps.
+### Requirement: Exact Bounded Revision Change Polling
+The system SHALL implement primary-only bounded keyset polling and return exactly the finalized `ChangePollOutcome` variants.
 
 #### Scenario: Events are available
-- WHEN a caller polls after a retained revision
-- THEN the adapter returns bounded event headers and all ordered changed keys for each included commit
-- AND no event is split between pages
+- WHEN a caller polls after a retained revision and complete events fit
+- THEN the adapter returns `Changes(ChangeBatch)` with ordered events, `next`, and `current_revision`
+- AND no event is split
 
 #### Scenario: More events remain
-- WHEN the configured event count stops the page before the current revision
-- THEN the adapter returns a stable resume revision and `has_more`
-- AND the next query resumes by revision key rather than offset
+- WHEN event or aggregate-key bounds stop the page after at least one event
+- THEN `ChangeBatch::next()` identifies the stable resume revision below `current_revision()`
+- AND no adapter-specific `has_more` field is introduced
+
+#### Scenario: First event cannot fit
+- WHEN the first available whole event exceeds `max_keys`
+- THEN the adapter returns `PollBoundTooSmall` with its revision and required key count
+- AND it does not partially materialize that event
+
+#### Scenario: Cursor is in the future
+- WHEN the requested cursor exceeds current authority revision
+- THEN the adapter returns `RevisionUnavailable`
+- AND no event data is returned
 
 #### Scenario: Cursor predates retained history
-- WHEN the requested revision is older than the filesystem's oldest retained event
+- WHEN the cursor is older than the oldest retained revision
 - THEN the adapter returns `RevisionCompacted`
 - AND callers must rebuild caches from authoritative reads
 
+#### Scenario: Poll request exceeds adapter limits
+- WHEN a poll was constructed under looser event/key bounds
+- THEN the adapter returns `MalformedRequest`
+- AND it does not issue an unbounded query
+
 ### Requirement: PostgreSQL Adapter Conformance and Recovery
-The system SHALL run offline adapter tests and the reusable live state-store conformance suite against current PostgreSQL 15–18 minor releases through independently created pools.
+The system SHALL run offline tests and the reusable live state-store conformance suite against current PostgreSQL 15–18 minor releases through independent pools.
 
 #### Scenario: Offline workspace tests run
 - WHEN no PostgreSQL DSN is configured
-- THEN numeric, codec, configuration, migration-checksum, key-order, and error-classification tests still run deterministically
-- AND ordinary workspace tests do not provision or require a database
+- THEN numeric, codec, cursor, configuration, migration-checksum, key-order, clock-conversion, and error-classification tests run deterministically
+- AND ordinary workspace tests do not provision a database
 
 #### Scenario: Live test is required
-- WHEN CI sets `W9PT_POSTGRES_TEST_REQUIRED=1` and a version-specific DSN
+- WHEN CI sets `W9PT_POSTGRES_TEST_REQUIRED=1` with version-specific DSNs
 - THEN migrations, startup validation, conformance, concurrency, leases, ambiguity, change polling, and fresh-client recovery execute
-- AND a missing DSN fails rather than silently skipping
+- AND a missing required DSN fails rather than silently skipping
 
-#### Scenario: Independent clients reopen state
-- WHEN one pool/store is discarded and another is constructed without shared local state
-- THEN the second adapter reconstructs authoritative records, mutation results, fences, and revisions from PostgreSQL alone
-- AND behavior matches the shared conformance reference
+#### Scenario: Bootstrap conformance runs
+- WHEN the shared suite acquires a lease before inserting `FilesystemRecord`
+- THEN independent PostgreSQL clients observe the exact revision and absence semantics of the reference authority
+- AND bootstrap succeeds under `RecordAbsent`
+
+#### Scenario: Independent client reopens state
+- WHEN one pool/store is discarded and another is constructed without shared state caches
+- THEN the second reconstructs records, mutation results, fences, lease-operation results, and revisions from PostgreSQL
+- AND behavior matches the reusable conformance reference
 
 ### Requirement: Explicit PostgreSQL Adapter Exclusions
 The system SHALL keep content layout, session durability, replica reads, wake-up notifications, and deployment concerns outside the PostgreSQL state adapter.
 
 #### Scenario: File data or block map is supplied
 - WHEN a caller attempts to store payload bytes, S3 manifests, blocks, or extent maps through version 1
-- THEN the adapter rejects or lacks that operation
-- AND stores only the finalized state contract's metadata and `ContentRef` fields
+- THEN the adapter lacks that operation
+- AND stores only finalized metadata and inode `ContentRef` fields
 
 #### Scenario: Session migration state is required
 - WHEN fids, tags, flush dependencies, effects, or response outboxes must survive node loss
 - THEN a separate session-state layer owns them
-- AND PostgreSQL filesystem-state tables do not become an implicit session database
+- AND filesystem-state tables do not become an implicit session database
 
 #### Scenario: Notification or deployment feature is requested
-- WHEN a caller needs `LISTEN/NOTIFY`, replica reads, synchronous-standby durability, database provisioning, backups, failover orchestration, or monitoring
-- THEN those features require separate deployment or approved adapter changes
+- WHEN a caller needs `LISTEN/NOTIFY`, replica reads, synchronous-standby durability, provisioning, backups, failover orchestration, or monitoring
+- THEN those features require separate deployment work or approved changes
 - AND version 1 does not claim them as correctness guarantees

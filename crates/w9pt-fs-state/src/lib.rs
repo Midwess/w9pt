@@ -2,6 +2,9 @@
 //!
 //! This crate defines portable filesystem metadata records and the semantic
 //! transaction contract implemented by local or distributed state adapters.
+//!
+//! This crate is under active unreleased development. Its API and record model
+//! may change without compatibility aliases or readers for earlier builds.
 
 #![forbid(unsafe_code)]
 
@@ -26,9 +29,10 @@ pub use change::{
 };
 pub use commit::{
     AmbiguousCommit, COMMIT_PROTOCOL_ORDER, CommitConflict, CommitConflictKind, CommitOutcome,
-    CommitProtocolPhase, CommitRequest, CommittedMutation, CounterAdjustment, MalformedCommit,
-    MutationContext, MutationMismatch, MutationReplay, Precondition, PublishContent,
-    PublishContentError, PublishXattrStaging, StateChange, validate_publish_content,
+    CommitProtocolPhase, CommitRequest, CommittedMutation, CounterAdjustment, InodeAttributeUpdate,
+    MalformedCommit, MutationContext, MutationMismatch, MutationReplay, Precondition,
+    PublishContent, PublishContentError, PublishXattrStaging, StateChange,
+    validate_publish_content,
 };
 
 pub use bounded::{
@@ -55,20 +59,20 @@ pub use limits::{
     InvalidStateLimits, StateLimitError, StateLimitKind, StateLimitValues, StateLimits,
 };
 pub use read::{
-    InvalidScanBounds, InvalidStateSnapshot, LockCursor, OpenPinCursor, ReadBatch, ReadConsistency,
-    ReadOutcome, ReadQuery, ReadResult, RecordScan, ScanBounds, ScanPage, ScanResume,
-    StateSnapshot, XattrCursor,
+    DirectoryPage, DirectoryPageEntry, InvalidScanBounds, InvalidStateSnapshot, LockCursor,
+    OpenPinCursor, ReadBatch, ReadConsistency, ReadOutcome, ReadQuery, ReadResult, RecordScan,
+    ScanBounds, ScanPage, ScanResume, StateSnapshot, XattrCursor,
 };
 pub use records::{
     DeviceNumbers, DirectoryEntryRecord, FilesystemRecord, InodeData, InodeKind, InodeRecord,
     InodeTimes, LockKind, LockOwner, LockRange, LockRangeEnd, LockRecord, MutationRecord,
     OpenAccess, OpenPinRecord, OpenRecord, OrphanRecord, RecordFamily, RecordKey,
     RecordValidationError, StateRecord, WriterLeaseRecord, XattrRecord, XattrStagingRecord,
-    validate_record_set,
+    validate_record_set, validate_record_set_with_limits,
 };
 pub use store::FilesystemStateStore;
 pub use values::{
     CounterOverflow, DataGeneration, DirectoryCookie, DirectoryGeneration, FencingToken,
     InodeGeneration, InvalidValue, LeaseDeadline, LeaseDuration, LockGeneration, MutationRetention,
-    RecordRevision, RequestFingerprint, StateRevision, UnixTimestamp,
+    QidPath, RecordRevision, RequestFingerprint, StateRevision, UnixTimestamp,
 };

@@ -4,7 +4,7 @@
 
 ### 1. Foundations
 
-- [x] 1.1 Add `crates/w9pt-storage` to the workspace with Rust 2024 package metadata, Apache-2.0 licensing, documentation lints, `unsafe_code = "forbid"`, and workspace-compatible Clippy policy.
+- [x] 1.1 Add `crates/w9pt-fs-storage` to the workspace with Rust 2024 package metadata, Apache-2.0 licensing, documentation lints, `unsafe_code = "forbid"`, and workspace-compatible Clippy policy.
 - [x] 1.2 Define `FileId`, caller-supplied `MutationId`, `ObjectKey`, opaque `ObjectVersion`, `Digest`, `ContentRef`, and `PreparedContent` strong types.
 - [x] 1.3 Define `StorageMethod::{Raw, BlockSplit}`, version-1 representation identifiers, persisted 32 KiB block parameters, and validated creation defaults.
 - [x] 1.4 Define checked `StorageLimits` and typed configuration, range, format, corruption, target, conflict, ambiguity, and limit errors.

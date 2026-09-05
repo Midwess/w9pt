@@ -5,7 +5,7 @@
 ### 1. Foundations
 
 - [x] 1.1 Add `crates/w9pt-fs-state` to the workspace with Rust 2024 metadata, Apache-2.0 licensing, documentation lints, `unsafe_code = "forbid"`, and workspace-compatible Clippy policy.
-- [x] 1.2 Add only the path dependency on `w9pt-storage`; verify there is no `w9pt`, SDK, database-client, or async-runtime dependency.
+- [x] 1.2 Add only the path dependency on `w9pt-fs-storage`; verify there is no `w9pt`, SDK, database-client, or async-runtime dependency.
 - [x] 1.3 Define fixed-width filesystem, inode, open, lock, lease, writer-scope, writer-incarnation, and client-incarnation IDs.
 - [x] 1.4 Define checked monotonic state/record revisions, directory cookies, fencing tokens, timestamps/deadlines, and state request fingerprints.
 - [x] 1.5 Define validated `StateLimits` for names, xattrs, result bytes, read queries, scan pages, preconditions, changes, change events, lease duration, and aggregate transaction size.

@@ -4,7 +4,7 @@ Status: approved
 
 ## Summary
 
-Add a new backend-neutral `w9pt-storage` crate that distributes one logical file's content across a caller-provided target object store. The first persisted storage methods are:
+Add a new backend-neutral `w9pt-fs-storage` crate that distributes one logical file's content across a caller-provided target object store. The first persisted storage methods are:
 
 - `raw`: one immutable object containing the complete logical file;
 - `block-split`: sparse, file-relative 32 KiB logical blocks stored as immutable objects.
@@ -30,7 +30,7 @@ The split also preserves the existing rule that protocol requests contain no obj
 
 ## Goals
 
-- Introduce a separate `w9pt-storage` workspace crate without adding dependencies or storage APIs to `w9pt`.
+- Introduce a separate `w9pt-fs-storage` workspace crate without adding dependencies or storage APIs to `w9pt`.
 - Define a runtime-neutral asynchronous target-object contract with immutable creation, reads, ranges, and single-key compare-and-swap publication.
 - Persist a self-describing storage method in every file manifest so configuration changes cannot reinterpret existing data.
 - Implement the `raw` whole-file method with explicit size bounds and documented rewrite amplification.
@@ -46,7 +46,7 @@ The split also preserves the existing rule that protocol requests contain no obj
 
 ### In scope
 
-- Root workspace membership for `crates/w9pt-storage`.
+- Root workspace membership for `crates/w9pt-fs-storage`.
 - Strong storage identifiers, validated limits, method configuration, content references, and typed errors.
 - A target object-store interface whose opaque version tokens can represent ETags, generation numbers, or local equivalents without exposing a specific provider.
 - A checked binary envelope, file head, file manifest, blob reference, and block-entry format.
@@ -74,7 +74,7 @@ The split also preserves the existing rule that protocol requests contain no obj
 
 ## Acceptance Criteria
 
-- `w9pt-storage` can create, reopen, read, write, and truncate files using either persisted storage method over the in-memory target.
+- `w9pt-fs-storage` can create, reopen, read, write, and truncate files using either persisted storage method over the in-memory target.
 - Reopening uses only target-store objects; no process-local index is authoritative.
 - Existing files remain readable after the configured default storage method changes.
 - `raw` mutations rewrite and atomically publish one complete file object within configured limits.
@@ -104,7 +104,7 @@ The split also preserves the existing rule that protocol requests contain no obj
 ## Dependencies
 
 - Rust 2024 with the workspace's Rust 1.85 baseline.
-- A narrowly scoped, license-compatible BLAKE3 implementation in `w9pt-storage`; the dependency-free policy for `w9pt` remains unchanged.
+- A narrowly scoped, license-compatible BLAKE3 implementation in `w9pt-fs-storage`; the dependency-free policy for `w9pt` remains unchanged.
 - A host-provided target implementation satisfying durable immutable puts, exact reads, atomic single-key compare-and-swap, and read-after-publication behavior.
 - Caller-provided `FileId` and `MutationId` values and any scheduling/runtime used to poll target futures.
 - A future filesystem semantic-engine proposal will integrate prepared content references with inode and namespace transactions.

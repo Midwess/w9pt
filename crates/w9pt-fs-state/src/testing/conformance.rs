@@ -10,8 +10,8 @@ use crate::{
     LeaseDuration, LeaseId, LeaseOperationId, LeaseRejection, LockGeneration, LockId, LockKind,
     LockOwner, LockRange, LockRecord, MutationContext, MutationResult, MutationResultKind,
     MutationRetention, OpenAccess, OpenId, OpenPinRecord, OpenRecord, OrphanRecord, Precondition,
-    PrincipalId, PublishContent, PublishXattrStaging, ReadBatch, ReadConsistency, ReadOutcome,
-    ReadQuery, ReadResult, RecordKey, RecordRevision, RecordScan, ReleaseLeaseOutcome,
+    PrincipalId, PublishContent, PublishXattrStaging, QidPath, ReadBatch, ReadConsistency,
+    ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, RecordScan, ReleaseLeaseOutcome,
     ReleaseWriterLease, RenewLeaseOutcome, RenewWriterLease, ResultFormatVersion, ScanBounds,
     ScanResume, StateChange, StateLimitValues, StateLimits, StateRecord, StateRevision,
     SymlinkTarget, UnixTimestamp, WriterFence, WriterIncarnationId, WriterScopeId, WriterTopology,
@@ -192,6 +192,7 @@ where
     };
     let root = InodeRecord::new(
         root_id,
+        QidPath::new(1).expect("one is a valid QID path"),
         RecordRevision::new(1).expect("one is a valid revision"),
         0o755,
         PrincipalId::new(b"r".to_vec(), limits)
@@ -204,6 +205,7 @@ where
         InodeGeneration::new(1).expect("one is a valid generation"),
         InodeData::Directory {
             generation: DirectoryGeneration::new(1).expect("one is a valid generation"),
+            parent_inode_id: root_id,
         },
     )
     .map_err(|error| StateStoreConformanceError::adapter("build root inode", error))?;
@@ -212,12 +214,13 @@ where
         StateRevision::new(1).expect("one is a valid revision"),
         RecordRevision::new(1).expect("one is a valid revision"),
         root_id,
+        QidPath::new(2).expect("two is a valid next QID path"),
         DirectoryCookie::new(1),
         1,
     )
     .map_err(|error| StateStoreConformanceError::adapter("build filesystem", error))?;
     let mutation = MutationContext::new(
-        w9pt_storage::MutationId::from_u128(7),
+        w9pt_fs_storage::MutationId::from_u128(7),
         crate::RequestFingerprint::blake3(b"conformance bootstrap"),
         ClientIncarnationId::from_u128(8),
         MutationRetention::new(100),
@@ -258,8 +261,40 @@ where
         }
     };
 
+    let identity_read = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![
+            ReadQuery::InodeByQidPath(QidPath::new(1).expect("one is nonzero")),
+            ReadQuery::InodeByQidPath(QidPath::new(2).expect("two is nonzero")),
+        ],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build QID lookup", error))?;
+    let ReadOutcome::Snapshot(identity_snapshot) = observer
+        .read(identity_read)
+        .await
+        .map_err(|error| StateStoreConformanceError::adapter("read QID lookup", error))?
+    else {
+        return Err(StateStoreConformanceError::assertion(
+            "QID lookup did not return a snapshot",
+        ));
+    };
+    if !matches!(
+        &identity_snapshot.results()[0],
+        ReadResult::InodeByQidPath { inode: Some(inode), .. }
+            if inode.inode_id() == root_id && inode.qid_path() == QidPath::new(1).expect("one is nonzero")
+    ) || !matches!(
+        &identity_snapshot.results()[1],
+        ReadResult::InodeByQidPath { inode: None, .. }
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "QID lookup did not preserve filesystem-scoped identity",
+        ));
+    }
+
     let failure_mutation = MutationContext::new(
-        w9pt_storage::MutationId::from_u128(70),
+        w9pt_fs_storage::MutationId::from_u128(70),
         crate::RequestFingerprint::blake3(b"failure-boundary"),
         ClientIncarnationId::from_u128(71),
         MutationRetention::new(100),
@@ -419,7 +454,7 @@ where
     let atomic_request = CommitRequest::new(
         filesystem_id,
         MutationContext::new(
-            w9pt_storage::MutationId::from_u128(9),
+            w9pt_fs_storage::MutationId::from_u128(9),
             crate::RequestFingerprint::blake3(b"atomic failure"),
             ClientIncarnationId::from_u128(10),
             MutationRetention::new(100),
@@ -492,7 +527,7 @@ where
     let stale_request = CommitRequest::new(
         filesystem_id,
         MutationContext::new(
-            w9pt_storage::MutationId::from_u128(11),
+            w9pt_fs_storage::MutationId::from_u128(11),
             crate::RequestFingerprint::blake3(b"stale fence"),
             ClientIncarnationId::from_u128(12),
             MutationRetention::new(100),
@@ -1101,6 +1136,7 @@ async fn check_isolated_transaction_bytes<H: StateStoreConformanceHarness>(
         StateRevision::new(1).expect("one is nonzero"),
         RecordRevision::new(1).expect("one is nonzero"),
         root_id,
+        QidPath::new(2).expect("two is a valid next QID path"),
         DirectoryCookie::new(1),
         1,
     )
@@ -1159,7 +1195,7 @@ async fn check_isolated_transaction_bytes<H: StateStoreConformanceHarness>(
     let request = CommitRequest::new(
         filesystem_id,
         MutationContext::new(
-            w9pt_storage::MutationId::from_u128(729),
+            w9pt_fs_storage::MutationId::from_u128(729),
             crate::RequestFingerprint::blake3(b"transaction-xattr"),
             ClientIncarnationId::from_u128(730),
             MutationRetention::new(100),
@@ -1363,6 +1399,28 @@ async fn check_independent_client_commits<S: FilesystemStateStore>(
         policy_outcome
             .map_err(|error| StateStoreConformanceError::adapter("disjoint policy", error))?,
     )?;
+    let stale_policy = conformance_request(
+        filesystem_id,
+        305,
+        fence,
+        vec![Precondition::FilesystemPolicyGeneration { expected: 1 }],
+        vec![StateChange::BumpInodeGeneration(root_id)],
+        limits,
+    )?;
+    if !matches!(
+        writer
+            .commit(stale_policy)
+            .await
+            .map_err(|error| StateStoreConformanceError::adapter("stale policy", error))?,
+        CommitOutcome::Conflict(crate::CommitConflict {
+            kind: crate::CommitConflictKind::FilesystemPolicyGeneration,
+            ..
+        })
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "stale policy generation did not conflict",
+        ));
+    }
     Ok(())
 }
 
@@ -1405,7 +1463,7 @@ fn conformance_request(
     CommitRequest::new(
         filesystem_id,
         MutationContext::new(
-            w9pt_storage::MutationId::from_u128(mutation_number),
+            w9pt_fs_storage::MutationId::from_u128(mutation_number),
             crate::RequestFingerprint::blake3(&mutation_number.to_be_bytes()),
             ClientIncarnationId::from_u128(304),
             MutationRetention::new(100),
@@ -1499,7 +1557,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
         let request = CommitRequest::new(
             filesystem_id,
             MutationContext::new(
-                w9pt_storage::MutationId::from_u128(500),
+                w9pt_fs_storage::MutationId::from_u128(500),
                 crate::RequestFingerprint::blake3(b"oversized-xattr"),
                 ClientIncarnationId::from_u128(501),
                 MutationRetention::new(100),
@@ -1547,6 +1605,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
         })?;
         let inode = InodeRecord::new(
             InodeId::from_u128(520),
+            QidPath::new(2).expect("two is a valid QID path"),
             RecordRevision::new(1).expect("one is nonzero"),
             0o755,
             PrincipalId::new(vec![b'p'; values.max_principal_bytes], looser).map_err(|error| {
@@ -1565,6 +1624,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
             InodeGeneration::new(1).expect("one is nonzero"),
             InodeData::Directory {
                 generation: DirectoryGeneration::new(1).expect("one is nonzero"),
+                parent_inode_id: InodeId::from_u128(520),
             },
         )
         .map_err(|error| StateStoreConformanceError::adapter("principal inode", error))?;
@@ -1596,6 +1656,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
         let inode_id = InodeId::from_u128(522);
         let inode = InodeRecord::new(
             inode_id,
+            QidPath::new(2).expect("two is a valid QID path"),
             RecordRevision::new(1).expect("one is nonzero"),
             0o755,
             PrincipalId::new(b"p".to_vec(), looser)
@@ -1613,6 +1674,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
             InodeGeneration::new(1).expect("one is nonzero"),
             InodeData::Directory {
                 generation: DirectoryGeneration::new(1).expect("one is nonzero"),
+                parent_inode_id: inode_id,
             },
         )
         .map_err(|error| StateStoreConformanceError::adapter("group inode", error))?;
@@ -1646,6 +1708,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
             .map_err(|error| StateStoreConformanceError::adapter("oversized symlink", error))?;
         let inode = InodeRecord::new(
             inode_id,
+            QidPath::new(2).expect("two is a valid QID path"),
             RecordRevision::new(1).expect("one is nonzero"),
             0o777,
             PrincipalId::new(b"p".to_vec(), looser)
@@ -1861,7 +1924,7 @@ async fn check_receiver_limits<S: FilesystemStateStore>(
         let request = CommitRequest::new(
             filesystem_id,
             MutationContext::new(
-                w9pt_storage::MutationId::from_u128(510),
+                w9pt_fs_storage::MutationId::from_u128(510),
                 crate::RequestFingerprint::blake3(b"oversized-result"),
                 ClientIncarnationId::from_u128(511),
                 MutationRetention::new(100),
@@ -2006,7 +2069,7 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
     limits: StateLimits,
 ) -> Result<(), StateStoreConformanceError> {
     let file_id = InodeId::from_u128(20);
-    let content_file_id = w9pt_storage::FileId::from_u128(20);
+    let content_file_id = w9pt_fs_storage::FileId::from_u128(20);
     let mut entry_name = EntryName::new(b"f".to_vec(), limits)
         .map_err(|error| StateStoreConformanceError::adapter("build entry name", error))?;
     let file = conformance_file(file_id, content_file_id, 1, 1, None, times, limits)?;
@@ -2040,11 +2103,49 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
             StateChange::AdvanceDirectoryCookie {
                 count: core::num::NonZeroU64::new(1).expect("one is nonzero"),
             },
+            StateChange::AdvanceQidPath {
+                count: core::num::NonZeroU64::new(1).expect("one is nonzero"),
+            },
         ],
         limits,
     )
     .await?;
     require_committed("create record set", create)?;
+
+    let page_request = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![ReadQuery::DirectoryPage {
+            parent_inode_id: root_id,
+            after: DirectoryCookie::START,
+            bounds: ScanBounds::new(8, 4_096, limits).map_err(|error| {
+                StateStoreConformanceError::adapter("build semantic directory page", error)
+            })?,
+        }],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build page read", error))?;
+    let ReadOutcome::Snapshot(page_snapshot) = store
+        .read(page_request)
+        .await
+        .map_err(|error| StateStoreConformanceError::adapter("read semantic page", error))?
+    else {
+        return Err(StateStoreConformanceError::assertion(
+            "semantic directory page did not return a snapshot",
+        ));
+    };
+    if !matches!(
+        &page_snapshot.results()[0],
+        ReadResult::DirectoryPage(page)
+            if page.entries().len() == 1
+                && page.entries()[0].entry().child_inode_id() == file_id
+                && page.entries()[0].child_kind() == crate::InodeKind::RegularFile
+                && page.entries()[0].child_qid_path() == QidPath::new(2).expect("two is nonzero")
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "semantic directory page did not retain child QID and kind",
+        ));
+    }
 
     let renamed = EntryName::new(b"n".to_vec(), limits)
         .map_err(|error| StateStoreConformanceError::adapter("build rename target", error))?;
@@ -2161,47 +2262,92 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
         .await?,
     )?;
 
-    let content_mutation = w9pt_storage::MutationId::from_u128(101);
-    let repository = w9pt_storage::ContentRepository::new(
-        w9pt_storage::testing::MemoryTarget::new(),
+    let content_mutation = w9pt_fs_storage::MutationId::from_u128(101);
+    let repository = w9pt_fs_storage::ContentRepository::new(
+        w9pt_fs_storage::testing::MemoryTarget::new(),
         "state-conformance",
-        w9pt_storage::CreationDefaults::new(w9pt_storage::StorageMethod::BlockSplit),
-        w9pt_storage::StorageLimits::default(),
+        w9pt_fs_storage::CreationDefaults::new(w9pt_fs_storage::StorageMethod::BlockSplit),
+        w9pt_fs_storage::StorageLimits::default(),
     )
     .map_err(|error| StateStoreConformanceError::adapter("build content repository", error))?;
     let prepared = repository
         .prepare_create(content_file_id, content_mutation, 0, b"d")
         .await
         .map_err(|error| StateStoreConformanceError::adapter("prepare content", error))?;
-    let publish_request = CommitRequest::new(
-        filesystem_id,
-        MutationContext::new(
-            content_mutation,
-            crate::RequestFingerprint::blake3(b"publish"),
-            ClientIncarnationId::from_u128(102),
-            MutationRetention::new(100),
-        ),
-        fence,
-        vec![],
-        vec![StateChange::PublishContent(PublishContent {
-            inode_id: file_id,
-            expected_base: w9pt_storage::BaseContentIdentity::NEW_FILE,
-            logical_size: prepared.content().logical_size(),
-            data_generation: DataGeneration::new(prepared.content().generation())
-                .expect("prepared generation is nonzero"),
-            prepared: prepared.clone(),
-            inode_generation: InodeGeneration::new(4).expect("four is nonzero"),
-            times,
-        })],
-        terminal_result(b"r", limits)?,
-        limits,
-    )
-    .map_err(|error| StateStoreConformanceError::adapter("build content publish", error))?;
+    let publish_request =
+        CommitRequest::new(
+            filesystem_id,
+            MutationContext::new(
+                content_mutation,
+                crate::RequestFingerprint::blake3(b"publish"),
+                ClientIncarnationId::from_u128(102),
+                MutationRetention::new(100),
+            ),
+            fence,
+            vec![],
+            vec![StateChange::PublishContent(PublishContent {
+                inode_id: file_id,
+                expected_base: w9pt_fs_storage::BaseContentIdentity::NEW_FILE,
+                logical_size: prepared.content().logical_size(),
+                data_generation: DataGeneration::new(prepared.content().generation())
+                    .expect("prepared generation is nonzero"),
+                prepared: prepared.clone(),
+                inode_generation: InodeGeneration::new(4).expect("four is nonzero"),
+                attributes: crate::InodeAttributeUpdate {
+                    mode: Some(0o640),
+                    owner: Some(PrincipalId::new(b"content-owner".to_vec(), limits).map_err(
+                        |error| StateStoreConformanceError::adapter("content owner", error),
+                    )?),
+                    group: Some(GroupId::new(b"content-group".to_vec(), limits).map_err(
+                        |error| StateStoreConformanceError::adapter("content group", error),
+                    )?),
+                    modified: Some(UnixTimestamp::new(2, 0).expect("valid timestamp")),
+                    changed: Some(UnixTimestamp::new(2, 0).expect("valid timestamp")),
+                    ..crate::InodeAttributeUpdate::default()
+                },
+            })],
+            terminal_result(b"r", limits)?,
+            limits,
+        )
+        .map_err(|error| StateStoreConformanceError::adapter("build content publish", error))?;
     let published = store
         .commit(publish_request)
         .await
         .map_err(|error| StateStoreConformanceError::adapter("publish content", error))?;
     require_committed("publish content", published)?;
+
+    let published_read = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![ReadQuery::Inode(file_id)],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build published read", error))?;
+    if !matches!(
+        store
+            .read(published_read)
+            .await
+            .map_err(|error| StateStoreConformanceError::adapter("read publication", error))?,
+        ReadOutcome::Snapshot(snapshot)
+            if matches!(
+                &snapshot.results()[0],
+                ReadResult::Point { record: Some(record), .. }
+                    if matches!(
+                        record.as_ref(),
+                        StateRecord::Inode(inode)
+                            if inode.mode() == 0o640
+                                && inode.owner().as_bytes() == b"content-owner"
+                                && inode.group().as_bytes() == b"content-group"
+                                && inode.times().accessed == times.accessed
+                                && inode.times().modified
+                                    == UnixTimestamp::new(2, 0).expect("valid timestamp")
+                    )
+            )
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "content publication did not atomically apply selected attributes",
+        ));
+    }
 
     let changed_timestamp = UnixTimestamp::new(1, 0).expect("valid timestamp");
     let changed_times = InodeTimes {
@@ -2212,6 +2358,7 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
     };
     let setattr = InodeRecord::new(
         file_id,
+        QidPath::new(2).expect("two is a valid QID path"),
         RecordRevision::new(1).expect("one is nonzero"),
         0o600,
         PrincipalId::new(b"o".to_vec(), limits)
@@ -2293,6 +2440,29 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
     )
     .await?;
     require_committed("open pins", opens)?;
+
+    let pin_count_read = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![ReadQuery::OpenPinCount(file_id)],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build pin-count read", error))?;
+    if !matches!(
+        store
+            .read(pin_count_read)
+            .await
+            .map_err(|error| StateStoreConformanceError::adapter("read pin count", error))?,
+        ReadOutcome::Snapshot(snapshot)
+            if matches!(
+                &snapshot.results()[0],
+                ReadResult::OpenPinCount { inode_id, count: 2 } if *inode_id == file_id
+            )
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "fixed-size open-pin count did not report both pins",
+        ));
+    }
 
     let lock_id = LockId::from_u128(108);
     let first_lock = LockRecord::new(
@@ -2621,7 +2791,7 @@ async fn commit_changes<S: FilesystemStateStore>(
     let request = CommitRequest::new(
         filesystem_id,
         MutationContext::new(
-            w9pt_storage::MutationId::from_u128(mutation_number),
+            w9pt_fs_storage::MutationId::from_u128(mutation_number),
             crate::RequestFingerprint::blake3(&mutation_number.to_be_bytes()),
             ClientIncarnationId::from_u128(119),
             MutationRetention::new(100),
@@ -2662,6 +2832,7 @@ fn conformance_root(
 ) -> Result<InodeRecord, StateStoreConformanceError> {
     InodeRecord::new(
         root_id,
+        QidPath::new(1).expect("one is a valid QID path"),
         RecordRevision::new(1).expect("one is nonzero"),
         0o755,
         PrincipalId::new(b"r".to_vec(), limits)
@@ -2675,6 +2846,7 @@ fn conformance_root(
         InodeData::Directory {
             generation: DirectoryGeneration::new(directory_generation)
                 .expect("test generation is nonzero"),
+            parent_inode_id: root_id,
         },
     )
     .map_err(|error| StateStoreConformanceError::adapter("build root replacement", error))
@@ -2683,21 +2855,22 @@ fn conformance_root(
 #[allow(clippy::too_many_arguments)]
 fn conformance_file(
     file_id: InodeId,
-    content_file_id: w9pt_storage::FileId,
+    content_file_id: w9pt_fs_storage::FileId,
     links: u64,
     inode_generation: u64,
-    content: Option<w9pt_storage::ContentRef>,
+    content: Option<w9pt_fs_storage::ContentRef>,
     times: InodeTimes,
     limits: StateLimits,
 ) -> Result<InodeRecord, StateStoreConformanceError> {
     let logical_size = content
         .as_ref()
-        .map_or(0, w9pt_storage::ContentRef::logical_size);
+        .map_or(0, w9pt_fs_storage::ContentRef::logical_size);
     let data_generation = content
         .as_ref()
-        .map_or(0, w9pt_storage::ContentRef::generation);
+        .map_or(0, w9pt_fs_storage::ContentRef::generation);
     InodeRecord::new(
         file_id,
+        QidPath::new(2).expect("two is a valid QID path"),
         RecordRevision::new(1).expect("one is nonzero"),
         0o644,
         PrincipalId::new(b"p".to_vec(), limits)
@@ -2784,7 +2957,7 @@ mod tests {
             StateLimits::default(),
             ManualLeaseClock::new(LeaseDeadline::new(0)),
         );
-        w9pt_storage::testing::block_on(check_state_store_conformance(&authority)).unwrap();
+        w9pt_fs_storage::testing::block_on(check_state_store_conformance(&authority)).unwrap();
     }
 
     #[test]
@@ -2794,6 +2967,6 @@ mod tests {
             StateLimits::default(),
             ManualLeaseClock::new(LeaseDeadline::new(0)),
         );
-        w9pt_storage::testing::block_on(check_state_store_conformance(&authority)).unwrap();
+        w9pt_fs_storage::testing::block_on(check_state_store_conformance(&authority)).unwrap();
     }
 }

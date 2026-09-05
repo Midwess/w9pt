@@ -2,7 +2,7 @@
 
 ## Design Approach
 
-Create a new `w9pt-storage` crate implementing a backend-neutral file-content repository. Keep the existing `w9pt` protocol/session crate unchanged. The repository is generic over a runtime-neutral target-store contract and dispatches internally between `Raw` and `BlockSplit` methods persisted in each file manifest.
+Create a new `w9pt-fs-storage` crate implementing a backend-neutral file-content repository. Keep the existing `w9pt` protocol/session crate unchanged. The repository is generic over a runtime-neutral target-store contract and dispatches internally between `Raw` and `BlockSplit` methods persisted in each file manifest.
 
 Use immutable payloads and manifests. Separate content preparation from authoritative publication, then provide a small object-backed file-head publisher for standalone operation and tests. Require durable data objects before manifest creation and a conditional head update before a prepared version becomes current.
 
@@ -15,7 +15,7 @@ Cargo.toml                                      # add workspace member
 Cargo.lock                                     # resolved compatible dependencies
 README.md                                      # document crate/status
 
-crates/w9pt-storage/
+crates/w9pt-fs-storage/
   Cargo.toml
   src/
     lib.rs                                     # public API and crate contract

@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     ClientIncarnationId, DataGeneration, DirectoryCookie, DirectoryGeneration, EntryName,
     FencingToken, FilesystemId, GroupId, InodeGeneration, InodeId, LeaseDeadline, LeaseId,
-    LockGeneration, LockId, MutationResult, MutationRetention, OpenId, PrincipalId, RecordRevision,
-    RequestFingerprint, StateLimitError, StateLimitKind, StateLimits, StateRevision, SymlinkTarget,
-    UnixTimestamp, WriterIncarnationId, WriterScopeId, XattrName, XattrStagingId, XattrValue,
+    LockGeneration, LockId, MutationResult, MutationRetention, OpenId, PrincipalId, QidPath,
+    RecordRevision, RequestFingerprint, StateLimitError, StateLimitKind, StateLimits,
+    StateRevision, SymlinkTarget, UnixTimestamp, WriterIncarnationId, WriterScopeId, XattrName,
+    XattrStagingId, XattrValue,
 };
 
 /// Stable semantic family of one authoritative record.
@@ -60,7 +61,7 @@ pub enum RecordKey {
     /// Xattr staging by stable staging identity.
     XattrStaging(FilesystemId, XattrStagingId),
     /// Mutation ledger by globally stable mutation identity.
-    Mutation(FilesystemId, w9pt_storage::MutationId),
+    Mutation(FilesystemId, w9pt_fs_storage::MutationId),
     /// Writer lease by protected scope.
     WriterLease(FilesystemId, WriterScopeId),
 }
@@ -377,6 +378,7 @@ pub struct FilesystemRecord {
     revision: StateRevision,
     record_revision: RecordRevision,
     root_inode_id: InodeId,
+    next_qid_path: QidPath,
     next_directory_cookie: DirectoryCookie,
     policy_generation: u64,
 }
@@ -388,6 +390,7 @@ impl FilesystemRecord {
         revision: StateRevision,
         record_revision: RecordRevision,
         root_inode_id: InodeId,
+        next_qid_path: QidPath,
         next_directory_cookie: DirectoryCookie,
         policy_generation: u64,
     ) -> Result<Self, RecordValidationError> {
@@ -404,6 +407,7 @@ impl FilesystemRecord {
             revision,
             record_revision,
             root_inode_id,
+            next_qid_path,
             next_directory_cookie,
             policy_generation,
         })
@@ -429,6 +433,11 @@ impl FilesystemRecord {
         self.root_inode_id
     }
 
+    /// Returns the next stable QID path that may be allocated transactionally.
+    pub const fn next_qid_path(&self) -> QidPath {
+        self.next_qid_path
+    }
+
     /// Returns the next cookie that may be allocated transactionally.
     pub const fn next_directory_cookie(&self) -> DirectoryCookie {
         self.next_directory_cookie
@@ -444,6 +453,14 @@ impl FilesystemRecord {
         count: core::num::NonZeroU64,
     ) -> Result<(), crate::CounterOverflow> {
         self.next_directory_cookie = self.next_directory_cookie.checked_advance(count.get())?;
+        Ok(())
+    }
+
+    pub(crate) fn advance_qid_path(
+        &mut self,
+        count: core::num::NonZeroU64,
+    ) -> Result<(), crate::CounterOverflow> {
+        self.next_qid_path = self.next_qid_path.checked_advance(count.get())?;
         Ok(())
     }
 
@@ -970,7 +987,7 @@ impl XattrStagingRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationRecord {
     filesystem_id: FilesystemId,
-    mutation_id: w9pt_storage::MutationId,
+    mutation_id: w9pt_fs_storage::MutationId,
     fingerprint: RequestFingerprint,
     client_incarnation: ClientIncarnationId,
     writer_scope: WriterScopeId,
@@ -987,7 +1004,7 @@ impl MutationRecord {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         filesystem_id: FilesystemId,
-        mutation_id: w9pt_storage::MutationId,
+        mutation_id: w9pt_fs_storage::MutationId,
         fingerprint: RequestFingerprint,
         client_incarnation: ClientIncarnationId,
         writer_scope: WriterScopeId,
@@ -1019,7 +1036,7 @@ impl MutationRecord {
     }
 
     /// Returns the globally stable mutation identity.
-    pub const fn mutation_id(&self) -> w9pt_storage::MutationId {
+    pub const fn mutation_id(&self) -> w9pt_fs_storage::MutationId {
         self.mutation_id
     }
 
@@ -1219,10 +1236,10 @@ pub struct DeviceNumbers {
 pub enum InodeData {
     /// Regular file and its explicit immutable-content identity.
     RegularFile {
-        /// File identity used by `w9pt-storage` object preparation.
-        content_file_id: w9pt_storage::FileId,
+        /// File identity used by `w9pt-fs-storage` object preparation.
+        content_file_id: w9pt_fs_storage::FileId,
         /// Current prepared content, or `None` before initial content publication.
-        content: Option<w9pt_storage::ContentRef>,
+        content: Option<w9pt_fs_storage::ContentRef>,
         /// Zero before first publication, otherwise equal to `content.generation()`.
         data_generation: u64,
     },
@@ -1230,6 +1247,8 @@ pub enum InodeData {
     Directory {
         /// Increases whenever a directory entry changes.
         generation: DirectoryGeneration,
+        /// Authoritative parent directory; an export root points to itself.
+        parent_inode_id: InodeId,
     },
     /// Symbolic-link target bytes.
     Symlink {
@@ -1278,6 +1297,7 @@ pub struct InodeTimes {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InodeRecord {
     inode_id: InodeId,
+    qid_path: QidPath,
     revision: RecordRevision,
     mode: u32,
     owner: PrincipalId,
@@ -1294,6 +1314,7 @@ impl InodeRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         inode_id: InodeId,
+        qid_path: QidPath,
         revision: RecordRevision,
         mode: u32,
         owner: PrincipalId,
@@ -1310,6 +1331,7 @@ impl InodeRecord {
         validate_inode_data(logical_size, &data)?;
         Ok(Self {
             inode_id,
+            qid_path,
             revision,
             mode,
             owner,
@@ -1325,6 +1347,11 @@ impl InodeRecord {
     /// Returns the stable inode identity.
     pub const fn inode_id(&self) -> InodeId {
         self.inode_id
+    }
+
+    /// Returns the stable non-reused 9P QID path.
+    pub const fn qid_path(&self) -> QidPath {
+        self.qid_path
     }
 
     /// Returns the record revision.
@@ -1378,7 +1405,7 @@ impl InodeRecord {
     }
 
     /// Returns the regular file's explicit immutable-content identity when applicable.
-    pub const fn content_file_id(&self) -> Option<w9pt_storage::FileId> {
+    pub const fn content_file_id(&self) -> Option<w9pt_fs_storage::FileId> {
         match &self.data {
             InodeData::RegularFile {
                 content_file_id, ..
@@ -1388,7 +1415,7 @@ impl InodeRecord {
     }
 
     /// Returns the currently published immutable content reference when present.
-    pub const fn content(&self) -> Option<&w9pt_storage::ContentRef> {
+    pub const fn content(&self) -> Option<&w9pt_fs_storage::ContentRef> {
         match &self.data {
             InodeData::RegularFile { content, .. } => content.as_ref(),
             _ => None,
@@ -1396,14 +1423,14 @@ impl InodeRecord {
     }
 
     /// Returns the exact regular-file content base, including the new-file sentinel.
-    pub fn content_base(&self) -> Option<w9pt_storage::BaseContentIdentity> {
+    pub fn content_base(&self) -> Option<w9pt_fs_storage::BaseContentIdentity> {
         match &self.data {
             InodeData::RegularFile {
                 content: Some(content),
                 ..
-            } => Some(w9pt_storage::BaseContentIdentity::from_content(content)),
+            } => Some(w9pt_fs_storage::BaseContentIdentity::from_content(content)),
             InodeData::RegularFile { content: None, .. } => {
-                Some(w9pt_storage::BaseContentIdentity::NEW_FILE)
+                Some(w9pt_fs_storage::BaseContentIdentity::NEW_FILE)
             }
             _ => None,
         }
@@ -1422,7 +1449,17 @@ impl InodeRecord {
     /// Returns the directory namespace generation when applicable.
     pub const fn directory_generation(&self) -> Option<DirectoryGeneration> {
         match &self.data {
-            InodeData::Directory { generation } => Some(*generation),
+            InodeData::Directory { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
+
+    /// Returns the authoritative parent identity for a directory.
+    pub const fn directory_parent(&self) -> Option<InodeId> {
+        match &self.data {
+            InodeData::Directory {
+                parent_inode_id, ..
+            } => Some(*parent_inode_id),
             _ => None,
         }
     }
@@ -1433,7 +1470,7 @@ impl InodeRecord {
     }
 
     pub(crate) fn bump_directory_generation(&mut self) -> Result<(), crate::CounterOverflow> {
-        let InodeData::Directory { generation } = &mut self.data else {
+        let InodeData::Directory { generation, .. } = &mut self.data else {
             return Err(crate::CounterOverflow {
                 field: "DirectoryGenerationKind",
             });
@@ -1458,7 +1495,16 @@ impl InodeRecord {
         let content_file_id = publication.prepared.content().file_id();
         self.logical_size = publication.logical_size;
         self.inode_generation = publication.inode_generation;
-        self.times = publication.times;
+        if let Some(mode) = publication.attributes.mode {
+            self.mode = mode;
+        }
+        if let Some(owner) = &publication.attributes.owner {
+            self.owner = owner.clone();
+        }
+        if let Some(group) = &publication.attributes.group {
+            self.group = group.clone();
+        }
+        self.times = publication.attributes.apply_times(self.times);
         self.data = InodeData::RegularFile {
             content_file_id,
             content: Some(publication.prepared.content().clone()),
@@ -1525,7 +1571,16 @@ fn validate_inode_data(logical_size: u64, data: &InodeData) -> Result<(), Record
 pub fn validate_record_set(
     records: &BTreeMap<RecordKey, StateRecord>,
 ) -> Result<(), RecordValidationError> {
+    validate_record_set_with_limits(records, StateLimits::default())
+}
+
+/// Validates a complete authority image with an explicit ancestry bound.
+pub fn validate_record_set_with_limits(
+    records: &BTreeMap<RecordKey, StateRecord>,
+    limits: StateLimits,
+) -> Result<(), RecordValidationError> {
     let mut directory_cookies = BTreeSet::new();
+    let mut qid_paths = BTreeSet::new();
     let mut locks = Vec::new();
     for (key, record) in records {
         record.validate_key(key)?;
@@ -1542,6 +1597,11 @@ pub fn validate_record_set(
                 if root.kind() != InodeKind::Directory {
                     return Err(RecordValidationError::InvalidRelatedRecord {
                         relation: "filesystem root is not a directory",
+                    });
+                }
+                if root.directory_parent() != Some(root.inode_id()) {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "filesystem root directory is not self-parented",
                     });
                 }
             }
@@ -1666,7 +1726,46 @@ pub fn validate_record_set(
                     "xattr-staging inode",
                 )?;
             }
-            StateRecord::Inode(_) | StateRecord::Mutation(_) | StateRecord::WriterLease(_) => {}
+            StateRecord::Inode(inode) => {
+                let Some(StateRecord::Filesystem(filesystem)) =
+                    records.get(&RecordKey::Filesystem(filesystem_id))
+                else {
+                    return Err(RecordValidationError::MissingRelatedRecord {
+                        relation: "inode filesystem header",
+                    });
+                };
+                if inode.qid_path() >= filesystem.next_qid_path() {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "inode QID path was not allocated before next QID path",
+                    });
+                }
+                if !qid_paths.insert((filesystem_id, inode.qid_path())) {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "duplicate inode QID path",
+                    });
+                }
+                if let Some(parent_inode_id) = inode.directory_parent() {
+                    let parent = require_inode(
+                        records,
+                        filesystem_id,
+                        parent_inode_id,
+                        "directory parent inode",
+                    )?;
+                    if parent.kind() != InodeKind::Directory {
+                        return Err(RecordValidationError::InvalidRelatedRecord {
+                            relation: "directory parent is not a directory",
+                        });
+                    }
+                    validate_directory_ancestry(
+                        records,
+                        filesystem_id,
+                        inode.inode_id(),
+                        filesystem.root_inode_id(),
+                        limits.max_directory_ancestor_depth(),
+                    )?;
+                }
+            }
+            StateRecord::Mutation(_) | StateRecord::WriterLease(_) => {}
         }
     }
     for (key, record) in records {
@@ -1674,22 +1773,43 @@ pub fn validate_record_set(
         else {
             continue;
         };
+        let namespace_entries: Vec<_> = records
+            .iter()
+            .filter_map(|(entry_key, record)| match (entry_key, record) {
+                (RecordKey::DirectoryEntry(entry_fs, _, _), StateRecord::DirectoryEntry(entry))
+                    if *entry_fs == *filesystem_id && entry.child_inode_id() == *inode_id =>
+                {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .collect();
+        let namespace_links = namespace_entries.len();
         if inode.kind() != InodeKind::Directory {
-            let namespace_links = records
-                .iter()
-                .filter(|(entry_key, record)| {
-                    matches!(
-                        (entry_key, record),
-                        (
-                            RecordKey::DirectoryEntry(entry_fs, _, _),
-                            StateRecord::DirectoryEntry(entry)
-                        ) if *entry_fs == *filesystem_id && entry.child_inode_id() == *inode_id
-                    )
-                })
-                .count();
             if u64::try_from(namespace_links) != Ok(inode.link_count()) {
                 return Err(RecordValidationError::InvalidRelatedRecord {
                     relation: "inode link count differs from namespace references",
+                });
+            }
+        } else {
+            let Some(StateRecord::Filesystem(filesystem)) =
+                records.get(&RecordKey::Filesystem(*filesystem_id))
+            else {
+                return Err(RecordValidationError::MissingRelatedRecord {
+                    relation: "directory filesystem header",
+                });
+            };
+            if *inode_id == filesystem.root_inode_id() {
+                if namespace_links != 0 {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "filesystem root directory has a namespace hard link",
+                    });
+                }
+            } else if namespace_entries.len() != 1
+                || namespace_entries[0].parent_inode_id() != inode.directory_parent().unwrap()
+            {
+                return Err(RecordValidationError::InvalidRelatedRecord {
+                    relation: "directory must have exactly one entry in its authoritative parent",
                 });
             }
         }
@@ -1719,6 +1839,44 @@ pub fn validate_record_set(
         }
     }
     Ok(())
+}
+
+fn validate_directory_ancestry(
+    records: &BTreeMap<RecordKey, StateRecord>,
+    filesystem_id: FilesystemId,
+    inode_id: InodeId,
+    root_inode_id: InodeId,
+    maximum_depth: u32,
+) -> Result<(), RecordValidationError> {
+    let mut current = inode_id;
+    let mut visited = BTreeSet::new();
+    // `maximum_depth` bounds parent edges, not visited nodes. Inspecting the
+    // root requires one final iteration after traversing exactly that many
+    // edges from the directory under validation.
+    for _ in 0..=maximum_depth {
+        if !visited.insert(current) {
+            return Err(RecordValidationError::DirectoryCycle { inode_id });
+        }
+        let inode = require_inode(records, filesystem_id, current, "directory ancestor inode")?;
+        let Some(parent) = inode.directory_parent() else {
+            return Err(RecordValidationError::InvalidRelatedRecord {
+                relation: "directory ancestor is not a directory",
+            });
+        };
+        if current == root_inode_id {
+            return if parent == root_inode_id {
+                Ok(())
+            } else {
+                Err(RecordValidationError::InvalidRelatedRecord {
+                    relation: "filesystem root directory is not self-parented",
+                })
+            };
+        }
+        current = parent;
+    }
+    Err(RecordValidationError::DirectoryAncestorLimit {
+        maximum: maximum_depth,
+    })
 }
 
 fn require_inode<'a>(
@@ -1757,6 +1915,16 @@ pub enum RecordValidationError {
     InvalidRelatedRecord {
         /// Stable relationship description.
         relation: &'static str,
+    },
+    /// Directory ancestry contains a cycle.
+    DirectoryCycle {
+        /// Directory whose ancestry was validated.
+        inode_id: InodeId,
+    },
+    /// Directory ancestry did not reach the root within the configured bound.
+    DirectoryAncestorLimit {
+        /// Maximum number of directory-parent edges allowed.
+        maximum: u32,
     },
     /// Directory entries and allocation state reserve cookie zero for scan start.
     ZeroDirectoryCookie,
@@ -1843,6 +2011,18 @@ impl fmt::Display for RecordValidationError {
             Self::InvalidRelatedRecord { relation } => {
                 write!(formatter, "invalid related record: {relation}")
             }
+            Self::DirectoryCycle { inode_id } => {
+                write!(
+                    formatter,
+                    "directory ancestry contains a cycle at {inode_id:?}"
+                )
+            }
+            Self::DirectoryAncestorLimit { maximum } => {
+                write!(
+                    formatter,
+                    "directory ancestry exceeds configured depth {maximum}"
+                )
+            }
             Self::ZeroDirectoryCookie => {
                 formatter.write_str("directory cookie zero is reserved for scan start")
             }
@@ -1897,7 +2077,7 @@ impl std::error::Error for RecordValidationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GroupId, PrincipalId, StateLimits};
+    use crate::{GroupId, PrincipalId, StateLimitValues, StateLimits};
 
     fn identity() -> (PrincipalId, GroupId) {
         let limits = StateLimits::default();
@@ -1922,6 +2102,7 @@ mod tests {
         let (owner, group) = identity();
         let inode = InodeRecord::new(
             InodeId::from_u128(1),
+            QidPath::new(1).unwrap(),
             RecordRevision::new(1).unwrap(),
             0o644,
             owner,
@@ -1931,7 +2112,7 @@ mod tests {
             1,
             InodeGeneration::new(1).unwrap(),
             InodeData::RegularFile {
-                content_file_id: w9pt_storage::FileId::from_u128(1),
+                content_file_id: w9pt_fs_storage::FileId::from_u128(1),
                 content: None,
                 data_generation: 0,
             },
@@ -1945,18 +2126,19 @@ mod tests {
     #[test]
     fn mismatched_content_summary_is_rejected() {
         let (owner, group) = identity();
-        let content = w9pt_storage::ContentRef::from_persisted(
-            w9pt_storage::FileId::from_u128(1),
+        let content = w9pt_fs_storage::ContentRef::from_persisted(
+            w9pt_fs_storage::FileId::from_u128(1),
             1,
             3,
-            w9pt_storage::ObjectKey::new("manifest").unwrap(),
-            w9pt_storage::Digest::new([1; 32]),
-            w9pt_storage::StorageMethod::Raw,
+            w9pt_fs_storage::ObjectKey::new("manifest").unwrap(),
+            w9pt_fs_storage::Digest::new([1; 32]),
+            w9pt_fs_storage::StorageMethod::Raw,
         )
         .unwrap();
         assert!(matches!(
             InodeRecord::new(
                 InodeId::from_u128(1),
+                QidPath::new(1).unwrap(),
                 RecordRevision::new(1).unwrap(),
                 0o644,
                 owner,
@@ -1966,7 +2148,7 @@ mod tests {
                 1,
                 InodeGeneration::new(1).unwrap(),
                 InodeData::RegularFile {
-                    content_file_id: w9pt_storage::FileId::from_u128(1),
+                    content_file_id: w9pt_fs_storage::FileId::from_u128(1),
                     content: Some(content),
                     data_generation: 1,
                 },
@@ -2133,6 +2315,7 @@ mod tests {
         let (owner, group) = identity();
         let root = InodeRecord::new(
             root_id,
+            QidPath::new(1).unwrap(),
             revision,
             0o755,
             owner,
@@ -2143,6 +2326,7 @@ mod tests {
             InodeGeneration::new(1).unwrap(),
             InodeData::Directory {
                 generation: DirectoryGeneration::new(1).unwrap(),
+                parent_inode_id: root_id,
             },
         )
         .unwrap();
@@ -2151,6 +2335,7 @@ mod tests {
             StateRevision::new(1).unwrap(),
             revision,
             root_id,
+            QidPath::new(2).unwrap(),
             DirectoryCookie::new(1),
             1,
         )
@@ -2186,5 +2371,229 @@ mod tests {
             validate_record_set(&records),
             Err(RecordValidationError::MissingRelatedRecord { .. })
         ));
+    }
+
+    #[test]
+    fn qid_paths_are_unique_within_each_filesystem() {
+        let filesystem_id = FilesystemId::from_u128(10);
+        let root_id = InodeId::from_u128(11);
+        let duplicate_id = InodeId::from_u128(12);
+        let revision = RecordRevision::new(1).unwrap();
+        let (owner, group) = identity();
+        let root = InodeRecord::new(
+            root_id,
+            QidPath::new(1).unwrap(),
+            revision,
+            0o755,
+            owner.clone(),
+            group.clone(),
+            times(),
+            0,
+            1,
+            InodeGeneration::new(1).unwrap(),
+            InodeData::Directory {
+                generation: DirectoryGeneration::new(1).unwrap(),
+                parent_inode_id: root_id,
+            },
+        )
+        .unwrap();
+        let duplicate = InodeRecord::new(
+            duplicate_id,
+            QidPath::new(1).unwrap(),
+            revision,
+            0o644,
+            owner,
+            group,
+            times(),
+            0,
+            1,
+            InodeGeneration::new(1).unwrap(),
+            InodeData::Fifo,
+        )
+        .unwrap();
+        let filesystem = FilesystemRecord::new(
+            filesystem_id,
+            StateRevision::new(1).unwrap(),
+            revision,
+            root_id,
+            QidPath::new(2).unwrap(),
+            DirectoryCookie::new(1),
+            1,
+        )
+        .unwrap();
+        let records = BTreeMap::from([
+            (
+                RecordKey::Filesystem(filesystem_id),
+                StateRecord::Filesystem(filesystem),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, root_id),
+                StateRecord::Inode(root),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, duplicate_id),
+                StateRecord::Inode(duplicate),
+            ),
+        ]);
+        assert!(matches!(
+            validate_record_set(&records),
+            Err(RecordValidationError::InvalidRelatedRecord {
+                relation: "duplicate inode QID path"
+            })
+        ));
+    }
+
+    #[test]
+    fn directory_ancestry_accepts_exact_bound_and_rejects_one_edge_beyond() {
+        let limits = StateLimits::default();
+        let filesystem_id = FilesystemId::from_u128(20);
+        let root_id = InodeId::from_u128(21);
+        let first_id = InodeId::from_u128(22);
+        let second_id = InodeId::from_u128(23);
+        let revision = RecordRevision::new(1).unwrap();
+        let (owner, group) = identity();
+        let directory = |inode_id, qid, parent| {
+            InodeRecord::new(
+                inode_id,
+                QidPath::new(qid).unwrap(),
+                revision,
+                0o755,
+                owner.clone(),
+                group.clone(),
+                times(),
+                0,
+                1,
+                InodeGeneration::new(1).unwrap(),
+                InodeData::Directory {
+                    generation: DirectoryGeneration::new(1).unwrap(),
+                    parent_inode_id: parent,
+                },
+            )
+            .unwrap()
+        };
+        let first_name = EntryName::new(b"first".to_vec(), limits).unwrap();
+        let second_name = EntryName::new(b"second".to_vec(), limits).unwrap();
+        let filesystem = FilesystemRecord::new(
+            filesystem_id,
+            StateRevision::new(1).unwrap(),
+            revision,
+            root_id,
+            QidPath::new(4).unwrap(),
+            DirectoryCookie::new(4),
+            1,
+        )
+        .unwrap();
+        let records = BTreeMap::from([
+            (
+                RecordKey::Filesystem(filesystem_id),
+                StateRecord::Filesystem(filesystem),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, root_id),
+                StateRecord::Inode(directory(root_id, 1, root_id)),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, first_id),
+                StateRecord::Inode(directory(first_id, 2, root_id)),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, second_id),
+                StateRecord::Inode(directory(second_id, 3, first_id)),
+            ),
+            (
+                RecordKey::DirectoryEntry(filesystem_id, root_id, first_name.clone()),
+                StateRecord::DirectoryEntry(
+                    DirectoryEntryRecord::new(
+                        root_id,
+                        first_name.clone(),
+                        DirectoryCookie::new(1),
+                        first_id,
+                        revision,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                RecordKey::DirectoryEntry(filesystem_id, first_id, second_name.clone()),
+                StateRecord::DirectoryEntry(
+                    DirectoryEntryRecord::new(
+                        first_id,
+                        second_name,
+                        DirectoryCookie::new(2),
+                        second_id,
+                        revision,
+                    )
+                    .unwrap(),
+                ),
+            ),
+        ]);
+        validate_record_set(&records).unwrap();
+
+        let mut hard_linked = records.clone();
+        let alias = EntryName::new(b"alias".to_vec(), limits).unwrap();
+        hard_linked.insert(
+            RecordKey::DirectoryEntry(filesystem_id, root_id, alias.clone()),
+            StateRecord::DirectoryEntry(
+                DirectoryEntryRecord::new(
+                    root_id,
+                    alias,
+                    DirectoryCookie::new(3),
+                    second_id,
+                    revision,
+                )
+                .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            validate_record_set(&hard_linked),
+            Err(RecordValidationError::InvalidRelatedRecord {
+                relation: "directory must have exactly one entry in its authoritative parent"
+            })
+        ));
+
+        let mut cyclic = records.clone();
+        cyclic.remove(&RecordKey::DirectoryEntry(
+            filesystem_id,
+            root_id,
+            first_name.clone(),
+        ));
+        cyclic.insert(
+            RecordKey::DirectoryEntry(filesystem_id, second_id, first_name.clone()),
+            StateRecord::DirectoryEntry(
+                DirectoryEntryRecord::new(
+                    second_id,
+                    first_name,
+                    DirectoryCookie::new(1),
+                    first_id,
+                    revision,
+                )
+                .unwrap(),
+            ),
+        );
+        cyclic.insert(
+            RecordKey::Inode(filesystem_id, first_id),
+            StateRecord::Inode(directory(first_id, 2, second_id)),
+        );
+        assert!(matches!(
+            validate_record_set(&cyclic),
+            Err(RecordValidationError::DirectoryCycle { .. })
+        ));
+
+        let exact_bound = StateLimits::new(StateLimitValues {
+            max_directory_ancestor_depth: 2,
+            ..StateLimitValues::default()
+        })
+        .unwrap();
+        validate_record_set_with_limits(&records, exact_bound).unwrap();
+
+        let one_edge_short = StateLimits::new(StateLimitValues {
+            max_directory_ancestor_depth: 1,
+            ..StateLimitValues::default()
+        })
+        .unwrap();
+        assert_eq!(
+            validate_record_set_with_limits(&records, one_edge_short),
+            Err(RecordValidationError::DirectoryAncestorLimit { maximum: 1 })
+        );
     }
 }

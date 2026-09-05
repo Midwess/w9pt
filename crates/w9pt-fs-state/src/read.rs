@@ -3,7 +3,8 @@
 use core::fmt;
 
 use crate::{
-    DirectoryCookie, EntryName, FilesystemId, InodeId, LockId, OpenId, RecordFamily, RecordKey,
+    DirectoryCookie, DirectoryEntryRecord, EntryName, FilesystemId, InodeId, InodeKind,
+    InodeRecord, LockId, OpenId, QidPath, RecordFamily, RecordKey, RecordRevision,
     RecordValidationError, StateLimitError, StateLimitKind, StateLimits, StateRecord,
     StateRevision, WriterScopeId, XattrName, XattrStagingId,
 };
@@ -71,26 +72,29 @@ impl ReadBatch {
             if let Some(key) = query.point_key(self.filesystem_id) {
                 key.validate_against_limits(limits)?;
             }
-            if let ReadQuery::Scan(scan) = query {
-                scan.bounds()
-                    .validate(limits)
-                    .map_err(|error| match error {
-                        InvalidScanBounds::Limit(error) => error,
-                        InvalidScanBounds::ZeroItems => StateLimitError::new(
-                            StateLimitKind::ScanItems,
-                            0,
-                            u64::from(limits.max_scan_items()),
-                        ),
-                        InvalidScanBounds::ZeroBytes => StateLimitError::new(
-                            StateLimitKind::ScanBytes,
-                            0,
-                            u64::try_from(limits.max_scan_bytes()).unwrap_or(u64::MAX),
-                        ),
-                    })?;
-                if let RecordScan::Xattrs {
+            let bounds = match query {
+                ReadQuery::Scan(scan) => Some(scan.bounds()),
+                ReadQuery::DirectoryPage { bounds, .. } => Some(*bounds),
+                _ => None,
+            };
+            if let Some(bounds) = bounds {
+                bounds.validate(limits).map_err(|error| match error {
+                    InvalidScanBounds::Limit(error) => error,
+                    InvalidScanBounds::ZeroItems => StateLimitError::new(
+                        StateLimitKind::ScanItems,
+                        0,
+                        u64::from(limits.max_scan_items()),
+                    ),
+                    InvalidScanBounds::ZeroBytes => StateLimitError::new(
+                        StateLimitKind::ScanBytes,
+                        0,
+                        u64::try_from(limits.max_scan_bytes()).unwrap_or(u64::MAX),
+                    ),
+                })?;
+                if let ReadQuery::Scan(RecordScan::Xattrs {
                     after: Some(cursor),
                     ..
-                } = scan
+                }) = query
                 {
                     limits.require_bytes(
                         StateLimitKind::XattrName,
@@ -229,7 +233,7 @@ pub enum ScanResume {
     /// Last xattr staging identity returned.
     XattrStaging(XattrStagingId),
     /// Last mutation identity returned.
-    Mutation(w9pt_storage::MutationId),
+    Mutation(w9pt_fs_storage::MutationId),
     /// Last writer scope returned.
     WriterLease(WriterScopeId),
 }
@@ -316,7 +320,7 @@ pub enum RecordScan {
     /// Mutation ledger records in stable mutation-ID order.
     Mutations {
         /// Exclusive resume identity.
-        after: Option<w9pt_storage::MutationId>,
+        after: Option<w9pt_fs_storage::MutationId>,
         /// Page bounds.
         bounds: ScanBounds,
     },
@@ -370,12 +374,23 @@ pub enum ReadQuery {
     Filesystem,
     /// Read one inode.
     Inode(InodeId),
+    /// Read one inode by its per-filesystem stable QID path.
+    InodeByQidPath(QidPath),
     /// Read one directory component.
     DirectoryEntry {
         /// Parent directory.
         parent_inode_id: InodeId,
         /// Byte-exact component.
         name: EntryName,
+    },
+    /// Read one semantic directory page with child kind and QID summaries.
+    DirectoryPage {
+        /// Directory being enumerated.
+        parent_inode_id: InodeId,
+        /// Exclusive persistent cookie; zero starts enumeration.
+        after: DirectoryCookie,
+        /// Complete-entry item and byte bounds.
+        bounds: ScanBounds,
     },
     /// Read one portable open.
     Open(OpenId),
@@ -386,6 +401,8 @@ pub enum ReadQuery {
         /// Pinning open.
         open_id: OpenId,
     },
+    /// Count authoritative open pins for one inode without scanning them.
+    OpenPinCount(InodeId),
     /// Read one orphan.
     Orphan(InodeId),
     /// Read one byte-range lock.
@@ -405,7 +422,7 @@ pub enum ReadQuery {
     /// Read one xattr staging record.
     XattrStaging(XattrStagingId),
     /// Read one mutation result.
-    Mutation(w9pt_storage::MutationId),
+    Mutation(w9pt_fs_storage::MutationId),
     /// Read the current writer lease for one scope.
     WriterLease(WriterScopeId),
     /// Execute a bounded ordered family scan.
@@ -413,11 +430,14 @@ pub enum ReadQuery {
 }
 
 impl ReadQuery {
-    /// Converts a point query to its semantic key; scans return `None`.
+    /// Converts a primary-key point query to its semantic key.
+    ///
+    /// Secondary QID-path lookup and scans return `None`.
     pub fn point_key(&self, filesystem_id: crate::FilesystemId) -> Option<RecordKey> {
         match self {
             Self::Filesystem => Some(RecordKey::Filesystem(filesystem_id)),
             Self::Inode(inode_id) => Some(RecordKey::Inode(filesystem_id, *inode_id)),
+            Self::InodeByQidPath(_) => None,
             Self::DirectoryEntry {
                 parent_inode_id,
                 name,
@@ -426,10 +446,12 @@ impl ReadQuery {
                 *parent_inode_id,
                 name.clone(),
             )),
+            Self::DirectoryPage { .. } => None,
             Self::Open(open_id) => Some(RecordKey::Open(filesystem_id, *open_id)),
             Self::OpenPin { inode_id, open_id } => {
                 Some(RecordKey::OpenPin(filesystem_id, *inode_id, *open_id))
             }
+            Self::OpenPinCount(_) => None,
             Self::Orphan(inode_id) => Some(RecordKey::Orphan(filesystem_id, *inode_id)),
             Self::Lock { inode_id, lock_id } => {
                 Some(RecordKey::Lock(filesystem_id, *inode_id, *lock_id))
@@ -444,6 +466,134 @@ impl ReadQuery {
             Self::WriterLease(scope) => Some(RecordKey::WriterLease(filesystem_id, *scope)),
             Self::Scan(_) => None,
         }
+    }
+}
+
+/// One directory entry joined to immutable child identity data at one revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryPageEntry {
+    entry: DirectoryEntryRecord,
+    child_kind: InodeKind,
+    child_qid_path: QidPath,
+    child_record_revision: RecordRevision,
+}
+
+impl DirectoryPageEntry {
+    /// Constructs a checked semantic entry from one dentry and child summary.
+    pub const fn new(
+        entry: DirectoryEntryRecord,
+        child_kind: InodeKind,
+        child_qid_path: QidPath,
+        child_record_revision: RecordRevision,
+    ) -> Self {
+        Self {
+            entry,
+            child_kind,
+            child_qid_path,
+            child_record_revision,
+        }
+    }
+
+    /// Returns the authoritative directory-entry record.
+    pub const fn entry(&self) -> &DirectoryEntryRecord {
+        &self.entry
+    }
+
+    /// Returns the child inode kind observed in the same snapshot.
+    pub const fn child_kind(&self) -> InodeKind {
+        self.child_kind
+    }
+
+    /// Returns the child's stable QID path observed in the same snapshot.
+    pub const fn child_qid_path(&self) -> QidPath {
+        self.child_qid_path
+    }
+
+    /// Returns the child inode record revision observed in the same snapshot.
+    pub const fn child_record_revision(&self) -> RecordRevision {
+        self.child_record_revision
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<usize> {
+        self.entry
+            .name()
+            .as_bytes()
+            .len()
+            .checked_mul(2)?
+            .checked_add(192)
+    }
+}
+
+/// Bounded complete semantic directory entries in persistent cookie order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryPage {
+    entries: Box<[DirectoryPageEntry]>,
+    resume: Option<DirectoryCookie>,
+}
+
+impl DirectoryPage {
+    /// Constructs a semantic directory page for adapter-side validation.
+    pub fn new(
+        entries: impl Into<Vec<DirectoryPageEntry>>,
+        resume: Option<DirectoryCookie>,
+    ) -> Self {
+        Self {
+            entries: entries.into().into_boxed_slice(),
+            resume,
+        }
+    }
+
+    /// Returns complete ordered semantic entries.
+    pub fn entries(&self) -> &[DirectoryPageEntry] {
+        &self.entries
+    }
+
+    /// Returns the last emitted cookie when another page is available.
+    pub const fn resume(&self) -> Option<DirectoryCookie> {
+        self.resume
+    }
+
+    fn validate_against(
+        &self,
+        parent_inode_id: InodeId,
+        after: DirectoryCookie,
+        bounds: ScanBounds,
+        snapshot_revision: StateRevision,
+    ) -> Result<(), InvalidStateSnapshot> {
+        if self.entries.len() > usize::try_from(bounds.max_items()).unwrap_or(usize::MAX) {
+            return Err(InvalidStateSnapshot::ScanItemLimit);
+        }
+        let mut previous = after;
+        let mut bytes = 0usize;
+        for entry in &self.entries {
+            if entry.entry().parent_inode_id() != parent_inode_id
+                || entry.entry().cookie() <= previous
+            {
+                return Err(InvalidStateSnapshot::RecordOutsideScan);
+            }
+            if entry.entry().revision().get() > snapshot_revision.get()
+                || entry.child_record_revision().get() > snapshot_revision.get()
+            {
+                return Err(InvalidStateSnapshot::RecordRevisionAfterSnapshot);
+            }
+            previous = entry.entry().cookie();
+            bytes = bytes
+                .checked_add(
+                    entry
+                        .retained_bytes()
+                        .ok_or(InvalidStateSnapshot::ScanByteLimit)?,
+                )
+                .ok_or(InvalidStateSnapshot::ScanByteLimit)?;
+            if bytes > bounds.max_bytes() {
+                return Err(InvalidStateSnapshot::ScanByteLimit);
+            }
+        }
+        if let Some(resume) = self.resume
+            && (self.entries.is_empty() || resume != previous)
+        {
+            return Err(InvalidStateSnapshot::InvalidResumeCursor);
+        }
+        Ok(())
     }
 }
 
@@ -653,6 +803,22 @@ pub enum ReadResult {
         /// Present checked value, or `None` when absent.
         record: Option<Box<StateRecord>>,
     },
+    /// Secondary lookup of an inode by its persisted QID path.
+    InodeByQidPath {
+        /// Exact queried QID path.
+        qid_path: QidPath,
+        /// Present checked inode, or `None` when absent in this filesystem.
+        inode: Option<Box<InodeRecord>>,
+    },
+    /// One-revision semantic directory page.
+    DirectoryPage(DirectoryPage),
+    /// Fixed-size authoritative open-pin count.
+    OpenPinCount {
+        /// Exact queried inode.
+        inode_id: InodeId,
+        /// Number of matching durable pins.
+        count: u64,
+    },
     /// Bounded ordered scan page.
     Scan(ScanPage),
 }
@@ -705,6 +871,29 @@ impl StateSnapshot {
             match (query, result) {
                 (ReadQuery::Scan(scan), ReadResult::Scan(page)) => {
                     page.validate_against(batch.filesystem_id, scan, revision)?;
+                }
+                (
+                    ReadQuery::DirectoryPage {
+                        parent_inode_id,
+                        after,
+                        bounds,
+                    },
+                    ReadResult::DirectoryPage(page),
+                ) => page.validate_against(*parent_inode_id, *after, *bounds, revision)?,
+                (ReadQuery::OpenPinCount(expected), ReadResult::OpenPinCount { inode_id, .. })
+                    if expected == inode_id => {}
+                (
+                    ReadQuery::InodeByQidPath(expected),
+                    ReadResult::InodeByQidPath { qid_path, inode },
+                ) if expected == qid_path => {
+                    if let Some(inode) = inode {
+                        if inode.qid_path() != *qid_path {
+                            return Err(InvalidStateSnapshot::UnexpectedResult { index });
+                        }
+                        if inode.revision().get() > revision.get() {
+                            return Err(InvalidStateSnapshot::RecordRevisionAfterSnapshot);
+                        }
+                    }
                 }
                 (query, ReadResult::Point { key, record })
                     if query.point_key(batch.filesystem_id).as_ref() == Some(key) =>
@@ -851,6 +1040,46 @@ mod tests {
             .point_key(filesystem_id),
             None
         );
+        assert_eq!(
+            ReadQuery::InodeByQidPath(QidPath::new(1).unwrap()).point_key(filesystem_id),
+            None
+        );
+    }
+
+    #[test]
+    fn qid_lookup_results_are_positionally_bound() {
+        let limits = StateLimits::default();
+        let filesystem_id = FilesystemId::from_u128(1);
+        let qid_path = QidPath::new(2).unwrap();
+        let batch = ReadBatch::new(
+            filesystem_id,
+            ReadConsistency::LatestLinearizable,
+            vec![ReadQuery::InodeByQidPath(qid_path)],
+            limits,
+        )
+        .unwrap();
+        assert!(
+            StateSnapshot::new(
+                StateRevision::new(1).unwrap(),
+                &batch,
+                vec![ReadResult::InodeByQidPath {
+                    qid_path,
+                    inode: None,
+                }],
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            StateSnapshot::new(
+                StateRevision::new(1).unwrap(),
+                &batch,
+                vec![ReadResult::InodeByQidPath {
+                    qid_path: QidPath::new(3).unwrap(),
+                    inode: None,
+                }],
+            ),
+            Err(InvalidStateSnapshot::UnexpectedResult { index: 0 })
+        ));
     }
 
     #[test]

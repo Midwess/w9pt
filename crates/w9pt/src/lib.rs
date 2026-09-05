@@ -5,6 +5,9 @@
 //! and returns typed [`Completion`] values. This crate never opens sockets or files and never
 //! starts an executor, thread, timer, or background task.
 //!
+//! This crate is under active unreleased development. Its Rust API has no
+//! backward-compatibility guarantee, and no deprecated aliases are retained.
+//!
 //! ```no_run
 //! use w9pt::{Effect, Session, SessionConfig, SessionContext, SessionId};
 //!

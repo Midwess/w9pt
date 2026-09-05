@@ -4,10 +4,19 @@
 contract for a local or distributed `w9pt` filesystem. It owns semantic records,
 one-revision reads, serializable commits, mutation replay, writer fencing, and
 revision invalidation. Immutable file bytes and manifests remain in
-`w9pt-storage`; 9P wire/session state remains outside this crate.
+`w9pt-fs-storage`; 9P wire/session state remains outside this crate.
+
+> **Development status:** This crate is unreleased. Its API and record model may
+> change directly. Earlier development records and schemas have no reader or
+> migration compatibility guarantee.
+
+Inodes persist separately allocated nonzero QID paths, and directories persist
+their authoritative parent. Bounded semantic directory-page reads return each
+entry with child kind and QID from one revision; fixed-size open-pin counts let
+unlink decisions be protected by an exact commit precondition.
 
 The database is the sole publisher of an inode's current `ContentRef`. A content
-write first prepares immutable objects through `w9pt-storage`, then submits
+write first prepares immutable objects through `w9pt-fs-storage`, then submits
 `PublishContent` in the metadata transaction. The state adapter never reads or
 writes object storage.
 

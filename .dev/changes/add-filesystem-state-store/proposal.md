@@ -10,7 +10,7 @@ The public contract is filesystem-semantic rather than a generic key/value abstr
 
 ## Motivation
 
-`w9pt` emits backend-neutral filesystem operations and `w9pt-storage` prepares immutable file content, but the workspace has no authoritative owner for inodes, directories, open-unlinked lifetime, locks, mutation results, or writer fencing. Keeping those records only in a processing node would make correctness depend on node affinity and would prevent a distributed 9P server from recovering safely.
+`w9pt` emits backend-neutral filesystem operations and `w9pt-fs-storage` prepares immutable file content, but the workspace has no authoritative owner for inodes, directories, open-unlinked lifetime, locks, mutation results, or writer fencing. Keeping those records only in a processing node would make correctness depend on node affinity and would prevent a distributed 9P server from recovering safely.
 
 A trait-first state crate establishes the semantic boundary before selecting a database product. It allows:
 
@@ -25,7 +25,7 @@ The trait must not be designed to the weakest shared operations of these databas
 ## Goals
 
 - Introduce `crates/w9pt-fs-state` without modifying the `w9pt` protocol/session API.
-- Depend on `w9pt-storage` for portable `ContentRef` and `PreparedContent` values, but not on `w9pt` wire or session types.
+- Depend on `w9pt-fs-storage` for portable `ContentRef` and `PreparedContent` values, but not on `w9pt` wire or session types.
 - Define stable filesystem, inode, open, lock, lease, writer, and client identities.
 - Define bounded authoritative records for inodes, directory entries and cookies, opens, orphans, locks, xattrs, staged xattrs, mutations, and writer leases.
 - Define consistent batched reads at one authoritative revision with bounded point and ordered-range queries.
@@ -73,7 +73,7 @@ The trait must not be designed to the weakest shared operations of these databas
 |---|---|
 | `Cargo.toml` / `Cargo.lock` | Add the new workspace crate and its path dependency |
 | `crates/w9pt-fs-state` | New authoritative state model, trait, memory reference, and conformance suite |
-| `w9pt-storage` | Reuse public content references and preparation identities; no storage-layout change |
+| `w9pt-fs-storage` | Reuse public content references and preparation identities; no storage-layout change |
 | `w9pt` | No source or dependency changes |
 | `README.md` | Document the state layer and deferred adapters |
 | `.dev/project.md` | Record the new state-store boundary and conventions |
@@ -81,7 +81,7 @@ The trait must not be designed to the weakest shared operations of these databas
 ## Dependencies
 
 - The completed `w9pt` Sans-I/O filesystem-operation contract.
-- The completed `w9pt-storage` portable `ContentRef`, `PreparedContent`, `FileId`, and mutation identity types.
+- The completed `w9pt-fs-storage` portable `ContentRef`, `PreparedContent`, `FileId`, and mutation identity types.
 - Rust 2024 with the workspace Rust 1.85 baseline.
 - Caller-provided clocks/time authorities and identities for deterministic lease behavior.
 - Future adapter proposals that prove database-specific durability, isolation, failover, transaction-size, lease, fencing, and revision-notification behavior.

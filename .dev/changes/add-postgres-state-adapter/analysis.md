@@ -2,47 +2,100 @@
 
 ## Current State
 
-- The workspace currently contains `w9pt` and `w9pt-storage`.
-- `w9pt` is a dependency-free Sans-I/O protocol/session core and must remain free of database clients and runtimes.
-- `w9pt-storage` prepares immutable content and portable `ContentRef`/`PreparedContent` values. It does not own authoritative inode or namespace state.
-- `add-filesystem-state-store` is a draft proposal at `0/37`; `crates/w9pt-fs-state` and its `FilesystemStateStore` trait do not yet exist.
-- The PostgreSQL adapter can be designed now, but implementation is blocked until the trait's IDs, records, limits, outcomes, lease time contract, and conformance factory are stable.
-- Current workspace conventions are Rust 2024, Rust 1.85, resolver 3, Apache-2.0, missing-documentation warnings, `unsafe_code = "forbid"`, and Clippy warnings.
-- The current Git history does not isolate the Rust scaffold; existing user changes must be preserved.
+- The workspace contains `w9pt`, `w9pt-fs-storage`, and `w9pt-fs-state`.
+- `add-filesystem-state-store` is approved and complete at `37/37`; commit `6efc340` introduced the finalized contract and reusable conformance suite.
+- Existing workspace tests, formatting, and Clippy with warnings denied pass after the state-store implementation.
+- `w9pt` remains a dependency-free Sans-I/O protocol/session core.
+- `w9pt-fs-storage` prepares immutable content and portable `ContentRef`/`PreparedContent` values but does not publish authoritative inode state.
+- `w9pt-fs-state` owns the runtime-neutral authoritative records, typed reads, declarative commits, leases/fences, semantic outcomes, and conformance harness.
+- The PostgreSQL change was originally drafted before the state contract landed. This revision reconciles its schema and protocols against the final Rust API and clears the implementation gate.
 
-## Request Interpretation
+## Finalized Contract Inventory
 
-Create `crates/w9pt-fs-state-postgres`, a runtime-specific PostgreSQL adapter that:
+The adapter must implement these exact entry points:
 
-- implements the finalized `FilesystemStateStore` trait;
-- advertises `WriterTopology::SerializableMultiWriter`;
-- accepts a caller-owned SQLx `PgPool`;
-- maps the complete semantic record model to normalized PostgreSQL tables;
-- uses primary-only serializable reads and commits;
-- preserves mutation replay, content publication, leases, fences, and revision polling;
-- runs the shared state-store conformance suite against PostgreSQL 15–18.
+```text
+contract
+read(ReadBatch) -> ReadOutcome
+commit(CommitRequest) -> CommitOutcome
+acquire_writer_lease(AcquireWriterLease) -> AcquireLeaseOutcome
+renew_writer_lease(RenewWriterLease) -> RenewLeaseOutcome
+release_writer_lease(ReleaseWriterLease) -> ReleaseLeaseOutcome
+poll_changes(ChangePoll) -> ChangePollOutcome
+```
 
-This change does not store per-block mappings in PostgreSQL. The current state-store proposal publishes a `ContentRef`; changing content-index placement requires a separate proposal that first modifies the semantic state/storage contract.
+Finalized public record families are filesystem, inode, directory entry, open, open pin, orphan, lock, xattr, xattr staging, mutation, and active writer lease.
+
+Finalized scans are:
+
+```text
+inodes                 inode_id
+directory entries      cookie within one parent
+opens                  open_id
+open pins              (inode_id, open_id)
+orphans                inode_id
+locks                  (inode_id, lock_id)
+xattrs                 (inode_id, name bytes)
+xattr staging          staging_id
+mutations              mutation_id
+writer leases          writer_scope_id
+```
+
+The adapter must return the public outcome enums exactly. It must not add an adapter-only scan cursor, replay mismatch, `has_more` field, or semantic error variant.
+
+## Resolved Pre-Implementation Gaps
+
+### Dependency gate
+
+The prior statement that `w9pt-fs-state` was draft and absent is obsolete. The dependency is complete and the PostgreSQL proposal is now approved.
+
+### Empty bootstrap and revisions
+
+The conformance suite acquires and renews a lease before inserting `FilesystemRecord`. The earlier schema conflated the public filesystem row with the revision head, which could not represent that sequence.
+
+Resolution: introduce private `authority_heads` and separate public `filesystem_records`. An absent private head means an empty authority at revision one. A successful pre-bootstrap lease transition creates/advances the private head while the public point query remains absent.
+
+### Scan identities
+
+The earlier draft used `(cookie, name)` for directory scans, `(range_start, lock_id)` for lock scans, and `(filesystem_id, lock_id)` as a lock primary key.
+
+Resolution: use the finalized cursor/key forms exactly—directory cookie, `(inode, lock)` lock cursor, and `(filesystem, inode, lock)` record identity. Also implement the finalized inode, open-pin, and xattr-staging scans that the old task list omitted.
+
+### Lease time representation
+
+The earlier draft stored `LeaseDeadline` as `TIMESTAMPTZ`, but the public contract uses exact unsigned ticks and PostgreSQL timestamps have microsecond precision and a different numeric domain.
+
+Resolution: define one version-1 tick as one microsecond, store deadlines/durations as constrained `NUMERIC(20,0)`, and convert one captured PostgreSQL `clock_timestamp()` observation to an integer Unix-epoch tick. The conformance harness uses a separate test-only database integer clock so `advance_time` is deterministic across independent pools.
+
+### Replay semantics
+
+The earlier text proposed independent change-set/result mismatch checks. The finalized `MutationContext::classify_record` exposes only mutation ID, fingerprint, client incarnation, and retention mismatch dimensions.
+
+Resolution: delegate replay classification to the finalized helper. The fingerprint is contractually the complete semantic request identity; the adapter never invents an additional mismatch variant and returns the stored result on exact replay.
+
+### Change polling
+
+The earlier draft returned `has_more`, which is not part of `ChangeBatch`, and did not enumerate every finalized outcome.
+
+Resolution: return only `Changes`, `RevisionUnavailable`, `RevisionCompacted`, `PollBoundTooSmall`, or `MalformedRequest`. `Changes` contains events, `next`, and `current_revision`; remaining work is inferred by comparing the two revisions.
+
+### Commit phase order
+
+The earlier plan performed full adapter preflight before SQL, conflicting with the normative ledger-before-preflight rule for retained retries.
+
+Resolution: perform a short primary `SERIALIZABLE READ ONLY` fixed-size ledger probe first. Only an absent mutation proceeds to adapter-limit preflight. Every write attempt repeats ledger lookup before fence/current-state validation inside its serializable transaction.
 
 ## Dependency and Driver Selection
 
 The adapter depends on `w9pt-fs-state` and SQLx, not on `w9pt`.
 
-Use an exact SQLx `=0.8.6` dependency with default features disabled and PostgreSQL/Tokio support. SQLx 0.9 currently requires Rust 1.86, which exceeds the workspace Rust 1.85 baseline. Avoid compile-time `query!`/`query_as!` macros for ordinary SQL so consumers do not require `DATABASE_URL` or checked-query metadata at build time; use static parameterized SQL and explicit checked row decoding.
+Use exact SQLx `=0.8.6`, default features disabled, with PostgreSQL and Tokio runtime support. Avoid compile-time query macros so consumers need no build-time database. Callers constructing `PgPool` choose credentials, URLs, TLS, pool limits, and runtime lifecycle.
 
-The adapter should not force a TLS trust policy. Callers constructing `PgPool` may enable a compatible SQLx TLS feature through Cargo feature unification. Pool creation, credentials, URLs, TLS roots, timeouts outside adapter transactions, and runtime lifecycle remain caller-owned.
-
-Relevant verified references:
-
-- SQLx 0.8.6 package: <https://docs.rs/crate/sqlx/0.8.6>
-- SQLx runtime/TLS feature separation: <https://docs.rs/sqlx/latest/sqlx/index.html>
-- SQLx MSRV change for 0.9: <https://github.com/launchbadge/sqlx/blob/main/CHANGELOG.md>
+SQLx 0.9 currently raises MSRV to Rust 1.86, above this workspace's Rust 1.85 baseline. Reference: <https://github.com/launchbadge/sqlx/blob/main/CHANGELOG.md>.
 
 ## Supported PostgreSQL Versions
 
-Use PostgreSQL 15-compatible SQL and test current minor releases of PostgreSQL 15, 16, 17, and 18. PostgreSQL 14 is near its November 2026 end-of-support date and is excluded from the initial support matrix. PostgreSQL 19 is beta as of this proposal and is also excluded.
-
-Reference: <https://www.postgresql.org/support/versioning/>
+Use PostgreSQL 15-compatible SQL and test the current minor releases of PostgreSQL 15, 16, 17, and 18. PostgreSQL 19 remains prerelease as of this reconciliation and is excluded until a later compatibility change. Reference: <https://www.postgresql.org/support/versioning/>.
 
 ## Construction and Configuration
 
@@ -51,6 +104,7 @@ pub struct PostgresStateStore {
     pool: sqlx::PgPool,
     config: PostgresStateConfig,
     contract: StateStoreContract,
+    clock: LeaseClockMode,
 }
 
 impl PostgresStateStore {
@@ -62,153 +116,100 @@ impl PostgresStateStore {
     pub async fn migrate(
         pool: &sqlx::PgPool,
     ) -> Result<MigrationReport, PostgresStateError>;
+
+    pub fn pool(&self) -> &sqlx::PgPool;
 }
 ```
 
-`open` never runs DDL. It validates the fixed schema version/checksums, server version, primary status, required privileges, limits, and durability settings. `migrate` is explicit so deployment can use a migration role different from the runtime role.
+Production `open` always selects PostgreSQL wall time. Feature-gated test support may select a database-resident manual clock but cannot be selected implicitly by the production constructor.
 
 `PostgresStateConfig` contains only adapter behavior:
 
-- state limits from the finalized trait crate;
+- finalized `StateLimits`;
 - statement and lock timeouts;
 - bounded retry count for definitive serialization/deadlock aborts;
 - bounded recovery attempts for ambiguous commits;
 - primary-WAL durability policy.
 
-Every bound is checked at construction.
+Every bound is checked at construction and must fit immutable schema maxima.
 
 ## Schema Direction
 
-Use a fixed quoted schema named `w9pt_fs_state_v1`. All runtime SQL and migration SQL fully qualifies every object; no correctness depends on `search_path` or caller-provided identifiers.
+Use fixed quoted production schema `w9pt_fs_state_v1`. All production runtime and migration statements fully qualify objects.
 
-Prefer normalized permanent logged tables:
+Private tables:
 
-- filesystem/revision head;
-- inodes and their `ContentRef` columns;
-- directory entries;
-- opens, open pins, and orphans;
-- locks;
-- xattrs and xattr staging;
-- mutation results;
-- writer fence/active lease state;
-- idempotent lease-operation results;
-- whole-commit change-event headers and ordered changed keys;
-- embedded migration version/checksum records.
+- `authority_heads`: per-filesystem current revision and oldest retained cursor;
+- `writer_fences`: greatest token plus nullable active lease fields;
+- `writer_lease_operations`: bounded exact acquire/renew/release replay rows;
+- migration ledger and normalized change history.
 
-Avoid cascade deletes that create unreported state changes. Every semantic deletion is explicit in the transaction plan and change event.
+Public record tables:
+
+- `filesystem_records`, `inodes`, `directory_entries`;
+- `opens`, `open_pins`, `orphans`;
+- `locks`, `xattrs`, `xattr_staging`;
+- `mutation_results`;
+- active projections of `writer_fences` as writer-lease records.
+
+Avoid cascading deletes. Fixed-width/numeric constraints and targeted cross-record validation independently protect the public model.
 
 ## Lossless PostgreSQL Mapping
 
-- Fixed-width IDs and digests use `BYTEA` with exact `octet_length` checks.
-- Entry/xattr names and other byte-preserving ordered values use bounded `BYTEA`, avoiding locale-sensitive text comparison.
-- Object keys use bounded `TEXT` because `w9pt-storage::ObjectKey` is checked UTF-8.
-- Enums use small numeric tags plus named check constraints.
-- Every public `u64` that can exceed `i64::MAX` uses constrained `NUMERIC(20,0)`.
-- The adapter binds canonical decimal text with an explicit numeric cast and selects numeric values as text for checked Rust `u64` parsing.
-- Timestamps and lease deadlines use `TIMESTAMPTZ` where the finalized state contract permits database time; caller-supplied filesystem timestamps retain their exact seconds/nanoseconds fields when PostgreSQL timestamp precision would lose information.
+- Fixed IDs and digests use exact-width `BYTEA`.
+- Entry/xattr/principal/group/symlink values use bounded `BYTEA`.
+- Object keys use bounded checked `TEXT`.
+- Enums use stable numeric tags plus named checks.
+- Every public `u64` uses `NUMERIC(20,0)` and canonical decimal text conversion.
+- Filesystem timestamps retain signed seconds and nanoseconds separately.
+- Lease deadlines use exact integer microsecond ticks, not timestamps.
+- Optional `ContentRef` fields are all-null or all-present and reconstruct through the public storage constructor.
 
-No unchecked `as i64` conversion is permitted. Rust preflight and SQL constraints independently enforce the same limits and relationships.
+No unchecked `as i64` or floating-point numeric conversion is permitted.
 
-## Read Transactions
+## Read Semantics
 
-Every `ReadBatch` uses one connection and one `SERIALIZABLE READ ONLY` transaction:
+Each `ReadBatch` uses one primary `SERIALIZABLE READ ONLY` transaction. It observes the private revision-one baseline when no authority head exists, preserves query order, implements every finalized point/scan form, and returns the exact finalized outcome.
 
-1. Begin the transaction and set isolation before the first data query.
-2. Verify `pg_is_in_recovery() = false` inside the transaction.
-3. Read the filesystem revision.
-4. Execute all typed point/range queries in request order.
-5. Verify an `AtLeast` revision floor when requested.
-6. Commit the read transaction before returning one `StateSnapshot`.
+Keyset queries stream bounded rows. If the next whole record exceeds the byte bound, return `ScanBoundTooSmall`; do not materialize it first.
 
-PostgreSQL `READ COMMITTED` is insufficient because each statement may observe a new snapshot. PostgreSQL documents that serializable transactions either correspond to a serial execution or fail with a serialization error: <https://www.postgresql.org/docs/18/sql-set-transaction.html>.
+## Commit Semantics
 
-All ordered reads use keyset pagination rather than `OFFSET`:
+Commit processing is ledger-first:
 
-- directory entries by `(cookie, name)`;
-- locks by `(range_start, lock_id)`;
-- xattrs by name;
-- opens, orphans, leases, and mutations by stable primary-key suffix.
+1. Fixed-size primary serializable ledger probe.
+2. Exact `MutationContext::classify_record` replay/mismatch when present.
+3. Adapter-limit preflight only when absent.
+4. Serializable write attempt with a repeated ledger-first lookup.
+5. Private authority-head lock/create.
+6. Writer-fence lock and one captured database tick.
+7. Canonical semantic record locks and absent predicates.
+8. Typed preconditions and targeted invariant validation.
+9. Checked application of every finalized `StateChange`.
+10. One revision, record versions, exact mutation record, and whole change event.
+11. One durable `COMMIT`.
 
-Results are bounded before materialization according to the state contract.
+The adapter validates the affected semantic closure using bounded indexed queries. It does not load an unbounded filesystem to validate a transition.
 
-## Commit Transactions
+## SQLSTATE, Retry, and Ambiguity
 
-Each commit uses one short `SERIALIZABLE READ WRITE` transaction:
+Classify failures by SQLSTATE, phase, and named constraint. Definitive `40001`/`40P01` aborts may retry the identical request within configured bounds. Unknown constraints are adapter failures.
 
-1. Validate the complete request and aggregate bounds before SQL.
-2. Set transaction-local statement/lock timeouts and `synchronous_commit = 'on'`.
-3. Verify primary status.
-4. Read the mutation ledger before current fence validation.
-5. Return exact `AlreadyCommitted` for matching mutation ID, fingerprint, and client incarnation.
-6. Return a hard mismatch for a retained mutation with different identity.
-7. Lock the per-filesystem revision row.
-8. Lock the writer-fence row and validate lease ID, holder, token, and database-time expiry.
-9. Sort and deduplicate affected semantic `RecordKey`s.
-10. Lock existing records in canonical order and perform absent-key predicate reads.
-11. Validate every typed precondition and cross-record invariant.
-12. Apply all normalized changes.
-13. Allocate one checked filesystem revision.
-14. Insert the exact mutation result, one whole-commit event, and ordered changed keys.
-15. Commit once.
+A `COMMIT` response error is potentially committed unless PostgreSQL proves abort. Recovery begins with a fresh primary ledger probe and may resubmit only the same owned request. Exhaustion returns finalized `CommitOutcome::Ambiguous`.
 
-The per-filesystem revision row creates a short total-order serialization point for change polling. Different filesystems do not share that row. Its contention must be benchmarked before claiming high write throughput.
+## Lease and Change Semantics
 
-## SQLSTATE and Retry Semantics
+Lease-operation ledger lookup precedes duration/current-fence validation. Successful acquire/renew/release transitions allocate revisions and emit one lease-origin event; rejected outcomes do not fabricate revision events. Release removes the public active lease while retaining the private greatest token.
 
-Classify errors by SQLSTATE and known constraint name, never localized error text.
-
-- `40001`: serialization abort known not committed; bounded exact retry is safe.
-- `40P01`: deadlock abort known not committed; bounded exact retry is safe and should be observable as a performance/invariant signal.
-- `23505`: only known named constraints map to semantic conflicts or ledger races.
-- `23503`/`23514`/`22003`/`22P02`: model, range, or schema invariant failure.
-- `25006`: read-only or incorrect primary routing.
-- `57014`: timeout/cancellation classified by operation phase.
-- connection and shutdown classes: availability or potentially ambiguous commit depending on phase.
-
-Known-abort retry reruns the exact SQL transaction and never changes mutation identity or semantically rebases the request. Retry exhaustion is explicit.
-
-An error from `COMMIT` is considered potentially committed unless PostgreSQL definitively reports transaction abort. Recovery uses a fresh primary transaction and the exact original mutation request. Ledger-first replay resolves an already committed attempt; an absent record permits only the same request to be tried again. Exhaustion returns an explicit ambiguous status without claiming rollback.
-
-## Leases and Fencing
-
-PostgreSQL time is the authoritative lease time source. Acquire, renew, and release use serializable transactions and stable lease-operation IDs.
-
-The `writer_fences` row permanently retains the greatest token allocated for each `(filesystem, writer scope)`. Expiry or release clears active lease fields but never deletes/reset the counter. Takeover increments the token with checked numeric arithmetic. Every non-replayed commit validates the exact lease ID, holder incarnation, token, and non-expiration using database time in the same transaction.
-
-Lease transitions participate in per-filesystem revision ordering and change polling. `LISTEN/NOTIFY` is not authoritative and is not required.
-
-## Durability Boundary
-
-Successful SQL `COMMIT` is the adapter acknowledgment boundary. Before advertising primary-WAL durability, `open` verifies:
-
-- `pg_is_in_recovery() = false`;
-- `fsync = on`;
-- `full_page_writes = on`;
-- permanent logged state tables;
-- transaction-local `synchronous_commit = on` can be enforced.
-
-This initial adapter promises WAL flush on the primary. It does not advertise synchronous-standby failover durability. A later change may add a separately verified policy requiring configured synchronous standbys and a stronger `synchronous_commit` mode. PostgreSQL documents these distinctions at <https://www.postgresql.org/docs/current/warm-standby.html>.
-
-The adapter cannot prove storage hardware, backup, or failover quality beyond the exact verified database boundary.
-
-## Change Polling
-
-`poll_changes` uses a primary-only serializable read transaction:
-
-1. Read the oldest retained and current filesystem revisions.
-2. Return `RevisionCompacted` when the cursor is too old.
-3. Select a bounded number of event headers after the cursor using revision keyset ordering.
-4. Fetch changed keys ordered by `(revision, ordinal)`.
-5. Enforce event/key/byte bounds before producing results.
-6. Return a resume revision and `has_more`.
-
-One transaction event is never split. Notifications may later wake pollers but can never substitute for revision reads.
+Change polling returns whole events under event/key bounds. It explicitly handles future cursors, compacted history, and a first event that cannot fit. There is no `has_more` field; `next < current_revision` indicates another poll is needed.
 
 ## Testing and CI
 
-Offline tests cover codecs, limits, key ordering, configuration, SQLSTATE classification, and migration checksums without a database.
+Offline tests cover codecs, limits, cursor mappings, configuration, clock conversion, migration checksums, and SQLSTATE classification.
 
-Live tests use environment-provided PostgreSQL instances and two independently created pools/store clients. Required CI variables:
+Live tests use explicit DSNs and two independent pools. A feature-gated harness creates one test-only database clock row so the shared suite can advance time without sleeps or shared RAM. Separate tests cover the production PostgreSQL clock path.
+
+Required CI variables:
 
 ```text
 W9PT_POSTGRES_15_DSN
@@ -217,29 +218,8 @@ W9PT_POSTGRES_17_DSN
 W9PT_POSTGRES_18_DSN
 ```
 
-`W9PT_POSTGRES_TEST_DSN` may select one local test database. When `W9PT_POSTGRES_TEST_REQUIRED=1`, missing DSNs fail rather than skip. Database/container provisioning remains outside the repository.
+`W9PT_POSTGRES_TEST_DSN` may select one local database. When `W9PT_POSTGRES_TEST_REQUIRED=1`, missing declared DSNs fail rather than skip.
 
-Live tests cover migrations, primary/durability validation, the shared conformance suite, serializable races, ledger replay/mismatch, prepared-content publication, lease/fence races, change gaps, commit-response loss, and empty-client recovery.
+## Readiness Conclusion
 
-## Affected Files
-
-- `Cargo.toml`, `Cargo.lock`, and `.gitattributes`.
-- `crates/w9pt-fs-state-postgres/Cargo.toml`.
-- Embedded migration SQL and modules for config, errors, numeric/key/row conversion, migrations, validation, transactions, reads, commits, leases, changes, and store implementation.
-- Offline tests and environment-driven PostgreSQL integration tests.
-- `README.md` and `.dev/project.md`.
-
-No changes should be required in `w9pt`, `w9pt-storage`, their persistent formats, or the future content index.
-
-## Risks
-
-- The prerequisite state trait may change before implementation.
-- Per-filesystem revision locking may limit a hot filesystem's write throughput.
-- Serializable retries can amplify load under contention.
-- PostgreSQL numeric, collation, or timestamp conversions can silently narrow public semantics if not independently tested.
-- Commit-time disconnects are inherently ambiguous.
-- Proxies can route an apparently valid connection to a standby.
-- Migrations and runtime binaries can disagree during rolling deployment.
-- Named constraints and SQLSTATE mappings can drift across migrations.
-- Mutation/change retention may grow without a safe maintenance horizon.
-- PostgreSQL storage or failover settings may provide weaker durability than the deployment advertises.
+The prerequisite is complete, the design is reconciled, the proposal is approved, and implementation may begin at Task 1.2. Remaining work is implementation and verification, not unresolved contract design.

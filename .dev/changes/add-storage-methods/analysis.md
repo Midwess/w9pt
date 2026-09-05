@@ -37,7 +37,7 @@ The SteamPipe research supports a useful separation between immutable payloads, 
 
 ### The repository belongs outside `w9pt`
 
-The protocol crate must remain dependency-free and unaware of target keys, blocks, manifests, hashes, compression, encryption, and SDKs. A new `w9pt-storage` crate can use associated futures or another runtime-neutral asynchronous interface without introducing a mandatory executor into the protocol core.
+The protocol crate must remain dependency-free and unaware of target keys, blocks, manifests, hashes, compression, encryption, and SDKs. A new `w9pt-fs-storage` crate can use associated futures or another runtime-neutral asynchronous interface without introducing a mandatory executor into the protocol core.
 
 ### Content preparation and filesystem publication are different operations
 
@@ -100,21 +100,21 @@ The file head identifies the current generation, manifest key/hash, and mutation
 
 | Path | Change |
 | --- | --- |
-| `Cargo.toml` | Add `crates/w9pt-storage` as a workspace member. |
+| `Cargo.toml` | Add `crates/w9pt-fs-storage` as a workspace member. |
 | `Cargo.lock` | Record the separately justified storage-crate hash dependency. |
-| `crates/w9pt-storage/Cargo.toml` | Add package metadata, compatible dependencies, and workspace lint policy. |
-| `crates/w9pt-storage/src/lib.rs` | Document and export the content-repository API. |
-| `crates/w9pt-storage/src/config.rs` | Persisted method selection and validated defaults/limits. |
-| `crates/w9pt-storage/src/error.rs` | Typed format, range, corruption, limit, conflict, and target errors. |
-| `crates/w9pt-storage/src/ids.rs` | Strong file, mutation, object-key, version, and content-reference types. |
-| `crates/w9pt-storage/src/limits.rs` | Checked bounds for raw materialization, manifests, objects, ranges, and retries. |
-| `crates/w9pt-storage/src/object_store.rs` | Runtime-neutral target operations and semantic guarantees. |
-| `crates/w9pt-storage/src/publisher.rs` | File-head load, conditional publication, and bounded rebasing. |
-| `crates/w9pt-storage/src/repository.rs` | Shared create/read/write/truncate dispatch and preparation rules. |
-| `crates/w9pt-storage/src/format/*` | Checked envelope, head, manifest, blob-reference, and canonical codec. |
-| `crates/w9pt-storage/src/layout/*` | Raw, block-split, and checked range-planning implementations. |
-| `crates/w9pt-storage/src/testing/*` | Deterministic memory target, failure injection, and reusable conformance helpers. |
-| `crates/w9pt-storage/tests/*` | Golden format, byte-model, publication, crash, corruption, and target-contract tests. |
+| `crates/w9pt-fs-storage/Cargo.toml` | Add package metadata, compatible dependencies, and workspace lint policy. |
+| `crates/w9pt-fs-storage/src/lib.rs` | Document and export the content-repository API. |
+| `crates/w9pt-fs-storage/src/config.rs` | Persisted method selection and validated defaults/limits. |
+| `crates/w9pt-fs-storage/src/error.rs` | Typed format, range, corruption, limit, conflict, and target errors. |
+| `crates/w9pt-fs-storage/src/ids.rs` | Strong file, mutation, object-key, version, and content-reference types. |
+| `crates/w9pt-fs-storage/src/limits.rs` | Checked bounds for raw materialization, manifests, objects, ranges, and retries. |
+| `crates/w9pt-fs-storage/src/object_store.rs` | Runtime-neutral target operations and semantic guarantees. |
+| `crates/w9pt-fs-storage/src/publisher.rs` | File-head load, conditional publication, and bounded rebasing. |
+| `crates/w9pt-fs-storage/src/repository.rs` | Shared create/read/write/truncate dispatch and preparation rules. |
+| `crates/w9pt-fs-storage/src/format/*` | Checked envelope, head, manifest, blob-reference, and canonical codec. |
+| `crates/w9pt-fs-storage/src/layout/*` | Raw, block-split, and checked range-planning implementations. |
+| `crates/w9pt-fs-storage/src/testing/*` | Deterministic memory target, failure injection, and reusable conformance helpers. |
+| `crates/w9pt-fs-storage/tests/*` | Golden format, byte-model, publication, crash, corruption, and target-contract tests. |
 | `README.md` | Document the new storage-method crate and its deliberately limited status. |
 
 `crates/w9pt` is not modified by this change.

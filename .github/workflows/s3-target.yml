@@ -1,0 +1,109 @@
+name: S3 target
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  rust-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+      - name: Verify every locked package declares license metadata
+        run: test -z "$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.license == null) | .name')"
+      - name: Install pinned RustSec audit tool
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Verify lock-only audit exceptions remain unreachable
+        run: |
+          test -z "$(cargo tree -i rkyv@0.7.46 --workspace --all-features --target all --locked 2>/dev/null)"
+          test -z "$(cargo tree -i rsa@0.9.10 --workspace --all-features --target all --locked 2>/dev/null)"
+      - name: Audit reachable root dependencies
+        run: >-
+          cargo audit --file Cargo.lock
+          --ignore RUSTSEC-2026-0235
+          --ignore RUSTSEC-2023-0071
+      - name: Audit standalone integration-test dependencies
+        run: cargo audit --file test/Cargo.lock
+
+  storage-integration:
+    runs-on: ubuntu-latest
+    env:
+      PROVIDER_IMAGE: chrislusf/seaweedfs@sha256:f7cbc8bdbbf60a1aaba7d61784a3bdff3ec1e0657f6ad0b26d5b6ab2cd9d0dc6
+      POSTGRES_IMAGE: postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+      COMPOSE_PROJECT_NAME: w9pt-storage-${{ github.run_id }}-${{ github.run_attempt }}
+      W9PT_SEAWEEDFS_PORT: "18333"
+      W9PT_POSTGRES_PORT: "15432"
+      W9PT_POSTGRES_TEST_DSN: postgres://w9pt_test:w9pt_test@127.0.0.1:15432/w9pt_test
+      W9PT_S3_COMPAT_TEST_REQUIRED: "1"
+      W9PT_S3_COMPAT_TEST_ENDPOINT: http://127.0.0.1:18333
+      W9PT_S3_COMPAT_TEST_BUCKET: w9pt-test-bucket
+      W9PT_S3_COMPAT_TEST_PROVIDER: SeaweedFS
+      W9PT_S3_COMPAT_TEST_VERSION: "4.42"
+      W9PT_S3_COMPAT_TEST_PREFIX: ci/target/w9pt-s3-test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
+      W9PT_S3_COMPAT_REPOSITORY_TEST_REQUIRED: "1"
+      W9PT_S3_COMPAT_REPOSITORY_TEST_PREFIX: ci/repository/w9pt-s3-test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
+      W9PT_TCP_SEAWEED_TEST_REQUIRED: "1"
+      W9PT_TEST_S3_ENDPOINT: http://127.0.0.1:18333
+      W9PT_TEST_S3_BUCKET: w9pt-test-bucket
+      W9PT_TEST_S3_PREFIX: ci/tcp/w9pt-s3-test-development
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Start exact local provider artifact
+        id: provider
+        run: |
+          docker compose --file test/compose.yaml pull
+          docker compose --file test/compose.yaml up --detach --wait --wait-timeout 60
+      - name: Verify provider identity and provision ephemeral test bucket
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --connect-timeout 1 --max-time 2 --fail --silent --show-error "$W9PT_S3_COMPAT_TEST_ENDPOINT/" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker compose --file test/compose.yaml logs
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --connect-timeout 1 --max-time 2 --silent --show-error --dump-header provider-headers --output /dev/null "$W9PT_S3_COMPAT_TEST_ENDPOINT/"
+          grep --fixed-strings 'Server: SeaweedFS 30GB 4.42' provider-headers
+          curl --connect-timeout 1 --max-time 2 --fail --silent --show-error --request PUT "$W9PT_S3_COMPAT_TEST_ENDPOINT/$W9PT_S3_COMPAT_TEST_BUCKET"
+      - name: Run required SeaweedFS target probes
+        run: >-
+          cargo test -p w9pt-fs-storage-s3 --test s3_conformance
+          live_pinned_compatible_provider_is_exercised_but_remains_unsupported
+          --locked -- --exact
+      - name: Run required SeaweedFS repository matrix
+        run: >-
+          cargo test -p w9pt-fs-storage-s3 --test s3_conformance
+          live_pinned_compatible_provider_repository_matrix_remains_unqualified
+          --locked -- --exact
+      - name: Run PostgreSQL migration and state conformance
+        run: >-
+          cargo test -p w9pt-fs-state-postgres --all-features --locked
+          -- --test-threads=1
+      - name: Run TCP 9P forwarding integration
+        run: >-
+          cargo test --manifest-path test/Cargo.toml --locked
+          --test tcp_seaweedfs -- --nocapture
+      - name: Print bounded integration logs on failure
+        if: failure()
+        run: docker compose --file test/compose.yaml logs --no-color --tail 200 seaweedfs postgres
+      - name: Stop integration project and verify teardown
+        if: always()
+        run: |
+          teardown_status=0
+          docker compose --file test/compose.yaml down --timeout 10 --volumes --remove-orphans || teardown_status=$?
+          remaining_containers=$(docker ps --all --quiet --filter label=com.docker.compose.project=$COMPOSE_PROJECT_NAME) || teardown_status=1
+          remaining_networks=$(docker network ls --quiet --filter label=com.docker.compose.project=$COMPOSE_PROJECT_NAME) || teardown_status=1
+          remaining_volumes=$(docker volume ls --quiet --filter label=com.docker.compose.project=$COMPOSE_PROJECT_NAME) || teardown_status=1
+          test -z "$remaining_containers$remaining_networks$remaining_volumes" || teardown_status=1
+          exit "$teardown_status"

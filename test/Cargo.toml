@@ -1,0 +1,23 @@
+[package]
+name = "w9pt-tcp-seaweedfs-test"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.94.1"
+
+[dependencies]
+aws-sdk-s3 = { version = "=1.145.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+w9pt = { path = "../crates/w9pt" }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[workspace]
+

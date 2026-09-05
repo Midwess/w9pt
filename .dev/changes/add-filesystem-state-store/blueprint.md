@@ -2,7 +2,7 @@
 
 ## Design Approach
 
-Create `w9pt-fs-state`, a runtime-neutral authoritative filesystem metadata and coordination contract. It depends on `w9pt-storage` for immutable `ContentRef`/`PreparedContent` values and does not depend on `w9pt`.
+Create `w9pt-fs-state`, a runtime-neutral authoritative filesystem metadata and coordination contract. It depends on `w9pt-fs-storage` for immutable `ContentRef`/`PreparedContent` values and does not depend on `w9pt`.
 
 ```text
 future filesystem semantic engine
@@ -11,12 +11,12 @@ future filesystem semantic engine
   │     ├── future SQLite/PostgreSQL adapters
   │     ├── future etcd adapter
   │     └── future SlateDB adapter
-  └── w9pt-storage::ContentRepository
+  └── w9pt-fs-storage::ContentRepository
 ```
 
 The trait models consistent reads, serializable conditional commits, leases and fencing, mutation-result idempotency, and bounded revision polling. It does not expose SQL, generic key/value transactions, SDK clients, runtimes, or object-store layout.
 
-Use static dispatch with return-position `impl Future`, following `w9pt-storage::TargetStore`. Object-safe boxed adapters are deferred.
+Use static dispatch with return-position `impl Future`, following `w9pt-fs-storage::TargetStore`. Object-safe boxed adapters are deferred.
 
 ## Public Contract
 
@@ -79,7 +79,7 @@ Define:
 - `RequestFingerprint`, `MutationRetention`, checked timestamps and lease durations;
 - bounded `EntryName`, `XattrName`, principal/group IDs, symlink targets, and terminal-result bytes.
 
-Reuse `w9pt_storage::MutationId`, `ContentRef`, `PreparedContent`, and `BaseContentIdentity` where their semantics match. A distinct state request fingerprint covers the entire filesystem mutation rather than only content preparation.
+Reuse `w9pt_fs_storage::MutationId`, `ContentRef`, `PreparedContent`, and `BaseContentIdentity` where their semantics match. A distinct state request fingerprint covers the entire filesystem mutation rather than only content preparation.
 
 Initial authoritative records:
 

@@ -21,6 +21,8 @@ pub struct StateLimitValues {
     pub max_mutation_result_bytes: usize,
     /// Maximum queries in one consistent read batch.
     pub max_read_queries: u32,
+    /// Maximum authoritative directory-parent edges traversed during validation.
+    pub max_directory_ancestor_depth: u32,
     /// Maximum records returned by one ordered scan.
     pub max_scan_items: u32,
     /// Maximum aggregate bytes returned by one scan.
@@ -58,6 +60,7 @@ impl Default for StateLimitValues {
             max_symlink_bytes: 16 * 1024,
             max_mutation_result_bytes: 1024 * 1024,
             max_read_queries: 256,
+            max_directory_ancestor_depth: 1_024,
             max_scan_items: 4_096,
             max_scan_bytes: 8 * 1024 * 1024,
             max_preconditions: 1_024,
@@ -96,6 +99,10 @@ impl StateLimits {
                 to_u64(values.max_mutation_result_bytes),
             ),
             ("max_read_queries", u64::from(values.max_read_queries)),
+            (
+                "max_directory_ancestor_depth",
+                u64::from(values.max_directory_ancestor_depth),
+            ),
             ("max_scan_items", u64::from(values.max_scan_items)),
             ("max_scan_bytes", to_u64(values.max_scan_bytes)),
             ("max_preconditions", u64::from(values.max_preconditions)),
@@ -184,6 +191,11 @@ impl StateLimits {
     /// Returns the maximum read-query count.
     pub const fn max_read_queries(self) -> u32 {
         self.0.max_read_queries
+    }
+
+    /// Returns the maximum authoritative directory-parent edge depth.
+    pub const fn max_directory_ancestor_depth(self) -> u32 {
+        self.0.max_directory_ancestor_depth
     }
 
     /// Returns the maximum scan item count.
@@ -326,6 +338,8 @@ pub enum StateLimitKind {
     MutationResult,
     /// Queries in one read batch.
     ReadQueries,
+    /// Directory ancestors traversed during validation.
+    DirectoryAncestors,
     /// Items in one scan page.
     ScanItems,
     /// Bytes in one scan page.

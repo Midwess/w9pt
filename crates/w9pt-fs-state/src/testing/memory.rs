@@ -9,16 +9,17 @@ use std::{
 use crate::{
     AcquireLeaseOutcome, AcquireWriterLease, AdapterFailureKind, AmbiguousCommit, ChangeBatch,
     ChangeEvent, ChangeOrigin, ChangePoll, ChangePollOutcome, CommitConflict, CommitConflictKind,
-    CommitOutcome, CommitRequest, CommittedMutation, DirectoryCookie, FenceValidation,
-    FencingToken, FilesystemStateStore, LeaseOperationId, LeaseRejection, LeaseTimeAuthority,
-    LockCursor, MalformedCommit, ManualLeaseClock, MutationMismatch, MutationRecord, OpenPinCursor,
-    Precondition, ReadBatch, ReadConsistency, ReadOutcome, ReadQuery, ReadResult, RecordKey,
-    RecordRevision, RecordScan, ReleaseLeaseOutcome, ReleaseWriterLease, RenewLeaseOutcome,
-    RenewWriterLease, RequestFingerprint, ScanPage, ScanResume, StateChange, StateLimits,
-    StateRecord, StateRevision, StateSnapshot, StateStoreAdapterError, StateStoreContract,
-    StateStoreOperation, WriterLeaseGrant, WriterScopeId, WriterTopology, XattrCursor,
-    grant_writer_lease, renew_current_lease, validate_lease_release, validate_publish_content,
-    validate_record_set, validate_writer_fence,
+    CommitOutcome, CommitRequest, CommittedMutation, DirectoryCookie, DirectoryPage,
+    DirectoryPageEntry, FenceValidation, FencingToken, FilesystemStateStore, LeaseOperationId,
+    LeaseRejection, LeaseTimeAuthority, LockCursor, MalformedCommit, ManualLeaseClock,
+    MutationMismatch, MutationRecord, OpenPinCursor, Precondition, ReadBatch, ReadConsistency,
+    ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, RecordScan, ReleaseLeaseOutcome,
+    ReleaseWriterLease, RenewLeaseOutcome, RenewWriterLease, RequestFingerprint, ScanPage,
+    ScanResume, StateChange, StateLimits, StateRecord, StateRevision, StateSnapshot,
+    StateStoreAdapterError, StateStoreContract, StateStoreOperation, WriterLeaseGrant,
+    WriterScopeId, WriterTopology, XattrCursor, grant_writer_lease, renew_current_lease,
+    validate_lease_release, validate_publish_content, validate_record_set_with_limits,
+    validate_writer_fence,
 };
 
 #[derive(Debug)]
@@ -214,6 +215,78 @@ impl MemoryStateStore {
         }
         let mut results = Vec::with_capacity(request.queries().len());
         for (query_index, query) in request.queries().iter().enumerate() {
+            if let ReadQuery::OpenPinCount(inode_id) = query {
+                let count = state
+                    .records
+                    .keys()
+                    .filter(|key| {
+                        matches!(
+                            key,
+                            RecordKey::OpenPin(filesystem_id, candidate, _)
+                                if *filesystem_id == request.filesystem_id()
+                                    && *candidate == *inode_id
+                        )
+                    })
+                    .count();
+                let count = u64::try_from(count).map_err(|_| {
+                    MemoryStateStoreError::new(
+                        StateStoreOperation::Read,
+                        AdapterFailureKind::Corruption,
+                    )
+                })?;
+                results.push(ReadResult::OpenPinCount {
+                    inode_id: *inode_id,
+                    count,
+                });
+                continue;
+            }
+            if let ReadQuery::DirectoryPage {
+                parent_inode_id,
+                after,
+                bounds,
+            } = query
+            {
+                match read_directory_page(
+                    &state,
+                    request.filesystem_id(),
+                    *parent_inode_id,
+                    *after,
+                    *bounds,
+                )? {
+                    Ok(page) => results.push(ReadResult::DirectoryPage(page)),
+                    Err(required_bytes) => {
+                        return traced_outcome(
+                            &mut state,
+                            StateStoreOperation::Read,
+                            MemoryTracePhase::Completed,
+                            ReadOutcome::ScanBoundTooSmall {
+                                query_index,
+                                required_bytes,
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+            if let ReadQuery::InodeByQidPath(qid_path) = query {
+                let inode = state
+                    .records
+                    .iter()
+                    .find_map(|(key, record)| match (key, record) {
+                        (RecordKey::Inode(filesystem_id, _), StateRecord::Inode(inode))
+                            if *filesystem_id == request.filesystem_id()
+                                && inode.qid_path() == *qid_path =>
+                        {
+                            Some(Box::new(inode.clone()))
+                        }
+                        _ => None,
+                    });
+                results.push(ReadResult::InodeByQidPath {
+                    qid_path: *qid_path,
+                    inode,
+                });
+                continue;
+            }
             if let Some(key) = query.point_key(request.filesystem_id()) {
                 results.push(ReadResult::Point {
                     record: state.records.get(&key).cloned().map(Box::new),
@@ -351,6 +424,14 @@ impl MemoryStateStore {
                 CommitOutcome::MalformedRequest(error),
             );
         }
+        if let Err(error) = validate_qid_path_transition(&state.records, &request) {
+            return traced_outcome(
+                &mut state,
+                StateStoreOperation::Commit,
+                MemoryTracePhase::Rejected,
+                CommitOutcome::MalformedRequest(error),
+            );
+        }
         if let Err(error) = validate_monotonic_transitions(&state.records, &request) {
             return traced_outcome(
                 &mut state,
@@ -387,7 +468,13 @@ impl MemoryStateStore {
                 change,
                 record_revision,
             ) {
-                Ok(()) => changed_keys.extend(affected),
+                Ok(()) => {
+                    for key in affected {
+                        if !changed_keys.contains(&key) {
+                            changed_keys.push(key);
+                        }
+                    }
+                }
                 Err(ApplyFailure::Conflict(kind)) => {
                     return traced_outcome(
                         &mut state,
@@ -409,7 +496,7 @@ impl MemoryStateStore {
                 }
             }
         }
-        if let Err(error) = validate_record_set(&staged) {
+        if let Err(error) = validate_record_set_with_limits(&staged, self.contract.limits()) {
             return traced_outcome(
                 &mut state,
                 StateStoreOperation::Commit,
@@ -1104,6 +1191,16 @@ fn evaluate_preconditions(
                     Some(CommitConflictKind::OpenPinCount)
                 }
             }
+            Precondition::FilesystemPolicyGeneration { expected } => {
+                match records.get(&RecordKey::Filesystem(request.filesystem_id())) {
+                    Some(StateRecord::Filesystem(filesystem))
+                        if filesystem.policy_generation() == *expected =>
+                    {
+                        None
+                    }
+                    _ => Some(CommitConflictKind::FilesystemPolicyGeneration),
+                }
+            }
             Precondition::ExactFence(fence) if *fence != request.fence() => {
                 Some(CommitConflictKind::ExactFence)
             }
@@ -1191,6 +1288,60 @@ fn validate_directory_cookie_transition(
     Ok(())
 }
 
+fn validate_qid_path_transition(
+    records: &BTreeMap<RecordKey, StateRecord>,
+    request: &CommitRequest,
+) -> Result<(), MalformedCommit> {
+    let Some(StateRecord::Filesystem(filesystem)) =
+        records.get(&RecordKey::Filesystem(request.filesystem_id()))
+    else {
+        // Bootstrap inserts the filesystem header and root inode together.
+        return Ok(());
+    };
+    let mut next = filesystem.next_qid_path();
+    let mut allocations = 0u64;
+    let mut declared = 0u64;
+    for change in request.changes() {
+        match change {
+            StateChange::Insert {
+                record: StateRecord::Inode(inode),
+                ..
+            } => {
+                if inode.qid_path() != next {
+                    return Err(MalformedCommit::QidPathAllocation);
+                }
+                next = next
+                    .checked_next()
+                    .map_err(|_| MalformedCommit::Arithmetic)?;
+                allocations = allocations
+                    .checked_add(1)
+                    .ok_or(MalformedCommit::Arithmetic)?;
+            }
+            StateChange::Replace {
+                key,
+                record: StateRecord::Inode(replacement),
+            } => {
+                let Some(StateRecord::Inode(current)) = records.get(key) else {
+                    continue;
+                };
+                if current.qid_path() != replacement.qid_path() {
+                    return Err(MalformedCommit::QidPathAllocation);
+                }
+            }
+            StateChange::AdvanceQidPath { count } => {
+                declared = declared
+                    .checked_add(count.get())
+                    .ok_or(MalformedCommit::Arithmetic)?;
+            }
+            _ => {}
+        }
+    }
+    if allocations != declared {
+        return Err(MalformedCommit::QidPathAllocation);
+    }
+    Ok(())
+}
+
 fn validate_monotonic_transitions(
     records: &BTreeMap<RecordKey, StateRecord>,
     request: &CommitRequest,
@@ -1249,6 +1400,7 @@ fn validate_monotonic_transitions(
         let valid = match (current, record) {
             (StateRecord::Filesystem(current), StateRecord::Filesystem(replacement)) => {
                 current.root_inode_id() == replacement.root_inode_id()
+                    && current.next_qid_path() == replacement.next_qid_path()
                     && current.next_directory_cookie() == replacement.next_directory_cookie()
                     && current.policy_generation() == replacement.policy_generation()
             }
@@ -1270,6 +1422,7 @@ fn validate_monotonic_transitions(
                     && current.content() == replacement.content()
                     && current.content_file_id() == replacement.content_file_id()
                     && directory_valid
+                    && directory_parent_transition_valid(records, request, current, replacement)
             }
             (StateRecord::DirectoryEntry(current), StateRecord::DirectoryEntry(replacement)) => {
                 current.cookie() == replacement.cookie()
@@ -1288,6 +1441,48 @@ fn validate_monotonic_transitions(
         }
     }
     Ok(())
+}
+
+fn directory_parent_transition_valid(
+    records: &BTreeMap<RecordKey, StateRecord>,
+    request: &CommitRequest,
+    current: &crate::InodeRecord,
+    replacement: &crate::InodeRecord,
+) -> bool {
+    let (Some(old_parent), Some(new_parent)) =
+        (current.directory_parent(), replacement.directory_parent())
+    else {
+        return current.directory_parent() == replacement.directory_parent();
+    };
+    if old_parent == new_parent {
+        return true;
+    }
+    let deleted = request.changes().iter().find_map(|change| {
+        let StateChange::Delete(key) = change else {
+            return None;
+        };
+        match records.get(key) {
+            Some(StateRecord::DirectoryEntry(entry))
+                if entry.child_inode_id() == current.inode_id()
+                    && entry.parent_inode_id() == old_parent =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        }
+    });
+    let inserted = request.changes().iter().find_map(|change| match change {
+        StateChange::Insert {
+            record: StateRecord::DirectoryEntry(entry),
+            ..
+        } if entry.child_inode_id() == current.inode_id()
+            && entry.parent_inode_id() == new_parent =>
+        {
+            Some(entry)
+        }
+        _ => None,
+    });
+    matches!((deleted, inserted), (Some(old), Some(new)) if old.cookie() == new.cookie())
 }
 
 fn directory_generation_advances_once(
@@ -1426,6 +1621,14 @@ fn apply_change(
                 }),
             })?;
         }
+        StateChange::AdvanceQidPath { count } => {
+            mutate_record(records, &key, revision, |record| match record {
+                StateRecord::Filesystem(record) => record.advance_qid_path(*count),
+                _ => Err(crate::CounterOverflow {
+                    field: "FilesystemRecordKind",
+                }),
+            })?;
+        }
         StateChange::BumpFilesystemPolicyGeneration => {
             mutate_record(records, &key, revision, |record| match record {
                 StateRecord::Filesystem(record) => record.bump_policy_generation(),
@@ -1542,6 +1745,72 @@ fn mutate_record(
 }
 
 type ScanCandidate<'a> = (&'a RecordKey, &'a StateRecord, ScanResume);
+
+fn read_directory_page(
+    state: &AuthorityState,
+    filesystem_id: crate::FilesystemId,
+    parent_inode_id: crate::InodeId,
+    after: DirectoryCookie,
+    bounds: crate::ScanBounds,
+) -> Result<Result<DirectoryPage, usize>, MemoryStateStoreError> {
+    let maximum = usize::try_from(bounds.max_items()).unwrap_or(usize::MAX);
+    let candidate_limit = maximum.checked_add(1).ok_or_else(|| {
+        MemoryStateStoreError::new(StateStoreOperation::Read, AdapterFailureKind::Internal)
+    })?;
+    let candidates = directory_candidates(
+        state,
+        filesystem_id,
+        parent_inode_id,
+        after,
+        candidate_limit,
+    );
+    let mut entries = Vec::with_capacity(candidates.len().min(maximum));
+    let mut retained_bytes = 0usize;
+    let mut consumed = 0usize;
+    for (_, record, _) in &candidates {
+        if entries.len() == maximum {
+            break;
+        }
+        let StateRecord::DirectoryEntry(entry) = record else {
+            return Err(MemoryStateStoreError::new(
+                StateStoreOperation::Read,
+                AdapterFailureKind::Corruption,
+            ));
+        };
+        let child_key = RecordKey::Inode(filesystem_id, entry.child_inode_id());
+        let Some(StateRecord::Inode(child)) = state.records.get(&child_key) else {
+            return Err(MemoryStateStoreError::new(
+                StateStoreOperation::Read,
+                AdapterFailureKind::Corruption,
+            ));
+        };
+        let page_entry = DirectoryPageEntry::new(
+            entry.clone(),
+            child.kind(),
+            child.qid_path(),
+            child.revision(),
+        );
+        let item_bytes = page_entry.retained_bytes().ok_or_else(|| {
+            MemoryStateStoreError::new(StateStoreOperation::Read, AdapterFailureKind::Corruption)
+        })?;
+        let next_bytes = retained_bytes.checked_add(item_bytes).ok_or_else(|| {
+            MemoryStateStoreError::new(StateStoreOperation::Read, AdapterFailureKind::Corruption)
+        })?;
+        if next_bytes > bounds.max_bytes() {
+            if entries.is_empty() {
+                return Ok(Err(item_bytes));
+            }
+            break;
+        }
+        retained_bytes = next_bytes;
+        entries.push(page_entry);
+        consumed += 1;
+    }
+    let resume = (consumed < candidates.len())
+        .then(|| entries.last().map(|entry| entry.entry().cookie()))
+        .flatten();
+    Ok(Ok(DirectoryPage::new(entries, resume)))
+}
 
 fn read_scan(
     state: &AuthorityState,
@@ -1874,8 +2143,8 @@ mod tests {
         InodeGeneration, InodeId, InodeRecord, InodeTimes, LeaseDeadline, LeaseDuration, LeaseId,
         LeaseOperationId, LeaseTimeAuthority, LockGeneration, LockId, LockKind, LockOwner,
         LockRange, LockRecord, MutationContext, MutationResult, MutationResultKind,
-        MutationRetention, Precondition, PrincipalId, ReadConsistency, ReadQuery, RecordRevision,
-        ResultFormatVersion, ScanBounds, StateChange, UnixTimestamp, WriterFence,
+        MutationRetention, Precondition, PrincipalId, QidPath, ReadConsistency, ReadQuery,
+        RecordRevision, ResultFormatVersion, ScanBounds, StateChange, UnixTimestamp, WriterFence,
         WriterIncarnationId, WriterLeaseRecord, WriterScopeId,
     };
 
@@ -1916,6 +2185,31 @@ mod tests {
         let earlier_name = EntryName::new(b"z".to_vec(), limits).unwrap();
         {
             let mut state = client.state.lock().unwrap();
+            let timestamp = UnixTimestamp::new(0, 0).unwrap();
+            state.records.insert(
+                RecordKey::Inode(filesystem_id, child),
+                StateRecord::Inode(
+                    InodeRecord::new(
+                        child,
+                        QidPath::new(7).unwrap(),
+                        revision,
+                        0o644,
+                        PrincipalId::new(b"owner".to_vec(), limits).unwrap(),
+                        GroupId::new(b"group".to_vec(), limits).unwrap(),
+                        InodeTimes {
+                            accessed: timestamp,
+                            modified: timestamp,
+                            changed: timestamp,
+                            created: timestamp,
+                        },
+                        0,
+                        2,
+                        InodeGeneration::new(1).unwrap(),
+                        InodeData::Fifo,
+                    )
+                    .unwrap(),
+                ),
+            );
             for (name, cookie) in [
                 (later_name, DirectoryCookie::new(5)),
                 (earlier_name, DirectoryCookie::new(3)),
@@ -1936,12 +2230,20 @@ mod tests {
         let batch = ReadBatch::new(
             filesystem_id,
             ReadConsistency::LatestLinearizable,
-            vec![ReadQuery::Inode(parent), query],
+            vec![
+                ReadQuery::Inode(parent),
+                query,
+                ReadQuery::DirectoryPage {
+                    parent_inode_id: parent,
+                    after: DirectoryCookie::START,
+                    bounds: ScanBounds::new(1, 1024, limits).unwrap(),
+                },
+            ],
             limits,
         )
         .unwrap();
         let ReadOutcome::Snapshot(snapshot) =
-            w9pt_storage::testing::block_on(client.read_request(batch)).unwrap()
+            w9pt_fs_storage::testing::block_on(client.read_request(batch)).unwrap()
         else {
             panic!("expected snapshot");
         };
@@ -1960,6 +2262,14 @@ mod tests {
             page.resume(),
             Some(&ScanResume::DirectoryEntry(DirectoryCookie::new(3)))
         );
+        let ReadResult::DirectoryPage(page) = &snapshot.results()[2] else {
+            panic!("expected semantic directory page");
+        };
+        assert_eq!(page.entries().len(), 1);
+        assert_eq!(page.entries()[0].entry().cookie(), DirectoryCookie::new(3));
+        assert_eq!(page.entries()[0].child_kind(), crate::InodeKind::Fifo);
+        assert_eq!(page.entries()[0].child_qid_path(), QidPath::new(7).unwrap());
+        assert_eq!(page.resume(), Some(DirectoryCookie::new(3)));
 
         let future = ReadBatch::new(
             filesystem_id,
@@ -1969,7 +2279,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.read_request(future)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.read_request(future)).unwrap(),
             ReadOutcome::RevisionUnavailable { .. }
         ));
     }
@@ -2016,6 +2326,7 @@ mod tests {
         };
         let root = InodeRecord::new(
             root_id,
+            crate::QidPath::new(1).unwrap(),
             RecordRevision::new(1).unwrap(),
             0o755,
             PrincipalId::new(b"root".to_vec(), limits).unwrap(),
@@ -2026,6 +2337,7 @@ mod tests {
             InodeGeneration::new(1).unwrap(),
             InodeData::Directory {
                 generation: DirectoryGeneration::new(1).unwrap(),
+                parent_inode_id: root_id,
             },
         )
         .unwrap();
@@ -2034,12 +2346,13 @@ mod tests {
             StateRevision::new(1).unwrap(),
             RecordRevision::new(1).unwrap(),
             root_id,
+            crate::QidPath::new(2).unwrap(),
             DirectoryCookie::new(1),
             1,
         )
         .unwrap();
         let mutation = MutationContext::new(
-            w9pt_storage::MutationId::from_u128(6),
+            w9pt_fs_storage::MutationId::from_u128(6),
             crate::RequestFingerprint::blake3(b"bootstrap"),
             ClientIncarnationId::from_u128(7),
             MutationRetention::new(100),
@@ -2076,7 +2389,9 @@ mod tests {
         authority
             .inject_commit_failure(CommitFailureTiming::BeforePublication)
             .unwrap();
-        assert!(w9pt_storage::testing::block_on(client.commit_request(request.clone())).is_err());
+        assert!(
+            w9pt_fs_storage::testing::block_on(client.commit_request(request.clone())).is_err()
+        );
         assert_eq!(observer.current_revision().unwrap().get(), 1);
         assert!(
             !observer
@@ -2091,7 +2406,7 @@ mod tests {
             .inject_commit_failure(CommitFailureTiming::AfterPublication)
             .unwrap();
         let committed =
-            w9pt_storage::testing::block_on(client.commit_request(request.clone())).unwrap();
+            w9pt_fs_storage::testing::block_on(client.commit_request(request.clone())).unwrap();
         assert!(matches!(committed, CommitOutcome::Ambiguous(_)));
         {
             let state = observer.state.lock().unwrap();
@@ -2116,7 +2431,7 @@ mod tests {
 
         clock.advance_to(LeaseDeadline::new(5)).unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.commit_request(request)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.commit_request(request)).unwrap(),
             CommitOutcome::AlreadyCommitted(_)
         ));
         assert_eq!(observer.current_revision().unwrap().get(), 2);
@@ -2162,13 +2477,13 @@ mod tests {
         )
         .unwrap();
         let AcquireLeaseOutcome::Granted(first) =
-            w9pt_storage::testing::block_on(first_client.acquire_lease_request(first_request))
+            w9pt_fs_storage::testing::block_on(first_client.acquire_lease_request(first_request))
                 .unwrap()
         else {
             panic!("first lease must be granted");
         };
         assert!(matches!(
-            w9pt_storage::testing::block_on(first_client.acquire_lease_request(first_request))
+            w9pt_fs_storage::testing::block_on(first_client.acquire_lease_request(first_request))
                 .unwrap(),
             AcquireLeaseOutcome::AlreadyApplied(_)
         ));
@@ -2184,13 +2499,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(second_client.acquire_lease_request(busy_request))
+            w9pt_fs_storage::testing::block_on(second_client.acquire_lease_request(busy_request))
                 .unwrap(),
             AcquireLeaseOutcome::Rejected(LeaseRejection::Busy(_))
         ));
         clock.advance_to(LeaseDeadline::new(5)).unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(second_client.acquire_lease_request(busy_request))
+            w9pt_fs_storage::testing::block_on(second_client.acquire_lease_request(busy_request))
                 .unwrap(),
             AcquireLeaseOutcome::Rejected(LeaseRejection::Busy(_))
         ));
@@ -2205,10 +2520,10 @@ mod tests {
             limits,
         )
         .unwrap();
-        let AcquireLeaseOutcome::Granted(second) =
-            w9pt_storage::testing::block_on(second_client.acquire_lease_request(takeover_request))
-                .unwrap()
-        else {
+        let AcquireLeaseOutcome::Granted(second) = w9pt_fs_storage::testing::block_on(
+            second_client.acquire_lease_request(takeover_request),
+        )
+        .unwrap() else {
             panic!("expired lease must permit takeover");
         };
         assert!(second.fence.fencing_token > first.fence.fencing_token);
@@ -2216,11 +2531,13 @@ mod tests {
         let release =
             ReleaseWriterLease::new(filesystem_id, LeaseOperationId::from_u128(10), second.fence);
         assert_eq!(
-            w9pt_storage::testing::block_on(second_client.release_lease_request(release)).unwrap(),
+            w9pt_fs_storage::testing::block_on(second_client.release_lease_request(release))
+                .unwrap(),
             ReleaseLeaseOutcome::Released
         );
         assert_eq!(
-            w9pt_storage::testing::block_on(second_client.release_lease_request(release)).unwrap(),
+            w9pt_fs_storage::testing::block_on(second_client.release_lease_request(release))
+                .unwrap(),
             ReleaseLeaseOutcome::AlreadyApplied
         );
         let third_request = AcquireWriterLease::new(
@@ -2234,7 +2551,7 @@ mod tests {
         )
         .unwrap();
         let AcquireLeaseOutcome::Granted(third) =
-            w9pt_storage::testing::block_on(first_client.acquire_lease_request(third_request))
+            w9pt_fs_storage::testing::block_on(first_client.acquire_lease_request(third_request))
                 .unwrap()
         else {
             panic!("released scope must be grantable");
@@ -2267,7 +2584,7 @@ mod tests {
         )
         .unwrap();
         let AcquireLeaseOutcome::Granted(grant) =
-            w9pt_storage::testing::block_on(client.acquire_lease_request(acquire)).unwrap()
+            w9pt_fs_storage::testing::block_on(client.acquire_lease_request(acquire)).unwrap()
         else {
             panic!("lease must be granted");
         };
@@ -2280,7 +2597,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.renew_lease_request(renew)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.renew_lease_request(renew)).unwrap(),
             RenewLeaseOutcome::Renewed(_)
         ));
         let poll = ChangePoll::new(
@@ -2292,7 +2609,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.poll_changes_request(poll)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.poll_changes_request(poll)).unwrap(),
             ChangePollOutcome::RevisionCompacted {
                 oldest_available,
                 ..
@@ -2323,8 +2640,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            w9pt_storage::testing::block_on(authority.open_client().acquire_lease_request(request))
-                .unwrap(),
+            w9pt_fs_storage::testing::block_on(
+                authority.open_client().acquire_lease_request(request)
+            )
+            .unwrap(),
             AcquireLeaseOutcome::Rejected(LeaseRejection::InvalidDuration)
         );
     }
@@ -2352,7 +2671,7 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(
-                w9pt_storage::testing::block_on(client.acquire_lease_request(request)).unwrap(),
+                w9pt_fs_storage::testing::block_on(client.acquire_lease_request(request)).unwrap(),
                 AcquireLeaseOutcome::Granted(_)
             ));
         }
@@ -2365,7 +2684,7 @@ mod tests {
         )
         .unwrap();
         let ChangePollOutcome::Changes(batch) =
-            w9pt_storage::testing::block_on(client.poll_changes_request(poll)).unwrap()
+            w9pt_fs_storage::testing::block_on(client.poll_changes_request(poll)).unwrap()
         else {
             panic!("expected scoped change batch");
         };
@@ -2418,7 +2737,7 @@ mod tests {
                 &mut records,
                 second_filesystem,
                 MutationContext::new(
-                    w9pt_storage::MutationId::from_u128(10),
+                    w9pt_fs_storage::MutationId::from_u128(10),
                     crate::RequestFingerprint::blake3(b"lock"),
                     ClientIncarnationId::from_u128(11),
                     crate::MutationRetention::new(12),
@@ -2451,7 +2770,7 @@ mod tests {
         )
         .unwrap();
         let AcquireLeaseOutcome::Granted(grant) =
-            w9pt_storage::testing::block_on(client.acquire_lease_request(acquire)).unwrap()
+            w9pt_fs_storage::testing::block_on(client.acquire_lease_request(acquire)).unwrap()
         else {
             panic!("lease must be granted");
         };
@@ -2464,7 +2783,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.renew_lease_request(renew)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.renew_lease_request(renew)).unwrap(),
             RenewLeaseOutcome::Renewed(_)
         ));
         let read = ReadBatch::new(
@@ -2475,7 +2794,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.read_request(read)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.read_request(read)).unwrap(),
             ReadOutcome::Snapshot(_)
         ));
         let poll = ChangePoll::new(
@@ -2487,13 +2806,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(client.poll_changes_request(poll)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.poll_changes_request(poll)).unwrap(),
             ChangePollOutcome::Changes(_)
         ));
         let release =
             ReleaseWriterLease::new(filesystem_id, LeaseOperationId::from_u128(7), grant.fence);
         assert_eq!(
-            w9pt_storage::testing::block_on(client.release_lease_request(release)).unwrap(),
+            w9pt_fs_storage::testing::block_on(client.release_lease_request(release)).unwrap(),
             ReleaseLeaseOutcome::Released
         );
         let started: Vec<_> = authority
@@ -2545,7 +2864,7 @@ mod tests {
         let request = CommitRequest::new(
             filesystem_id,
             MutationContext::new(
-                w9pt_storage::MutationId::from_u128(4),
+                w9pt_fs_storage::MutationId::from_u128(4),
                 crate::RequestFingerprint::blake3(b"publish-xattr"),
                 ClientIncarnationId::from_u128(5),
                 MutationRetention::new(6),
@@ -2604,8 +2923,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(authority.open_client().poll_changes_request(request))
-                .unwrap(),
+            w9pt_fs_storage::testing::block_on(
+                authority.open_client().poll_changes_request(request)
+            )
+            .unwrap(),
             ChangePollOutcome::MalformedRequest(crate::InvalidChangeRequest::Limit(
                 crate::StateLimitError {
                     kind: crate::StateLimitKind::ChangeHistory,
@@ -2632,7 +2953,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            w9pt_storage::testing::block_on(
+            w9pt_fs_storage::testing::block_on(
                 authority.open_client().poll_changes_request(request)
             )
             .unwrap(),

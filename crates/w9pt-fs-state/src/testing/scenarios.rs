@@ -5,10 +5,11 @@ use crate::{
     InodeTimes, LeaseDeadline, LeaseDuration, LeaseId, LeaseOperationId, LockGeneration, LockId,
     LockKind, LockOwner, LockRange, LockRecord, ManualLeaseClock, MutationContext, MutationResult,
     MutationResultKind, MutationRetention, OpenAccess, OpenId, OpenPinRecord, OpenRecord,
-    OrphanRecord, PrincipalId, PublishContent, ReadBatch, ReadConsistency, ReadOutcome, ReadQuery,
-    ReadResult, RecordKey, RecordRevision, ResultFormatVersion, StateChange, StateLimits,
-    StateRecord, StateRevision, UnixTimestamp, WriterFence, WriterIncarnationId, WriterScopeId,
-    WriterTopology, XattrName, XattrStagingId, XattrStagingRecord, XattrValue,
+    OrphanRecord, Precondition, PrincipalId, PublishContent, QidPath, ReadBatch, ReadConsistency,
+    ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, ResultFormatVersion,
+    StateChange, StateLimits, StateRecord, StateRevision, UnixTimestamp, WriterFence,
+    WriterIncarnationId, WriterScopeId, WriterTopology, XattrName, XattrStagingId,
+    XattrStagingRecord, XattrValue,
 };
 
 use super::MemoryAuthority;
@@ -20,7 +21,7 @@ struct Harness {
     filesystem_id: FilesystemId,
     root_id: InodeId,
     file_id: InodeId,
-    content_file_id: w9pt_storage::FileId,
+    content_file_id: w9pt_fs_storage::FileId,
     first_open: OpenId,
     second_open: OpenId,
     first_client: ClientIncarnationId,
@@ -41,7 +42,7 @@ impl Harness {
         let filesystem_id = FilesystemId::from_u128(1);
         let root_id = InodeId::from_u128(2);
         let file_id = InodeId::from_u128(3);
-        let content_file_id = w9pt_storage::FileId::from_u128(3);
+        let content_file_id = w9pt_fs_storage::FileId::from_u128(3);
         let first_open = OpenId::from_u128(4);
         let second_open = OpenId::from_u128(5);
         let first_client = ClientIncarnationId::from_u128(6);
@@ -57,7 +58,7 @@ impl Harness {
         )
         .unwrap();
         let AcquireLeaseOutcome::Granted(grant) =
-            w9pt_storage::testing::block_on(client.acquire_lease_request(acquire)).unwrap()
+            w9pt_fs_storage::testing::block_on(client.acquire_lease_request(acquire)).unwrap()
         else {
             panic!("test lease must be granted");
         };
@@ -65,6 +66,7 @@ impl Harness {
         let root = root_record(root_id, 1, limits);
         let file = file_record(
             file_id,
+            QidPath::new(2).unwrap(),
             content_file_id,
             1,
             1,
@@ -78,6 +80,7 @@ impl Harness {
             StateRevision::new(1).unwrap(),
             revision,
             root_id,
+            QidPath::new(3).unwrap(),
             DirectoryCookie::new(3),
             1,
         )
@@ -169,18 +172,26 @@ impl Harness {
     }
 
     fn commit(&mut self, changes: Vec<StateChange>) -> CommitOutcome {
+        self.commit_with_preconditions(vec![], changes)
+    }
+
+    fn commit_with_preconditions(
+        &mut self,
+        preconditions: Vec<Precondition>,
+        changes: Vec<StateChange>,
+    ) -> CommitOutcome {
         let mutation_number = self.next_mutation;
         self.next_mutation += 1;
         let request = CommitRequest::new(
             self.filesystem_id,
             MutationContext::new(
-                w9pt_storage::MutationId::from_u128(mutation_number),
+                w9pt_fs_storage::MutationId::from_u128(mutation_number),
                 crate::RequestFingerprint::blake3(&mutation_number.to_be_bytes()),
                 ClientIncarnationId::from_u128(12),
                 MutationRetention::new(1_000),
             ),
             self.fence,
-            vec![],
+            preconditions,
             changes,
             MutationResult::new(
                 MutationResultKind::new(1).unwrap(),
@@ -192,7 +203,7 @@ impl Harness {
             self.limits,
         )
         .unwrap();
-        w9pt_storage::testing::block_on(self.client.commit_request(request)).unwrap()
+        w9pt_fs_storage::testing::block_on(self.client.commit_request(request)).unwrap()
     }
 
     fn read(&self, query: ReadQuery) -> Option<StateRecord> {
@@ -204,7 +215,7 @@ impl Harness {
         )
         .unwrap();
         let ReadOutcome::Snapshot(snapshot) =
-            w9pt_storage::testing::block_on(self.client.read_request(batch)).unwrap()
+            w9pt_fs_storage::testing::block_on(self.client.read_request(batch)).unwrap()
         else {
             panic!("expected snapshot");
         };
@@ -228,6 +239,7 @@ fn identity_times(seconds: i64) -> InodeTimes {
 fn root_record(root_id: InodeId, generation: u64, limits: StateLimits) -> InodeRecord {
     InodeRecord::new(
         root_id,
+        QidPath::new(1).unwrap(),
         RecordRevision::new(1).unwrap(),
         0o755,
         PrincipalId::new(b"root".to_vec(), limits).unwrap(),
@@ -238,6 +250,7 @@ fn root_record(root_id: InodeId, generation: u64, limits: StateLimits) -> InodeR
         InodeGeneration::new(generation).unwrap(),
         InodeData::Directory {
             generation: DirectoryGeneration::new(generation).unwrap(),
+            parent_inode_id: root_id,
         },
     )
     .unwrap()
@@ -246,21 +259,23 @@ fn root_record(root_id: InodeId, generation: u64, limits: StateLimits) -> InodeR
 #[allow(clippy::too_many_arguments)]
 fn file_record(
     inode_id: InodeId,
-    content_file_id: w9pt_storage::FileId,
+    qid_path: QidPath,
+    content_file_id: w9pt_fs_storage::FileId,
     links: u64,
     inode_generation: u64,
-    content: Option<w9pt_storage::ContentRef>,
+    content: Option<w9pt_fs_storage::ContentRef>,
     times: InodeTimes,
     limits: StateLimits,
 ) -> InodeRecord {
     let logical_size = content
         .as_ref()
-        .map_or(0, w9pt_storage::ContentRef::logical_size);
+        .map_or(0, w9pt_fs_storage::ContentRef::logical_size);
     let data_generation = content
         .as_ref()
-        .map_or(0, w9pt_storage::ContentRef::generation);
+        .map_or(0, w9pt_fs_storage::ContentRef::generation);
     InodeRecord::new(
         inode_id,
+        qid_path,
         RecordRevision::new(1).unwrap(),
         0o644,
         PrincipalId::new(b"owner".to_vec(), limits).unwrap(),
@@ -282,7 +297,7 @@ fn file_record(
 fn create_rename_link_and_unlink_are_atomic_record_sets() {
     let mut harness = Harness::new();
     let inode = InodeId::from_u128(20);
-    let content_file = w9pt_storage::FileId::from_u128(20);
+    let content_file = w9pt_fs_storage::FileId::from_u128(20);
     let created = EntryName::new(b"created".to_vec(), harness.limits).unwrap();
     assert!(matches!(
         harness.commit(vec![
@@ -290,6 +305,7 @@ fn create_rename_link_and_unlink_are_atomic_record_sets() {
                 key: RecordKey::Inode(harness.filesystem_id, inode),
                 record: StateRecord::Inode(file_record(
                     inode,
+                    QidPath::new(3).unwrap(),
                     content_file,
                     1,
                     1,
@@ -322,9 +338,16 @@ fn create_rename_link_and_unlink_are_atomic_record_sets() {
             StateChange::AdvanceDirectoryCookie {
                 count: core::num::NonZeroU64::new(1).unwrap(),
             },
+            StateChange::AdvanceQidPath {
+                count: core::num::NonZeroU64::new(1).unwrap(),
+            },
         ]),
         CommitOutcome::Committed(_)
     ));
+    let Some(StateRecord::Filesystem(filesystem)) = harness.read(ReadQuery::Filesystem) else {
+        panic!("filesystem header must remain");
+    };
+    assert_eq!(filesystem.next_qid_path(), QidPath::new(4).unwrap());
 
     let renamed = EntryName::new(b"renamed".to_vec(), harness.limits).unwrap();
     assert!(matches!(
@@ -383,6 +406,7 @@ fn create_rename_link_and_unlink_are_atomic_record_sets() {
                 key: RecordKey::Inode(harness.filesystem_id, inode),
                 record: StateRecord::Inode(file_record(
                     inode,
+                    QidPath::new(3).unwrap(),
                     content_file,
                     2,
                     2,
@@ -412,6 +436,7 @@ fn create_rename_link_and_unlink_are_atomic_record_sets() {
                 key: RecordKey::Inode(harness.filesystem_id, inode),
                 record: StateRecord::Inode(file_record(
                     inode,
+                    QidPath::new(3).unwrap(),
                     content_file,
                     1,
                     3,
@@ -441,60 +466,233 @@ fn create_rename_link_and_unlink_are_atomic_record_sets() {
 }
 
 #[test]
-fn prepared_content_and_open_unlinked_lifetime_publish_atomically() {
+fn qid_lookup_is_filesystem_scoped_and_allocated_paths_cannot_be_reused() {
     let mut harness = Harness::new();
-    let repository = w9pt_storage::ContentRepository::new(
-        w9pt_storage::testing::MemoryTarget::new(),
-        "scenario",
-        w9pt_storage::CreationDefaults::new(w9pt_storage::StorageMethod::BlockSplit),
-        w9pt_storage::StorageLimits::default(),
+    let read = |filesystem_id, qid_path| {
+        let request = ReadBatch::new(
+            filesystem_id,
+            ReadConsistency::LatestLinearizable,
+            vec![ReadQuery::InodeByQidPath(qid_path)],
+            harness.limits,
+        )
+        .unwrap();
+        let ReadOutcome::Snapshot(snapshot) =
+            w9pt_fs_storage::testing::block_on(harness.client.read_request(request)).unwrap()
+        else {
+            panic!("expected QID lookup snapshot");
+        };
+        snapshot.results()[0].clone()
+    };
+
+    assert!(matches!(
+        read(harness.filesystem_id, QidPath::new(2).unwrap()),
+        ReadResult::InodeByQidPath { qid_path, inode: Some(inode) }
+            if qid_path == QidPath::new(2).unwrap() && inode.inode_id() == harness.file_id
+    ));
+    assert!(matches!(
+        read(FilesystemId::from_u128(999), QidPath::new(2).unwrap()),
+        ReadResult::InodeByQidPath { inode: None, .. }
+    ));
+
+    let reused_inode = InodeId::from_u128(30);
+    assert!(matches!(
+        harness.commit(vec![
+            StateChange::Insert {
+                key: RecordKey::Inode(harness.filesystem_id, reused_inode),
+                record: StateRecord::Inode(file_record(
+                    reused_inode,
+                    QidPath::new(1).unwrap(),
+                    w9pt_fs_storage::FileId::from_u128(30),
+                    1,
+                    1,
+                    None,
+                    identity_times(0),
+                    harness.limits,
+                )),
+            },
+            StateChange::AdvanceQidPath {
+                count: core::num::NonZeroU64::new(1).unwrap(),
+            },
+        ]),
+        CommitOutcome::MalformedRequest(crate::MalformedCommit::QidPathAllocation)
+    ));
+}
+
+#[test]
+fn open_pin_count_is_fixed_size_and_preconditioned_at_commit() {
+    let mut harness = Harness::new();
+    let request = ReadBatch::new(
+        harness.filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![ReadQuery::OpenPinCount(harness.file_id)],
+        harness.limits,
     )
     .unwrap();
-    let mutation_id = w9pt_storage::MutationId::from_u128(harness.next_mutation);
-    let prepared = w9pt_storage::testing::block_on(repository.prepare_create(
+    let ReadOutcome::Snapshot(snapshot) =
+        w9pt_fs_storage::testing::block_on(harness.client.read_request(request)).unwrap()
+    else {
+        panic!("expected open-pin count snapshot");
+    };
+    assert_eq!(
+        snapshot.results()[0],
+        ReadResult::OpenPinCount {
+            inode_id: harness.file_id,
+            count: 2,
+        }
+    );
+
+    assert!(matches!(
+        harness.commit_with_preconditions(
+            vec![Precondition::OpenPinCount {
+                inode_id: harness.file_id,
+                expected: 2,
+            }],
+            vec![StateChange::BumpInodeGeneration(harness.file_id)],
+        ),
+        CommitOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        harness.commit_with_preconditions(
+            vec![Precondition::OpenPinCount {
+                inode_id: harness.file_id,
+                expected: 3,
+            }],
+            vec![StateChange::BumpInodeGeneration(harness.file_id)],
+        ),
+        CommitOutcome::Conflict(crate::CommitConflict {
+            kind: crate::CommitConflictKind::OpenPinCount,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn policy_generation_precondition_rejects_stale_authorization() {
+    let mut harness = Harness::new();
+    assert!(matches!(
+        harness.commit(vec![StateChange::BumpFilesystemPolicyGeneration]),
+        CommitOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        harness.commit_with_preconditions(
+            vec![Precondition::FilesystemPolicyGeneration { expected: 1 }],
+            vec![StateChange::BumpInodeGeneration(harness.file_id)],
+        ),
+        CommitOutcome::Conflict(crate::CommitConflict {
+            kind: crate::CommitConflictKind::FilesystemPolicyGeneration,
+            ..
+        })
+    ));
+    assert!(matches!(
+        harness.commit_with_preconditions(
+            vec![Precondition::FilesystemPolicyGeneration { expected: 2 }],
+            vec![StateChange::BumpInodeGeneration(harness.file_id)],
+        ),
+        CommitOutcome::Committed(_)
+    ));
+}
+
+#[test]
+fn prepared_content_and_open_unlinked_lifetime_publish_atomically() {
+    let mut harness = Harness::new();
+    let repository = w9pt_fs_storage::ContentRepository::new(
+        w9pt_fs_storage::testing::MemoryTarget::new(),
+        "scenario",
+        w9pt_fs_storage::CreationDefaults::new(w9pt_fs_storage::StorageMethod::BlockSplit),
+        w9pt_fs_storage::StorageLimits::default(),
+    )
+    .unwrap();
+    let mutation_id = w9pt_fs_storage::MutationId::from_u128(harness.next_mutation);
+    let prepared = w9pt_fs_storage::testing::block_on(repository.prepare_create(
         harness.content_file_id,
         mutation_id,
         0,
         b"content",
     ))
     .unwrap();
+    let mutation = MutationContext::new(
+        mutation_id,
+        crate::RequestFingerprint::blake3(b"publish"),
+        ClientIncarnationId::from_u128(12),
+        MutationRetention::new(1_000),
+    );
+    let changed_time = UnixTimestamp::new(1, 0).unwrap();
+    let publication = PublishContent {
+        inode_id: harness.file_id,
+        expected_base: w9pt_fs_storage::BaseContentIdentity::NEW_FILE,
+        logical_size: prepared.content().logical_size(),
+        data_generation: DataGeneration::new(prepared.content().generation()).unwrap(),
+        prepared: prepared.clone(),
+        inode_generation: InodeGeneration::new(2).unwrap(),
+        attributes: crate::InodeAttributeUpdate {
+            mode: Some(0o600),
+            modified: Some(changed_time),
+            changed: Some(changed_time),
+            ..crate::InodeAttributeUpdate::default()
+        },
+    };
+    let result = MutationResult::new(
+        MutationResultKind::new(1).unwrap(),
+        ResultFormatVersion::new(1).unwrap(),
+        b"published".to_vec(),
+        harness.limits,
+    )
+    .unwrap();
+    let conflict = CommitRequest::new(
+        harness.filesystem_id,
+        mutation,
+        harness.fence,
+        vec![Precondition::InodeGeneration {
+            inode_id: harness.file_id,
+            expected: InodeGeneration::new(2).unwrap(),
+        }],
+        vec![StateChange::PublishContent(publication.clone())],
+        result.clone(),
+        harness.limits,
+    )
+    .unwrap();
+    assert!(matches!(
+        w9pt_fs_storage::testing::block_on(harness.client.commit_request(conflict)).unwrap(),
+        CommitOutcome::Conflict(crate::CommitConflict {
+            kind: crate::CommitConflictKind::InodeGeneration,
+            ..
+        })
+    ));
+    assert!(matches!(
+        harness.read(ReadQuery::Inode(harness.file_id)),
+        Some(StateRecord::Inode(inode))
+            if inode.content().is_none() && inode.mode() == 0o644
+    ));
+
     let request = CommitRequest::new(
         harness.filesystem_id,
-        MutationContext::new(
-            mutation_id,
-            crate::RequestFingerprint::blake3(b"publish"),
-            ClientIncarnationId::from_u128(12),
-            MutationRetention::new(1_000),
-        ),
+        mutation,
         harness.fence,
-        vec![],
-        vec![StateChange::PublishContent(PublishContent {
+        vec![Precondition::InodeGeneration {
             inode_id: harness.file_id,
-            expected_base: w9pt_storage::BaseContentIdentity::NEW_FILE,
-            logical_size: prepared.content().logical_size(),
-            data_generation: DataGeneration::new(prepared.content().generation()).unwrap(),
-            prepared: prepared.clone(),
-            inode_generation: InodeGeneration::new(2).unwrap(),
-            times: identity_times(1),
-        })],
-        MutationResult::new(
-            MutationResultKind::new(1).unwrap(),
-            ResultFormatVersion::new(1).unwrap(),
-            b"published".to_vec(),
-            harness.limits,
-        )
-        .unwrap(),
+            expected: InodeGeneration::new(1).unwrap(),
+        }],
+        vec![StateChange::PublishContent(publication)],
+        result,
         harness.limits,
     )
     .unwrap();
     harness.next_mutation += 1;
     assert!(matches!(
-        w9pt_storage::testing::block_on(harness.client.commit_request(request)).unwrap(),
+        w9pt_fs_storage::testing::block_on(harness.client.commit_request(request)).unwrap(),
         CommitOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        harness.read(ReadQuery::Inode(harness.file_id)),
+        Some(StateRecord::Inode(inode))
+            if inode.mode() == 0o600
+                && inode.times().accessed == identity_times(0).accessed
+                && inode.times().modified == changed_time
     ));
     let name = EntryName::new(b"file".to_vec(), harness.limits).unwrap();
     let published = file_record(
         harness.file_id,
+        QidPath::new(2).unwrap(),
         harness.content_file_id,
         0,
         3,
@@ -649,6 +847,7 @@ fn locks_xattrs_and_simultaneous_attributes_remain_atomic() {
     let changed_times = identity_times(9);
     let changed = InodeRecord::new(
         harness.file_id,
+        QidPath::new(2).unwrap(),
         RecordRevision::new(1).unwrap(),
         0o600,
         PrincipalId::new(b"alice".to_vec(), harness.limits).unwrap(),
@@ -705,6 +904,7 @@ fn deleted_directory_cookies_cannot_be_reallocated() {
                 key: RecordKey::Inode(harness.filesystem_id, harness.file_id),
                 record: StateRecord::Inode(file_record(
                     harness.file_id,
+                    QidPath::new(2).unwrap(),
                     harness.content_file_id,
                     0,
                     2,
@@ -756,6 +956,7 @@ fn deleted_directory_cookies_cannot_be_reallocated() {
                 key: RecordKey::Inode(harness.filesystem_id, harness.file_id),
                 record: StateRecord::Inode(file_record(
                     harness.file_id,
+                    QidPath::new(2).unwrap(),
                     harness.content_file_id,
                     1,
                     3,
@@ -789,6 +990,7 @@ fn zero_link_pin_sets_require_an_orphan_until_final_retirement() {
                 key: RecordKey::Inode(harness.filesystem_id, harness.file_id),
                 record: StateRecord::Inode(file_record(
                     harness.file_id,
+                    QidPath::new(2).unwrap(),
                     harness.content_file_id,
                     0,
                     2,
@@ -815,6 +1017,7 @@ fn managed_generations_cannot_be_replaced_without_exact_advancement() {
     let mut harness = Harness::new();
     let stale = file_record(
         harness.file_id,
+        QidPath::new(2).unwrap(),
         harness.content_file_id,
         1,
         1,

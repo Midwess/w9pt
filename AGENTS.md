@@ -6,6 +6,22 @@
 
 The system is stateful even when its compute nodes are stateless. Every piece of state required for correctness must have an explicit owner in the connection/session layer, the authoritative metadata database, or immutable backend storage.
 
+## Development Status and Compatibility
+
+`w9pt` is under active unreleased development. There is no backward-compatibility
+contract for Rust APIs, crate boundaries, configuration, database schemas,
+private object keys, fingerprints, or persisted formats.
+
+- Remove superseded code instead of retaining deprecated aliases or adapters.
+- Do not implement legacy readers, dual writers, schema upgrades, import paths,
+  or compatibility shims for earlier development builds.
+- Make breaking changes directly and update current golden fixtures and tests.
+- Reject data from an incompatible development build and require the operator to
+  recreate its database and private object prefix.
+- Version and checksum current formats for validation and testing, not as a
+  promise to read formats produced before the current build.
+- Add compatibility guarantees only through a future explicit release proposal.
+
 ## Primary Architecture
 
 ```text
@@ -98,7 +114,7 @@ For block-split content:
 - shrink zeroes the discarded tail of the final retained block;
 - stored-data hash mismatch is corruption, never an instruction to update metadata.
 
-`w9pt-storage` prepares immutable payloads and returns a portable, self-validating `PreparedContent`/`ContentRef`. In clustered filesystem operation, it must not independently publish a mutable per-file S3 head as a second authority. The filesystem metadata transaction is the sole publisher of current content.
+`w9pt-fs-storage` prepares immutable payloads and returns a portable, self-validating `PreparedContent`/`ContentRef`. In clustered filesystem operation, it must not independently publish a mutable per-file S3 head as a second authority. The filesystem metadata transaction is the sole publisher of current content.
 
 ## Canonical Read Flow
 
@@ -197,7 +213,7 @@ Session input, effect dispatch, completion, and response emission require durabl
 - Emits high-level filesystem/policy effects and accepts exact terminal completions.
 - Never exposes target object keys, blocks, manifests, transactions, or database details on the wire.
 
-### `w9pt-storage`
+### `w9pt-fs-storage`
 
 - Implements backend-neutral raw and block-split content preparation and reads.
 - Is generic over a target-object interface and does not depend on a particular S3 SDK.
@@ -246,6 +262,7 @@ If a backend or deployment cannot prove a required guarantee, omit the capabilit
 11. Preserve one terminal completion per emitted operation even when cancellation or node failure races with commitment.
 12. Keep all persistent formats versioned, bounded, canonical, and independently testable.
 13. Do not copy, translate, or closely adapt AGPL ZeroFS implementation code, tests, comments, formats, or distinctive structure.
+14. While unreleased, remove superseded APIs and formats directly; do not retain backward-compatibility code for prior development builds.
 
 ## Required Testing
 
@@ -266,6 +283,5 @@ Every implementation layer must include deterministic tests for its failure boun
 
 - `.dev/project.md` defines the wider project scope and ownership rules.
 - `.dev/changes/complete-sans-io-core/` documents the implemented protocol/session foundation.
-- `.dev/changes/add-storage-methods/` is the draft proposal for raw and block-split content storage.
+- `.dev/changes/add-storage-methods/` documents the implemented raw and block-split content foundation.
 - `.dev/research/9p-s3-filesystem.md` and `.dev/research/steampipe-content-system.md` are research evidence, not normative requirements.
-

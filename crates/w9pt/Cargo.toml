@@ -1,8 +1,9 @@
 [package]
 name = "w9pt"
-version = "0.1.0"
+version = "0.1.0-dev"
+publish = false
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94.1"
 description = "Runtime-free Sans-I/O server core for stock 9P2000.L"
 license = "Apache-2.0"
 readme = "../../README.md"

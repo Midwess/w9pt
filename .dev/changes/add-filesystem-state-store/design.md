@@ -7,7 +7,7 @@
 ```text
 w9pt Session
   -> future filesystem semantic engine
-       ├── w9pt-storage ContentRepository
+       ├── w9pt-fs-storage ContentRepository
        │     -> immutable target objects
        └── w9pt-fs-state FilesystemStateStore
              -> authoritative metadata adapter
@@ -42,10 +42,10 @@ Use consistent `ReadBatch` snapshots followed by a typed `CommitRequest`. Adapte
 ## 3. Dependency Direction
 
 ```text
-w9pt-fs-state -> w9pt-storage
+w9pt-fs-state -> w9pt-fs-storage
 w9pt          -> no new dependencies
 
-future-w9pt-filesystem -> w9pt + w9pt-fs-state + w9pt-storage
+future-w9pt-filesystem -> w9pt + w9pt-fs-state + w9pt-fs-storage
 ```
 
 The state crate reuses portable content values but does not depend on protocol/session values. Database adapters therefore do not depend on 9P codecs, tags, fids, effects, or errno mappings.
@@ -110,7 +110,7 @@ inode/data/directory generations
 
 Zero is reserved where a value needs an explicit absent/uninitialized representation. Checked increment methods return typed overflow errors and never wrap.
 
-`InodeId` is not implicitly converted into `w9pt_storage::FileId`. A regular inode stores an explicit immutable content-file identity. Every prepared-content publication verifies this binding.
+`InodeId` is not implicitly converted into `w9pt_fs_storage::FileId`. A regular inode stores an explicit immutable content-file identity. Every prepared-content publication verifies this binding.
 
 ## 6. Authoritative Records
 
@@ -187,7 +187,7 @@ Before commit, the store verifies:
 - every immutable dependency was prepared before the state commit;
 - inode size, timestamps, content root, and data generation are changed together.
 
-The store does not read object storage. `PreparedContent` is the proof/handoff from `w9pt-storage`; adapter-specific publication stores its portable fields atomically with inode metadata.
+The store does not read object storage. `PreparedContent` is the proof/handoff from `w9pt-fs-storage`; adapter-specific publication stores its portable fields atomically with inode metadata.
 
 ## 10. Mutation Ledger and Ambiguity
 

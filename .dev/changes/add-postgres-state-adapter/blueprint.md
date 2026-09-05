@@ -1,26 +1,26 @@
 # Implementation Blueprint: Add PostgreSQL State Adapter
 
-## Dependency Gate
+## Readiness
 
-This change depends on `add-filesystem-state-store` and must remain draft until `w9pt-fs-state` is approved, implemented, and its conformance API is stable. Before implementation, reconcile every adapter task against the finalized public trait and schema model.
+`add-filesystem-state-store` is approved and complete. This blueprint is reconciled with the finalized `w9pt-fs-state` API, and the PostgreSQL change is approved for implementation.
 
 ## Design Approach
 
-Create `w9pt-fs-state-postgres`, a Tokio/SQLx adapter for `FilesystemStateStore`:
+Create `w9pt-fs-state-postgres`, a Tokio/SQLx implementation of `FilesystemStateStore`:
 
 ```text
 future filesystem engine
   -> w9pt-fs-state::FilesystemStateStore
        -> w9pt-fs-state-postgres
             -> caller-owned sqlx::PgPool
-                 -> PostgreSQL primary
+                 -> PostgreSQL writable primary
 ```
 
-The adapter accepts a caller-created pool, advertises `SerializableMultiWriter`, uses primary-only serializable transactions, maps semantic records to a fixed normalized schema, and preserves exact replay/fencing/revision behavior. It stores no file payload, S3 manifest, per-block mapping, or 9P session state.
+The adapter advertises `SerializableMultiWriter`, uses primary-only serializable transactions, maps every finalized semantic record/cursor/outcome to a fixed normalized schema, and stores no content payload, target manifest object, per-block mapping, or 9P session state.
 
 ## Package and Public API
 
-Use SQLx exactly `0.8.6` because the current SQLx 0.9 release requires Rust 1.86 while this workspace targets Rust 1.85:
+Use SQLx exactly `0.8.6`:
 
 ```toml
 sqlx = {
@@ -30,15 +30,14 @@ sqlx = {
 }
 ```
 
-Use static parameterized runtime queries and checked explicit row conversion. Embedded migration SQL uses `include_str!` and a small adapter-owned migration runner/checksum ledger, avoiding a live `DATABASE_URL` during consumer builds.
-
-Do not force a TLS backend. The embedding application constructs `PgPool` and may enable its chosen compatible SQLx TLS feature through Cargo feature unification.
+Use static parameterized runtime queries and checked explicit row conversion. Do not require `DATABASE_URL` or SQLx query metadata during builds. The embedding application constructs `PgPool` and may add a compatible SQLx TLS feature through feature unification.
 
 ```rust
 pub struct PostgresStateStore {
     pool: sqlx::PgPool,
     config: PostgresStateConfig,
     contract: StateStoreContract,
+    clock: LeaseClockMode,
 }
 
 impl PostgresStateStore {
@@ -55,34 +54,29 @@ impl PostgresStateStore {
 }
 ```
 
-`open` validates and never migrates. `migrate` is explicit so schema and runtime roles may have different privileges.
+Production `open` always uses PostgreSQL wall time. Test-only construction may select the database manual clock required by the conformance harness.
 
-## Fixed Schema and Migrations
+## Fixed Production Schema
 
-Use one fixed quoted schema:
+Use one fixed schema:
 
 ```sql
 "w9pt_fs_state_v1"
 ```
 
-All runtime and migration statements fully qualify identifiers. No correctness depends on `search_path`, locale, or caller-generated identifiers.
-
-Migrations are immutable SQL files embedded with `include_str!`, assigned monotonic versions, and checked with a stable digest. A fixed PostgreSQL advisory lock serializes migration runners. Applied version/digest records live in `w9pt_fs_state_v1.schema_migrations`. Startup fails on unknown versions, missing migrations, or checksum drift.
-
-Migration execution is transactional wherever PostgreSQL permits. The initial migration creates the schema, tables, constraints, and indexes. Future rolling changes must use documented expand/contract compatibility.
-
-## Physical Schema
+Every production statement fully qualifies every object. Migrations are immutable embedded SQL with monotonic versions and stable checksums. A fixed advisory lock serializes migration runners. `open` never runs DDL.
 
 Create permanent logged tables:
 
 ```text
 schema_migrations
-filesystems
+authority_heads
+filesystem_records
 inodes
 directory_entries
 opens
-orphans
 open_pins
+orphans
 locks
 xattrs
 xattr_staging
@@ -93,38 +87,70 @@ change_commits
 change_keys
 ```
 
-Principal keys and indexes:
+## Empty Authority and Bootstrap
 
-- `filesystems`: primary key `filesystem_id`; root inode, current revision, oldest retained change revision.
-- `inodes`: primary key `(filesystem_id, inode_id)` and record revision.
-- `directory_entries`: primary key `(filesystem_id, parent_inode_id, name)`; unique `(filesystem_id, parent_inode_id, cookie)`; child-inode index.
-- `opens`: primary key `(filesystem_id, open_id)`; inode index.
-- `orphans`: primary key `(filesystem_id, inode_id)`.
-- `open_pins`: primary key `(filesystem_id, inode_id, open_id)`.
-- `locks`: primary key `(filesystem_id, lock_id)`; index `(filesystem_id, inode_id, range_start, lock_id)`.
-- `xattrs`: primary key `(filesystem_id, inode_id, name)`.
-- `xattr_staging`: primary key `(filesystem_id, staging_id)`; owner/deadline indexes.
-- `mutation_results`: primary key `(filesystem_id, mutation_id)`; fingerprint, client incarnation, writer identity, exact result, revision, and retention horizon.
-- `writer_fences`: primary key `(filesystem_id, writer_scope_id)`; greatest-ever fence plus nullable current lease/holder/deadline.
-- `writer_lease_operations`: primary key `(filesystem_id, lease_operation_id)` for acquire/renew/release replay.
-- `change_commits`: primary key `(filesystem_id, revision)` and unique mutation ID.
-- `change_keys`: primary key `(filesystem_id, revision, ordinal)` with typed normalized key components.
+`authority_heads` is private and separate from `filesystem_records`.
 
-Avoid cascading deletes. Every record mutation and change key is explicit.
+- Missing head means current revision `1` and oldest cursor `1`.
+- A first successful revision-bearing operation inserts a baseline head then increments it.
+- Lease acquire/renew may occur while the public filesystem record is absent.
+- `ReadQuery::Filesystem` reads only `filesystem_records`.
+- A bootstrap commit may require public filesystem absence and insert the filesystem/root records.
+- Public filesystem deletion never deletes the private head, mutation ledger, change history, or fence counter.
 
-Use deferrable foreign keys only where ordering would otherwise prevent a valid atomic rename, unlink, or orphan transition. Rust validation remains the primary semantic validator; named SQL constraints independently reject malformed direct rows.
+Use `INSERT ... ON CONFLICT DO NOTHING` plus a locked read under serializable retry for lazy head creation. Never expose a private head as `StateRecord::Filesystem`.
 
-## Lossless SQL Mapping
+## Exact Physical Keys
 
-- Fixed IDs and digests: `BYTEA` with exact `octet_length` checks.
-- Entry names, xattr names, and byte-preserving identities: bounded `BYTEA` with binary ordering.
-- Object keys: bounded `TEXT`.
-- Enum values: small numeric tags with named check constraints.
-- Full public unsigned values: `NUMERIC(20,0)` plus `0..18446744073709551615` checks.
-- Filesystem timestamps: exact seconds/nanoseconds columns when PostgreSQL timestamp precision would narrow the public model.
-- Lease deadlines: `TIMESTAMPTZ`, evaluated using PostgreSQL time.
+- `authority_heads`: `(filesystem_id)`.
+- `filesystem_records`: `(filesystem_id)` with state revision, record revision, root, next cookie, and policy generation.
+- `inodes`: `(filesystem_id, inode_id)`.
+- `directory_entries`: `(filesystem_id, parent_inode_id, name)` and unique `(filesystem_id, parent_inode_id, cookie)`.
+- `opens`: `(filesystem_id, open_id)`.
+- `open_pins`: `(filesystem_id, inode_id, open_id)`.
+- `orphans`: `(filesystem_id, inode_id)`.
+- `locks`: `(filesystem_id, inode_id, lock_id)`.
+- `xattrs`: `(filesystem_id, inode_id, name)`.
+- `xattr_staging`: `(filesystem_id, staging_id)`.
+- `mutation_results`: `(filesystem_id, mutation_id)`.
+- `writer_fences`: `(filesystem_id, writer_scope_id)`.
+- `writer_lease_operations`: `(filesystem_id, lease_operation_id)`.
+- `change_commits`: `(filesystem_id, revision)`.
+- `change_keys`: `(filesystem_id, revision, ordinal)`.
 
-The numeric codec binds canonical unsigned decimal text through an explicit numeric cast and reads `numeric::text`, then parses through checked Rust `u64`. No unchecked signed cast is used.
+`writer_fences` contains the permanent greatest token and nullable active holder/lease/deadline/revision fields. Active fields decode as `WriterLeaseRecord`; all-null active fields mean the public record is absent.
+
+Avoid cascade deletes. Use deferrable foreign keys only where a valid atomic transition requires ordering flexibility, and still make every semantic change explicit.
+
+## Lossless Row Codecs
+
+- All state/storage IDs: exact 16-byte `BYTEA`.
+- Digests and fingerprints: exact 32-byte `BYTEA`.
+- Entry/xattr/principal/group/symlink bytes: bounded `BYTEA`.
+- Object keys: nonempty bounded `TEXT` without forbidden controls.
+- Enum variants: stable numeric tags with named constraints.
+- Every `u64`: `NUMERIC(20,0)` constrained to the unsigned range.
+- Every nonzero revision/generation/token: unsigned numeric plus lower bound one.
+- `UnixTimestamp`: signed seconds plus nanoseconds.
+- Lease duration/deadline: integer microsecond ticks in unsigned numeric columns.
+- Optional `ContentRef`: all fields null or all fields present.
+
+Bind unsigned values as canonical decimal text with explicit casts. Select numeric values canonically and parse with checked Rust conversion. Reconstruct `ContentRef` through `ContentRef::from_persisted` and validate its inode summaries.
+
+## Production and Test Lease Clocks
+
+Version 1 defines one lease tick as one microsecond.
+
+Production clock query:
+
+1. Call `clock_timestamp()` once per operation.
+2. Convert the Unix epoch value to an integral microsecond `NUMERIC` without floating-point transport.
+3. Reject negative/out-of-range values.
+4. Reuse the captured value for all comparisons and deadline calculations.
+
+Persist the resulting deadline as `NUMERIC(20,0)`, never `TIMESTAMPTZ`.
+
+The feature-gated PostgreSQL test harness creates `w9pt_fs_state_test_v1.lease_clocks(clock_id, now_tick)` outside production migrations. Test clients query one row in the same transaction as lease/fence state. `advance_time` performs a checked database update. This keeps independent pools deterministic with no shared process clock.
 
 ## Startup Validation
 
@@ -132,111 +158,142 @@ The numeric codec binds canonical unsigned decimal text through an explicit nume
 
 - PostgreSQL major version 15–18;
 - `pg_is_in_recovery() = false`;
-- exact supported schema migration versions and checksums;
-- configured state limits fit the schema constraints;
-- runtime role can perform required reads, writes, transaction settings, and row locks;
+- writable transaction state;
+- exact production schema migration versions/checksums;
+- configured `StateLimits` fit schema maxima;
+- runtime role has required DML, lock, and transaction-setting privileges;
 - `fsync = on` and `full_page_writes = on`;
-- permanent state tables are logged;
+- every production state table is logged/permanent;
 - transaction-local `synchronous_commit = on` can be enforced.
 
-The initial contract promises WAL flush on the primary only. Synchronous-standby durability and replica reads are separate future capabilities.
-
-Because a pool or proxy may route different connections differently, primary status is also verified inside every authoritative transaction.
+Primary routing is checked again inside every authoritative transaction. Write transactions additionally verify they are writable; read transactions remain intentionally `READ ONLY`.
 
 ## Serializable Read Mapping
 
 Every `ReadBatch`:
 
 1. Acquires one pool connection.
-2. Begins a transaction and immediately selects `SERIALIZABLE READ ONLY`.
-3. Verifies the connection is a primary.
-4. Reads the current filesystem revision.
-5. Executes all point/range queries in request order.
-6. Checks an `AtLeast` freshness floor inside the same snapshot.
-7. Commits before returning one state snapshot.
+2. Starts `SERIALIZABLE READ ONLY` before the first data query.
+3. Verifies writable-primary routing.
+4. Reads the private authority revision or revision-one baseline.
+5. Evaluates `AtLeast` in the same snapshot.
+6. Executes queries in request order.
+7. Streams bounded scan rows and constructs positional results.
+8. Commits before returning one outcome.
 
-Range scans use stable keyset cursors, never `OFFSET`:
+Exact scan keysets:
 
-- directory entries `(cookie, name)`;
-- locks `(range_start, lock_id)`;
-- xattrs `name`;
-- opens/orphans/mutations stable key suffixes.
+```text
+Inodes              inode_id
+DirectoryEntries    cookie within parent
+Opens               open_id
+OpenPins            (inode_id, open_id)
+Orphans             inode_id
+Locks               (inode_id, lock_id)
+Xattrs              (inode_id, name BYTEA)
+XattrStaging        staging_id
+Mutations           mutation_id
+WriterLeases        writer_scope_id, active only
+```
 
-Each query and aggregate result is bounded before materialization.
+Never use `OFFSET`. If one complete next row cannot fit the byte bound, return `ScanBoundTooSmall`. Return only the finalized `ReadOutcome` variants.
 
-## Serializable Commit Mapping
+## Ledger-First Commit Mapping
 
-Each attempt runs in one short `SERIALIZABLE READ WRITE` transaction:
+Before full adapter-limit preflight, perform a short primary `SERIALIZABLE READ ONLY` fixed-size lookup by `(filesystem_id, mutation_id)`:
 
-1. Validate the complete model and bounds before SQL.
-2. Set transaction-local statement timeout, lock timeout, and `synchronous_commit = on`.
-3. Verify primary status.
-4. Read the mutation ledger first.
-5. Return exact `AlreadyCommitted` for matching mutation ID, fingerprint, and client incarnation.
-6. Reject a retained identity mismatch before current-fence checks.
-7. Lock the per-filesystem revision row.
-8. Lock and validate the exact database-time writer fence.
-9. Sort and deduplicate all affected `RecordKey`s.
-10. Lock existing records in canonical order and read absent-key predicates.
-11. Validate typed preconditions and cross-record invariants.
-12. Apply normalized record changes.
-13. Increment the filesystem revision using checked numeric arithmetic.
-14. Store one exact mutation result, whole-commit event header, and ordered changed keys.
-15. Commit once.
+- present: call `MutationContext::classify_record` and return exact replay/mismatch;
+- absent: run `CommitRequest::validate_preflight` against adapter limits.
 
-All records changed by one semantic transaction receive the same new record revision. Failed preconditions roll back without retaining a terminal mutation result.
+Each new write attempt then runs one short `SERIALIZABLE READ WRITE` transaction:
 
-The per-filesystem revision row intentionally creates total event order and a short serialization point. Different filesystems do not share it.
+1. Set local statement timeout, lock timeout, and `synchronous_commit = on`.
+2. Verify writable-primary status.
+3. Repeat mutation-ledger lookup first.
+4. Lazily create/lock the private authority head.
+5. Lock the writer-fence row and capture one clock tick.
+6. Validate the exact current unexpired fence.
+7. Sort/deduplicate affected finalized `RecordKey`s.
+8. Lock existing records in canonical semantic order.
+9. Perform serializable absent-key predicate reads.
+10. Evaluate typed preconditions in request order.
+11. Apply typed changes and targeted cross-record validation.
+12. Increment the authority revision with checked numeric arithmetic.
+13. Assign the corresponding record revision to all changed public records.
+14. Store the exact `MutationRecord`, including retention and writer context.
+15. Store one whole change event including the mutation-record key.
+16. Commit once.
 
-## Content Publication
+Do not load an entire filesystem to validate a transition. Query the bounded affected closure and use constraints/indexed predicates for namespace generations, cookie allocation, content relationships, open pins/orphans, xattr staging, and lock conflicts.
 
-`PublishContent` writes only checked `ContentRef` fields into the inode row. The adapter delegates semantic validation to the finalized state model and confirms prepared mutation, file identity, base content, size, and generation relationships before issuing SQL.
+## Exact Mutation Replay
 
-No PostgreSQL table contains file payload bytes, object manifests, or per-block/per-extent mappings. Adding database-resident content mappings first requires a separate approved change to the state/storage contract.
+Persist all finalized `MutationRecord` fields. Classification uses only the finalized mismatch dimensions:
+
+```text
+mutation ID
+request fingerprint
+client incarnation
+retention
+```
+
+The request fingerprint represents the complete semantic request. Do not compare submitted changes or terminal results as separate adapter-specific mismatch dimensions. On exact replay, return the recorded revision/result and skip current fence validation.
+
+## Semantic Lock Order
+
+Mirror Rust `RecordKey::Ord` using a stable family tag plus byte-ordered key components. Lock the private authority head, then the writer-fence row, then issue table-specific `FOR UPDATE` operations in canonical semantic order.
+
+For absent rows, perform predicate reads in the serializable transaction. For byte-range locks, search only the inode, apply checked overlap predicates, and choose the lowest canonical conflicting `LockId`.
+
+## Content and Xattr Publication
+
+`PublishContent` validates and persists only `ContentRef`, logical size, generations, and times. Target data and manifest objects are already durable and are never fetched by PostgreSQL.
+
+`PublishXattrStaging` validates one complete staging record and atomically consumes it into the final xattr. Generic staging deletion plus generic xattr mutation must be rejected when it would bypass the dedicated transition.
 
 ## SQLSTATE, Retry, and Ambiguity
 
-Use exact SQLSTATE values and named constraints, never localized messages:
+- `40001`: definitive serialization abort; bounded identical retry.
+- `40P01`: definitive deadlock abort; bounded identical retry plus observability.
+- `23505`: only known constraints map to a semantic race or fresh ledger resolution.
+- `23503`/`23514`/`22003`/`22P02`: known model/range/schema failures.
+- `25006`: read-only route.
+- `57014`: timeout/cancellation classified by phase.
+- `08xxx`/`57P0x`: availability or ambiguous commit according to phase.
 
-- `40001`: definitive serialization abort; bounded exact transaction retry.
-- `40P01`: definitive deadlock abort; bounded exact retry plus observability.
-- `23505`: only known constraints map to semantic conflict or mutation-ledger race.
-- `23503`, `23514`, `22003`, `22P02`: invalid model/schema/range outcome.
-- `25006`: primary/read-only routing failure.
-- `57014`: timeout/cancellation classified by transaction phase.
-- connection/shutdown errors: availability or ambiguous commit according to phase.
+Never match localized messages. Unknown constraints/codes remain adapter failures.
 
-Definitive retry repeats the exact request and never rebases or changes mutation identity. Retry exhaustion is explicit.
+Any uncertain `COMMIT` response is potentially committed. Recovery starts with a fresh primary ledger probe and may resubmit only the same owned request. Exhaustion returns `CommitOutcome::Ambiguous`.
 
-Any error returned while executing `COMMIT` is treated as potentially committed unless PostgreSQL proves abort. Recovery opens a fresh primary transaction and resubmits the identical request. Ledger-first replay returns the committed result if present; if absent, only the same request may proceed. Bounded recovery exhaustion returns explicit ambiguity without claiming rollback.
+## Lease Mapping
 
-## Database-Time Leases and Fencing
+For acquire, renew, and release:
 
-Lease operations use stable operation IDs and serializable primary transactions. PostgreSQL time evaluates deadlines.
+1. Look up `(filesystem_id, lease_operation_id)` first.
+2. Compare the finalized `operation_fingerprint` and reconstruct exact replay/rejection.
+3. Validate request limits only when absent.
+4. Start/repeat a short primary serializable transaction.
+5. Lock the relevant private head/fence row in fixed order.
+6. Capture one authoritative tick.
+7. Apply the finalized grant/renew/release rule.
+8. Retain bounded operation replay data.
+9. For a successful public lease transition only, allocate a revision and whole lease-origin event.
 
-- Acquire locks the persistent scope row.
-- A non-expired different holder receives a busy result.
-- Fresh acquisition increments the greatest-ever fence using checked numeric arithmetic.
-- Renew validates exact lease, holder, and token and preserves the token.
-- Release clears active fields but retains the fence counter.
-- Exact lease-operation outcomes are retained for ambiguous replay.
-- Every non-replayed state commit validates the current non-expired fence.
-- Lease transitions receive filesystem revisions and change events.
+Release nulls active fields but never deletes/resets the greatest token. Renewal never shortens a deadline. History exhaustion is explicit.
 
-No Rust process clock participates in lease correctness.
+## Exact Change Polling
 
-## Change Polling
+`poll_changes` uses one primary serializable read transaction:
 
-`poll_changes` runs in a primary-only serializable read transaction:
+1. Read oldest/current revisions or revision-one baseline.
+2. Return `RevisionUnavailable` for a future cursor.
+3. Return `RevisionCompacted` for a cursor before retained history.
+4. Read headers after the cursor by revision.
+5. Use stored key counts to return `PollBoundTooSmall` before fetching an oversized first event.
+6. Fetch whole events and ordered keys within event/key bounds.
+7. Return `Changes(ChangeBatch)` with events, `next`, and `current_revision`.
 
-1. Read oldest retained/current revisions.
-2. Return `RevisionCompacted` for an old cursor.
-3. Select bounded event headers after the cursor in revision order.
-4. Select corresponding keys ordered by `(revision, ordinal)`.
-5. Enforce commit/key/byte bounds.
-6. Return resume revision and `has_more`.
-
-One event is never split. `LISTEN/NOTIFY` may later be used only as a wake-up hint.
+No event is split and no `has_more` field is added. Remaining work is `next < current_revision`.
 
 ## Files to Create or Modify
 
@@ -256,6 +313,7 @@ crates/w9pt-fs-state-postgres/
     config.rs
     error.rs
     numeric.rs
+    clock.rs
     key_codec.rs
     row_codec.rs
     migration.rs
@@ -270,14 +328,17 @@ crates/w9pt-fs-state-postgres/
       mod.rs
       records.rs
       locks.rs
+    testing.rs            # feature-gated database conformance controls
   tests/
     support/
       mod.rs
     numeric_roundtrip.rs
     migration.rs
     validation.rs
+    bootstrap.rs
     postgres_conformance.rs
     transaction_isolation.rs
+    scans.rs
     idempotency.rs
     commit_recovery.rs
     leases_and_fencing.rs
@@ -286,17 +347,17 @@ crates/w9pt-fs-state-postgres/
 
 ## Implementation Phases
 
-1. Reconcile finalized trait, scaffold adapter, configure SQLx, and implement checked codecs/configuration.
-2. Create fixed schema and explicit embedded migration runner.
+1. Scaffold the adapter, config/error types, SQLx dependency, and checked numeric/key/clock codecs.
+2. Implement private authority heads, exact public record tables, and embedded migrations.
 3. Implement startup/transaction validation and SQLSTATE classification.
-4. Implement consistent reads and bounded keyset scans.
-5. Implement ledger-first atomic commits, deterministic locks, revisions, and prepared-content publication.
-6. Implement database-time leases, fencing, and change polling.
-7. Run PostgreSQL 15–18 conformance, ambiguity/failure tests, documentation, and dependency validation.
+4. Implement revision-one reads, every point query, and all ten exact scan mappings.
+5. Implement ledger-first commits, semantic locking, all transitions, revisions, and exact replay.
+6. Implement database-time leases, test database clock, fencing, and exact change outcomes.
+7. Run PostgreSQL 15–18 conformance/failure tests and complete documentation/dependency validation.
 
 ## Integration Test Environment
 
-CI supplies explicit DSNs:
+CI supplies:
 
 ```text
 W9PT_POSTGRES_15_DSN
@@ -305,32 +366,19 @@ W9PT_POSTGRES_17_DSN
 W9PT_POSTGRES_18_DSN
 ```
 
-`W9PT_POSTGRES_TEST_DSN` selects one optional local database. When `W9PT_POSTGRES_TEST_REQUIRED=1`, missing required DSNs fail rather than skip. Tests use unique random filesystem identities inside the fixed schema and delete only those scoped rows. Database/container provisioning remains outside this repository.
+`W9PT_POSTGRES_TEST_DSN` selects one optional local database. `W9PT_POSTGRES_TEST_REQUIRED=1` makes missing declared DSNs fail. Tests use unique filesystem, clock, and mutation identities and remove only their scoped rows. Database/container provisioning remains outside the repository.
 
-## Testing Strategy
+## Required Verification
 
-- Round-trip `0`, `i64::MAX`, `i64::MAX + 1`, and `u64::MAX` through every unsigned mapping.
-- Reject malformed direct rows through named SQL constraints.
-- Prove one read batch cannot mix revisions during concurrent commits.
+- Round-trip every public numeric boundary and malformed row.
+- Prove empty revision-one behavior and lease-before-filesystem bootstrap.
+- Prove one read batch cannot mix revisions.
+- Test every point query, scan order, resume cursor, and byte-bound outcome.
 - Prove per-filesystem ordering and cross-filesystem independence.
-- Exercise namespace, content, open-unlinked, lock, and xattr transitions through the shared conformance suite.
-- Retry exact mutations through separate pools and reject changed fingerprints/results.
-- Lose the response after server commit and recover only through ledger replay.
-- Reopen fresh stores with empty process-local state.
-- Exercise lease acquire/renew/release/takeover and stale writers with database time.
-- Verify standby and weak-durability configurations are rejected.
-- Exercise change polling at empty, bounded, resume, and compaction boundaries.
-- Run the complete adapter conformance matrix on PostgreSQL 15–18 current minors.
-
-## Risks and Mitigations
-
-- **Prerequisite trait changes:** block implementation and reconcile the full schema after the state crate lands.
-- **Hot revision row:** keep it per filesystem and transactions short; benchmark before claiming throughput.
-- **Serializable retry amplification:** deterministic locks, bounded exact retries, and explicit exhaustion.
-- **Absent-key races:** combine serializable predicate reads with named unique constraints.
-- **Ambiguous commit:** never infer rollback or alter the request; resolve through exact ledger retry.
-- **Unsigned narrowing:** constrained numeric values and independent boundary tests.
-- **Replica staleness:** primary verification inside every transaction.
-- **Search-path/collation behavior:** fixed fully qualified schema and byte-preserving ordered values.
-- **Migration drift:** embedded immutable checksums and fail-closed startup.
-- **Durability overstatement:** verify exact settings and document primary-WAL-only acknowledgment.
+- Exercise every finalized state transition and semantic outcome.
+- Retry exact mutations through separate pools and reject only finalized mismatch dimensions.
+- Lose a successful commit acknowledgment and recover through ledger replay.
+- Exercise deterministic test time and real PostgreSQL time separately.
+- Prove release/expiry/takeover never reuses a fence.
+- Exercise future, compacted, too-small, empty, bounded, and resumed change polls.
+- Reopen fresh stores with no local state and pass the complete shared conformance suite on PostgreSQL 15–18.

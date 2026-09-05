@@ -26,7 +26,7 @@ The system SHALL keep protocol/session state, filesystem metadata coordination, 
 
 #### Scenario: State crate is built
 - WHEN `w9pt-fs-state` is compiled
-- THEN it may depend on portable `w9pt-storage` content types
+- THEN it may depend on portable `w9pt-fs-storage` content types
 - AND it does not depend on `w9pt`, a database SDK, an async runtime, or a transport
 
 #### Scenario: Connection state must survive movement
@@ -36,7 +36,7 @@ The system SHALL keep protocol/session state, filesystem metadata coordination, 
 
 #### Scenario: File content changes
 - WHEN immutable payloads and a manifest are prepared
-- THEN `w9pt-storage` owns their physical layout
+- THEN `w9pt-fs-storage` owns their physical layout
 - AND `w9pt-fs-state` owns only the authoritative inode publication of the resulting content reference
 
 ### Requirement: Honest Store Guarantees and Writer Topology
@@ -73,7 +73,7 @@ The system SHALL represent every persistent filesystem, inode, open, lock, lease
 
 #### Scenario: Inode owns content
 - WHEN a regular inode is associated with immutable file content
-- THEN it stores an explicit `w9pt_storage::FileId` binding
+- THEN it stores an explicit `w9pt_fs_storage::FileId` binding
 - AND no undocumented numeric conversion from `InodeId` is used
 
 ### Requirement: Bounded Validated Authoritative Records
@@ -154,7 +154,7 @@ The system SHALL apply a validated `CommitRequest` as one serializable, durable,
 The system SHALL publish prepared immutable content only through the same authoritative transaction that updates its inode metadata and retained mutation result.
 
 #### Scenario: Prepared content is published
-- GIVEN all immutable payloads and the manifest were acknowledged durable by `w9pt-storage`
+- GIVEN all immutable payloads and the manifest were acknowledged durable by `w9pt-fs-storage`
 - WHEN `PublishContent` validates against the current inode base
 - THEN the new `ContentRef`, logical size, timestamps, data generation, and terminal result commit together
 - AND the state store performs no target-object reads or writes

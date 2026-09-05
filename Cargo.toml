@@ -1,3 +1,10 @@
 [workspace]
-members = ["crates/w9pt", "crates/w9pt-storage", "crates/w9pt-fs-state"]
+members = [
+    "crates/w9pt",
+    "crates/w9pt-fs",
+    "crates/w9pt-fs-storage",
+    "crates/w9pt-fs-storage-s3",
+    "crates/w9pt-fs-state",
+    "crates/w9pt-fs-state-postgres",
+]
 resolver = "3"

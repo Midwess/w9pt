@@ -7,11 +7,11 @@ The change introduces a file-content repository between a future filesystem sema
 ```text
 w9pt Session
   -> future filesystem semantic engine
-       -> w9pt-storage ContentRepository
+       -> w9pt-fs-storage ContentRepository
             -> caller-provided TargetStore
 ```
 
-`w9pt-storage` owns content layout and persistence. It does not own paths, namespace metadata, inode authorization, QIDs, open handles, append-offset selection, or locks. A caller supplies opaque file and mutation identities and decides when a prepared content reference becomes part of authoritative filesystem metadata.
+`w9pt-fs-storage` owns content layout and persistence. It does not own paths, namespace metadata, inode authorization, QIDs, open handles, append-offset selection, or locks. A caller supplies opaque file and mutation identities and decides when a prepared content reference becomes part of authoritative filesystem metadata.
 
 The existing `w9pt` effect/completion API remains the only protocol boundary. Storage methods are never visible to a 9P client.
 
