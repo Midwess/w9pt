@@ -1,9 +1,9 @@
-//! Minimal application-owned 9P-to-S3 forwarding server used by integration tests.
+//! Minimal application-owned 9P-to-S3 forwarding servers used by integration tests.
 //!
 //! This is intentionally not a production filesystem. It demonstrates the
 //! embedding boundary: [`w9pt::Session`] owns 9P protocol state, while this
-//! application receives effects, performs SeaweedFS S3 operations, and returns
-//! completions.
+//! application receives TCP stream bytes or complete binary WebSocket messages,
+//! performs SeaweedFS S3 operations, and returns completions.
 
 #![forbid(unsafe_code)]
 
@@ -14,6 +14,16 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
     primitives::ByteStream,
     types::ChecksumAlgorithm,
+};
+use axum::{
+    Router,
+    extract::{
+        State,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{any, get},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -36,6 +46,10 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 
 const ROOT_OBJECT: u128 = 1;
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// WebSocket subprotocol required by the HTTP 9P endpoint.
+pub const WEBSOCKET_9P_SUBPROTOCOL: &str = "9p";
+/// Maximum complete 9P frame accepted in one WebSocket message.
+pub const WEBSOCKET_9P_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct FileEntry {
@@ -547,6 +561,204 @@ pub async fn serve_forever(
             }
         });
     }
+}
+
+#[derive(Clone, Debug)]
+struct WebsocketState {
+    filesystem: AppFilesystem,
+    next_session: Arc<Mutex<u64>>,
+}
+
+impl WebsocketState {
+    fn new(filesystem: AppFilesystem) -> Self {
+        Self {
+            filesystem,
+            next_session: Arc::new(Mutex::new(1)),
+        }
+    }
+
+    async fn reserve_session(&self) -> Result<SessionId, io::Error> {
+        let mut next = self.next_session.lock().await;
+        let session = *next;
+        *next = next
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session identifier exhausted"))?;
+        Ok(SessionId::new(session))
+    }
+}
+
+/// Builds the standalone HTTP router that serves 9P over binary WebSocket messages.
+///
+/// `GET /healthz` returns `204 No Content`. `/9p` requires the `9p` WebSocket
+/// subprotocol. Each accepted binary message is one complete 9P frame, and each
+/// response frame is sent as one binary message.
+pub fn websocket_router(filesystem: AppFilesystem) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/9p", any(upgrade_websocket))
+        .with_state(WebsocketState::new(filesystem))
+}
+
+async fn upgrade_websocket(
+    websocket: WebSocketUpgrade,
+    State(state): State<WebsocketState>,
+) -> Response {
+    let websocket = websocket
+        .max_message_size(WEBSOCKET_9P_MAX_MESSAGE_BYTES)
+        .max_frame_size(WEBSOCKET_9P_MAX_MESSAGE_BYTES)
+        .protocols([WEBSOCKET_9P_SUBPROTOCOL]);
+    if websocket.selected_protocol().is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Sec-WebSocket-Protocol must include 9p",
+        )
+            .into_response();
+    }
+    let session_id = match state.reserve_session().await {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            eprintln!("WebSocket 9P session allocation failed: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    websocket
+        .on_failed_upgrade(|error| eprintln!("WebSocket 9P upgrade failed: {error}"))
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = serve_websocket(socket, state.filesystem, session_id).await {
+                eprintln!("WebSocket 9P connection failed: {error}");
+            }
+        })
+}
+
+async fn serve_websocket(
+    mut socket: WebSocket,
+    filesystem: AppFilesystem,
+    session_id: SessionId,
+) -> Result<(), BoxError> {
+    let mut session = Session::new(SessionConfig::default(), SessionContext::new(session_id))?;
+    while let Some(message) = socket.recv().await {
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                session.transport_closed();
+                drain_cleanup_effects(&mut session, &filesystem).await?;
+                return Err(error.into());
+            }
+        };
+        match message {
+            Message::Binary(frame) => {
+                if let Err(error) = session.receive_frame(frame.to_vec()) {
+                    eprintln!("invalid 9P WebSocket frame: {error}");
+                    close_websocket(&mut socket, close_code::PROTOCOL, "invalid 9P frame").await;
+                    session.transport_closed();
+                    drain_cleanup_effects(&mut session, &filesystem).await?;
+                    return Ok(());
+                }
+                if !drive_websocket_effects(&mut session, &mut socket, &filesystem).await? {
+                    return Ok(());
+                }
+            }
+            Message::Text(_) => {
+                close_websocket(
+                    &mut socket,
+                    close_code::UNSUPPORTED,
+                    "9P requires binary messages",
+                )
+                .await;
+                session.transport_closed();
+                drain_cleanup_effects(&mut session, &filesystem).await?;
+                return Ok(());
+            }
+            Message::Close(_) => {
+                session.transport_closed();
+                drain_cleanup_effects(&mut session, &filesystem).await?;
+                return Ok(());
+            }
+            Message::Ping(_) | Message::Pong(_) => {}
+        }
+    }
+    session.transport_closed();
+    drain_cleanup_effects(&mut session, &filesystem).await?;
+    Ok(())
+}
+
+async fn drive_websocket_effects(
+    session: &mut Session,
+    socket: &mut WebSocket,
+    filesystem: &AppFilesystem,
+) -> Result<bool, BoxError> {
+    while let Some(effect) = session.poll_effect() {
+        match effect {
+            Effect::SendFrame { bytes } => socket.send(Message::Binary(bytes.into())).await?,
+            Effect::Filesystem {
+                operation_id,
+                request,
+            } => {
+                let result = filesystem.handle_filesystem(request).await;
+                session.complete(Completion::Filesystem {
+                    operation_id,
+                    result,
+                })?;
+            }
+            Effect::Policy {
+                operation_id,
+                request,
+            } => {
+                let result = filesystem.handle_policy(request);
+                session.complete(Completion::Policy {
+                    operation_id,
+                    result,
+                })?;
+            }
+            Effect::Cancel { .. } => {}
+            Effect::CloseSession { .. } => {
+                close_websocket(socket, close_code::PROTOCOL, "9P session closed").await;
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn drain_cleanup_effects(
+    session: &mut Session,
+    filesystem: &AppFilesystem,
+) -> Result<(), BoxError> {
+    while let Some(effect) = session.poll_effect() {
+        match effect {
+            Effect::Filesystem {
+                operation_id,
+                request,
+            } => {
+                let result = filesystem.handle_filesystem(request).await;
+                session.complete(Completion::Filesystem {
+                    operation_id,
+                    result,
+                })?;
+            }
+            Effect::Policy {
+                operation_id,
+                request,
+            } => {
+                let result = filesystem.handle_policy(request);
+                session.complete(Completion::Policy {
+                    operation_id,
+                    result,
+                })?;
+            }
+            Effect::SendFrame { .. } | Effect::Cancel { .. } | Effect::CloseSession { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+async fn close_websocket(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
 }
 
 async fn drive_effects(

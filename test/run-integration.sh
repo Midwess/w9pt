@@ -11,7 +11,8 @@ compose_project="w9pt-integration-$$"
 compose_file="$repository_root/test/compose.yaml"
 endpoint=${W9PT_TEST_S3_ENDPOINT:-http://127.0.0.1:$provider_port}
 bucket=${W9PT_TEST_S3_BUCKET:-w9pt-test-bucket}
-prefix=${W9PT_TEST_S3_PREFIX:-tcp/w9pt-s3-test-development}
+tcp_prefix=${W9PT_TEST_S3_PREFIX:-tcp/w9pt-s3-test-development}
+websocket_prefix=${W9PT_TEST_WEBSOCKET_S3_PREFIX:-websocket/w9pt-s3-test-development}
 compat_prefix=${W9PT_S3_COMPAT_TEST_PREFIX:-compat/target/w9pt-s3-test-0123456789abcdef}
 compat_repository_prefix=${W9PT_S3_COMPAT_REPOSITORY_TEST_PREFIX:-compat/repository/w9pt-s3-test-fedcba9876543210}
 postgres_dsn=${W9PT_POSTGRES_TEST_DSN:-postgres://w9pt_test:w9pt_test@127.0.0.1:$postgres_port/w9pt_test}
@@ -114,5 +115,11 @@ cargo test -p w9pt-fs-state-postgres --all-features --locked -- --test-threads=1
 W9PT_TCP_SEAWEED_TEST_REQUIRED=1 \
 W9PT_TEST_S3_ENDPOINT="$endpoint" \
 W9PT_TEST_S3_BUCKET="$bucket" \
-W9PT_TEST_S3_PREFIX="$prefix" \
+W9PT_TEST_S3_PREFIX="$tcp_prefix" \
 cargo test --manifest-path test/Cargo.toml --locked --test tcp_seaweedfs -- --nocapture
+
+W9PT_WEBSOCKET_SEAWEED_TEST_REQUIRED=1 \
+W9PT_TEST_S3_ENDPOINT="$endpoint" \
+W9PT_TEST_S3_BUCKET="$bucket" \
+W9PT_TEST_WEBSOCKET_S3_PREFIX="$websocket_prefix" \
+cargo test --manifest-path test/Cargo.toml --locked --test websocket_seaweedfs -- --nocapture

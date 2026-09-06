@@ -216,3 +216,21 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
   durability, restart, response-loss, multi-node, TLS/SigV4, lifecycle, or
   production-support claim; deterministic SDK replay remains authoritative for
   transport ambiguity.
+
+### WebSocket 9P integration profile (`add-websocket-9p-integration-profile`, 2026-09-06)
+
+- The standalone test workspace includes sibling TCP and HTTP/WebSocket
+  application profiles over the same minimal SeaweedFS-backed fixture; no
+  runtime or transport dependency enters a root workspace crate.
+- The HTTP server exposes `GET /healthz` and upgrades `/9p` only for clients
+  offering the `9p` WebSocket subprotocol.
+- Each bounded binary WebSocket message maps to one complete
+  `Session::receive_frame` input and each `SendFrame` effect maps to one binary
+  response message. Text and malformed frame inputs close deterministically.
+- Every upgraded connection owns an independent checked `SessionId` and
+  in-memory `Session`; gateway loss ends the connection and no migration or
+  recovery guarantee is claimed.
+- The required SeaweedFS job executes the same 9P2000.L file lifecycle through
+  TCP and WebSocket, then verifies the payload directly through S3. HTTP/WSS
+  deployment policy, TLS, authentication, Origin checks, proxies, persistence,
+  and production gateway behavior remain future work.

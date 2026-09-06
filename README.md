@@ -99,14 +99,17 @@ Effects own all their payloads. A host may schedule filesystem and policy work i
 
 `SendFrame` effects are complete response frames. They are emitted in the only transport order the host must preserve for that session; unrelated tags may finish in completion order rather than request-arrival order.
 
-The standalone [TCP SeaweedFS integration application](test/README.md) demonstrates
-this boundary with a raw 9P client: TCP bytes enter `Session`, policy/filesystem
-effects are forwarded to application code, file bytes are handled through the
-SeaweedFS S3 API, and completions produce TCP response frames. It is a minimal
-development fixture with an in-memory namespace, not the production semantic
-engine. The same Docker Compose stack runs the PostgreSQL adapter's live
-migration and state-store conformance suite independently. Before the TCP test,
-the stack also runs digest-pinned SeaweedFS target probes and a private
+The standalone [TCP and HTTP/WebSocket SeaweedFS integration
+applications](test/README.md) demonstrate this boundary with a raw 9P client.
+TCP bytes enter `Session::receive_bytes`; each binary WebSocket message enters
+`Session::receive_frame` as one complete 9P frame. In both profiles,
+policy/filesystem effects are forwarded to application code, file bytes are
+handled through the SeaweedFS S3 API, and completions produce response frames.
+They are minimal development fixtures with an in-memory namespace, not the
+production semantic engine or durable transport gateway. The same Docker
+Compose stack runs the PostgreSQL adapter's live migration and state-store
+conformance suite independently. Before the transport tests, the stack also
+runs digest-pinned SeaweedFS target probes and a private
 compatibility wrapper through the full Raw/BlockSplit repository lifecycle and
 standalone publication-boundary matrix; that evidence does not qualify
 SeaweedFS for production use.
