@@ -1,15 +1,15 @@
 use crate::{
     AcquireLeaseOutcome, AcquireWriterLease, ClientIncarnationId, CommitOutcome, CommitRequest,
-    DataGeneration, DirectoryCookie, DirectoryEntryRecord, DirectoryGeneration, EntryName,
-    FilesystemId, FilesystemRecord, GroupId, InodeData, InodeGeneration, InodeId, InodeRecord,
-    InodeTimes, LeaseDeadline, LeaseDuration, LeaseId, LeaseOperationId, LockGeneration, LockId,
-    LockKind, LockOwner, LockRange, LockRecord, ManualLeaseClock, MutationContext, MutationResult,
-    MutationResultKind, MutationRetention, OpenAccess, OpenId, OpenPinRecord, OpenRecord,
-    OrphanRecord, Precondition, PrincipalId, PublishContent, QidPath, ReadBatch, ReadConsistency,
-    ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, ResultFormatVersion,
-    StateChange, StateLimits, StateRecord, StateRevision, UnixTimestamp, WriterFence,
-    WriterIncarnationId, WriterScopeId, WriterTopology, XattrName, XattrStagingId,
-    XattrStagingRecord, XattrValue,
+    ContentMetadataRecord, DataGeneration, DirectoryCookie, DirectoryEntryRecord,
+    DirectoryGeneration, EntryName, FilesystemId, FilesystemRecord, GroupId, InodeData,
+    InodeGeneration, InodeId, InodeRecord, InodeTimes, LeaseDeadline, LeaseDuration, LeaseId,
+    LeaseOperationId, LockGeneration, LockId, LockKind, LockOwner, LockRange, LockRecord,
+    ManualLeaseClock, MutationContext, MutationResult, MutationResultKind, MutationRetention,
+    OpenAccess, OpenId, OpenPinRecord, OpenRecord, OrphanRecord, Precondition, PrincipalId,
+    PublishContent, QidPath, ReadBatch, ReadConsistency, ReadOutcome, ReadQuery, ReadResult,
+    RecordKey, RecordRevision, ResultFormatVersion, RewrapContentMetadata, StateChange,
+    StateLimits, StateRecord, StateRevision, UnixTimestamp, WriterFence, WriterIncarnationId,
+    WriterScopeId, WriterTopology, XattrName, XattrStagingId, XattrStagingRecord, XattrValue,
 };
 
 use super::MemoryAuthority;
@@ -131,6 +131,14 @@ impl Harness {
                 StateChange::Insert {
                     key: RecordKey::Inode(filesystem_id, file_id),
                     record: StateRecord::Inode(file),
+                },
+                StateChange::Insert {
+                    key: RecordKey::ContentMetadata(filesystem_id, content_file_id),
+                    record: StateRecord::ContentMetadata(plain_content_metadata(
+                        file_id,
+                        content_file_id,
+                        limits,
+                    )),
                 },
                 StateChange::Insert {
                     key: RecordKey::DirectoryEntry(filesystem_id, root_id, name.clone()),
@@ -273,7 +281,7 @@ fn file_record(
     let data_generation = content
         .as_ref()
         .map_or(0, w9pt_fs_storage::ContentRef::generation);
-    InodeRecord::new(
+    InodeRecord::new_regular(
         inode_id,
         qid_path,
         RecordRevision::new(1).unwrap(),
@@ -284,11 +292,37 @@ fn file_record(
         logical_size,
         links,
         InodeGeneration::new(inode_generation).unwrap(),
+        content_context_id(content_file_id),
         InodeData::RegularFile {
             content_file_id,
             content,
             data_generation,
         },
+    )
+    .unwrap()
+}
+
+fn content_context_id(file_id: w9pt_fs_storage::FileId) -> w9pt_fs_storage::ContentContextId {
+    w9pt_fs_storage::ContentContextId::new(*file_id.as_bytes())
+}
+
+fn plain_content_metadata(
+    inode_id: InodeId,
+    file_id: w9pt_fs_storage::FileId,
+    limits: StateLimits,
+) -> ContentMetadataRecord {
+    let policy =
+        w9pt_fs_storage::FileStoragePolicy::plain(w9pt_fs_storage::StorageMethod::BlockSplit);
+    ContentMetadataRecord::new(
+        inode_id,
+        file_id,
+        content_context_id(file_id),
+        w9pt_fs_storage::FileStoragePolicy::FORMAT,
+        policy.to_bytes().to_vec(),
+        None,
+        None,
+        RecordRevision::new(1).unwrap(),
+        limits,
     )
     .unwrap()
 }
@@ -311,6 +345,14 @@ fn create_rename_link_and_unlink_are_atomic_record_sets() {
                     1,
                     None,
                     identity_times(0),
+                    harness.limits,
+                )),
+            },
+            StateChange::Insert {
+                key: RecordKey::ContentMetadata(harness.filesystem_id, content_file),
+                record: StateRecord::ContentMetadata(plain_content_metadata(
+                    inode,
+                    content_file,
                     harness.limits,
                 )),
             },
@@ -510,6 +552,17 @@ fn qid_lookup_is_filesystem_scoped_and_allocated_paths_cannot_be_reused() {
                     harness.limits,
                 )),
             },
+            StateChange::Insert {
+                key: RecordKey::ContentMetadata(
+                    harness.filesystem_id,
+                    w9pt_fs_storage::FileId::from_u128(30),
+                ),
+                record: StateRecord::ContentMetadata(plain_content_metadata(
+                    reused_inode,
+                    w9pt_fs_storage::FileId::from_u128(30),
+                    harness.limits,
+                )),
+            },
             StateChange::AdvanceQidPath {
                 count: core::num::NonZeroU64::new(1).unwrap(),
             },
@@ -603,8 +656,28 @@ fn prepared_content_and_open_unlinked_lifetime_publish_atomically() {
     )
     .unwrap();
     let mutation_id = w9pt_fs_storage::MutationId::from_u128(harness.next_mutation);
-    let prepared = w9pt_fs_storage::testing::block_on(repository.prepare_create(
-        harness.content_file_id,
+    let Some(StateRecord::ContentMetadata(metadata)) =
+        harness.read(ReadQuery::ContentMetadata(harness.content_file_id))
+    else {
+        panic!("managed file context must exist");
+    };
+    let context = w9pt_fs_storage::open_committed_context(
+        w9pt_fs_storage::FileContextScope::new(
+            *harness.filesystem_id.as_bytes(),
+            *harness.file_id.as_bytes(),
+            harness.content_file_id,
+            metadata.context_id(),
+        ),
+        metadata.policy_format(),
+        metadata.policy_bytes(),
+        metadata.key_commitment().copied(),
+        metadata.wrapped_key_bytes(),
+        metadata.revision().get(),
+        None,
+    )
+    .unwrap();
+    let prepared = w9pt_fs_storage::testing::block_on(repository.prepare_create_with_context(
+        &context,
         mutation_id,
         0,
         b"content",
@@ -845,7 +918,7 @@ fn locks_xattrs_and_simultaneous_attributes_remain_atomic() {
     ));
 
     let changed_times = identity_times(9);
-    let changed = InodeRecord::new(
+    let changed = InodeRecord::new_regular(
         harness.file_id,
         QidPath::new(2).unwrap(),
         RecordRevision::new(1).unwrap(),
@@ -856,6 +929,7 @@ fn locks_xattrs_and_simultaneous_attributes_remain_atomic() {
         0,
         1,
         InodeGeneration::new(2).unwrap(),
+        content_context_id(harness.content_file_id),
         InodeData::RegularFile {
             content_file_id: harness.content_file_id,
             content: None,
@@ -1105,4 +1179,141 @@ fn incomplete_xattr_staging_cannot_be_published() {
             })
             .is_none()
     );
+}
+
+#[test]
+fn content_metadata_creation_composite_read_rewrap_and_retirement_are_atomic() {
+    let mut harness = Harness::new();
+    let inode_id = InodeId::from_u128(30);
+    let file_id = w9pt_fs_storage::FileId::from_u128(31);
+    let context_id = w9pt_fs_storage::ContentContextId::from_u128(32);
+    let inode = InodeRecord::new_regular(
+        inode_id,
+        QidPath::new(3).unwrap(),
+        RecordRevision::new(1).unwrap(),
+        0o600,
+        PrincipalId::new(b"owner".to_vec(), harness.limits).unwrap(),
+        GroupId::new(b"group".to_vec(), harness.limits).unwrap(),
+        identity_times(1),
+        0,
+        1,
+        InodeGeneration::new(1).unwrap(),
+        context_id,
+        InodeData::RegularFile {
+            content_file_id: file_id,
+            content: None,
+            data_generation: 0,
+        },
+    )
+    .unwrap();
+    let metadata = ContentMetadataRecord::new(
+        inode_id,
+        file_id,
+        context_id,
+        1,
+        vec![1, 2, 3, 4],
+        Some([5; 32]),
+        Some(vec![6; 76]),
+        RecordRevision::new(1).unwrap(),
+        harness.limits,
+    )
+    .unwrap();
+    let name = EntryName::new(b"context-file".to_vec(), harness.limits).unwrap();
+    assert!(matches!(
+        harness.commit(vec![
+            StateChange::Insert {
+                key: RecordKey::Inode(harness.filesystem_id, inode_id),
+                record: StateRecord::Inode(inode),
+            },
+            StateChange::Insert {
+                key: RecordKey::ContentMetadata(harness.filesystem_id, file_id),
+                record: StateRecord::ContentMetadata(metadata),
+            },
+            StateChange::Insert {
+                key: RecordKey::DirectoryEntry(
+                    harness.filesystem_id,
+                    harness.root_id,
+                    name.clone()
+                ),
+                record: StateRecord::DirectoryEntry(
+                    DirectoryEntryRecord::new(
+                        harness.root_id,
+                        name.clone(),
+                        DirectoryCookie::new(3),
+                        inode_id,
+                        RecordRevision::new(1).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+            },
+            StateChange::AdvanceQidPath {
+                count: core::num::NonZeroU64::new(1).unwrap(),
+            },
+            StateChange::AdvanceDirectoryCookie {
+                count: core::num::NonZeroU64::new(1).unwrap(),
+            },
+            StateChange::BumpDirectoryGeneration(harness.root_id),
+        ]),
+        CommitOutcome::Committed(_)
+    ));
+
+    let batch = ReadBatch::new(
+        harness.filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![ReadQuery::InodeWithContentMetadata(inode_id)],
+        harness.limits,
+    )
+    .unwrap();
+    let ReadOutcome::Snapshot(snapshot) =
+        w9pt_fs_storage::testing::block_on(harness.client.read_request(batch)).unwrap()
+    else {
+        panic!("expected snapshot");
+    };
+    let ReadResult::InodeWithContentMetadata {
+        inode: Some(inode),
+        metadata: Some(metadata),
+        ..
+    } = &snapshot.results()[0]
+    else {
+        panic!("expected composite content context");
+    };
+    assert_eq!(inode.content_context_id(), Some(context_id));
+    let first_revision = metadata.revision();
+
+    assert!(matches!(
+        harness.commit(vec![StateChange::RewrapContentMetadata(
+            RewrapContentMetadata {
+                content_file_id: file_id,
+                expected_context_id: context_id,
+                expected_revision: first_revision,
+                wrapped_key_bytes: vec![7; 76],
+            },
+        )]),
+        CommitOutcome::Committed(_)
+    ));
+    let Some(StateRecord::ContentMetadata(rewrapped)) =
+        harness.read(ReadQuery::ContentMetadata(file_id))
+    else {
+        panic!("expected retained context");
+    };
+    assert_eq!(rewrapped.wrapped_key_bytes(), Some(&vec![7; 76][..]));
+    assert_ne!(rewrapped.revision(), first_revision);
+
+    assert!(matches!(
+        harness.commit(vec![
+            StateChange::Delete(RecordKey::DirectoryEntry(
+                harness.filesystem_id,
+                harness.root_id,
+                name,
+            )),
+            StateChange::Delete(RecordKey::Inode(harness.filesystem_id, inode_id)),
+            StateChange::BumpDirectoryGeneration(harness.root_id),
+        ]),
+        CommitOutcome::Committed(_)
+    ));
+    assert!(harness.read(ReadQuery::Inode(inode_id)).is_none());
+    assert!(matches!(
+        harness.read(ReadQuery::ContentMetadata(file_id)),
+        Some(StateRecord::ContentMetadata(_))
+    ));
 }

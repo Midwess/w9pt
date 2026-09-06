@@ -5,7 +5,7 @@ use crate::{CorruptionError, Digest, FormatError, LimitError, LimitKind};
 use super::{PersistentFormatError, Reader, Writer};
 
 const MAGIC: [u8; 8] = *b"W9PTOBJ\0";
-const FORMAT_MAJOR: u16 = 1;
+const FORMAT_MAJOR: u16 = 3;
 const FORMAT_MINOR: u16 = 0;
 pub(crate) const HEADER_LEN: usize = 8 + 1 + 2 + 2 + 8 + 32;
 
@@ -19,6 +19,20 @@ pub enum ObjectKind {
     Manifest = 2,
     /// Immutable canonical identity payload.
     Payload = 3,
+    /// Immutable leaf mapping page.
+    LeafMap = 4,
+    /// Immutable branch mapping page.
+    BranchMap = 5,
+}
+
+impl ObjectKind {
+    pub(crate) const fn if_map_level(level: u8) -> Self {
+        if level == 0 {
+            Self::LeafMap
+        } else {
+            Self::BranchMap
+        }
+    }
 }
 
 /// Validated borrowed envelope payload.
@@ -40,7 +54,7 @@ impl<'a> Envelope<'a> {
     }
 }
 
-/// Encodes a version-1 checked object, enforcing the complete object bound.
+/// Encodes a current-version checked object, enforcing the complete object bound.
 pub fn encode_envelope(
     kind: ObjectKind,
     payload: &[u8],
@@ -81,7 +95,7 @@ pub(crate) fn checked_envelope_len(
     }
 }
 
-/// Decodes and verifies one version-1 checked object without allocating payload bytes.
+/// Decodes and verifies one current-version checked object without allocating payload bytes.
 pub fn decode_envelope(
     expected_kind: ObjectKind,
     bytes: &[u8],

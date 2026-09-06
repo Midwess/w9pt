@@ -12,8 +12,8 @@ use crate::{
     database::{PostgresTransaction, query, query_scalar, validate_rows_affected},
     numeric::encode_u64,
     row_codec::{
-        DirectoryEntryRow, FilesystemRow, InodeRow, LockRow, MutationRow, OpenPinRow, OpenRow,
-        OrphanRow, SqlStateRecord, XattrRow, XattrStagingRow,
+        ContentMetadataRow, DirectoryEntryRow, FilesystemRow, InodeRow, LockRow, MutationRow,
+        OpenPinRow, OpenRow, OrphanRow, SqlStateRecord, XattrRow, XattrStagingRow,
     },
     sqlstate::SqlOperationPhase,
 };
@@ -49,6 +49,16 @@ pub(crate) async fn lock_existing_record(
             )
             .bind(filesystem_id.as_bytes().to_vec())
             .bind(inode_id.as_bytes().to_vec())
+            .fetch_optional(transaction)
+            .await
+        }
+        RecordKey::ContentMetadata(filesystem_id, file_id) => {
+            query_scalar::<i32>(
+                r#"SELECT 1 FROM "public"."w9pt_fs_state_content_metadata"
+                   WHERE "filesystem_id" = $1 AND "content_file_id" = $2 FOR UPDATE"#,
+            )
+            .bind(filesystem_id.as_bytes().to_vec())
+            .bind(file_id.as_bytes().to_vec())
             .fetch_optional(transaction)
             .await
         }
@@ -252,6 +262,7 @@ fn prepare_public_record(
             row.record_revision.clone_from(&allocated);
         }
         SqlStateRecord::Inode(row) => row.record_revision.clone_from(&allocated),
+        SqlStateRecord::ContentMetadata(row) => row.record_revision.clone_from(&allocated),
         SqlStateRecord::DirectoryEntry(row) => row.record_revision.clone_from(&allocated),
         SqlStateRecord::Open(row) => row.record_revision.clone_from(&allocated),
         SqlStateRecord::OpenPin(row) => row.record_revision.clone_from(&allocated),
@@ -273,6 +284,7 @@ async fn insert_encoded(
     match row {
         SqlStateRecord::Filesystem(row) => insert_filesystem(transaction, row).await,
         SqlStateRecord::Inode(row) => insert_inode(transaction, *row).await,
+        SqlStateRecord::ContentMetadata(row) => insert_content_metadata(transaction, row).await,
         SqlStateRecord::DirectoryEntry(row) => insert_directory_entry(transaction, row).await,
         SqlStateRecord::Open(row) => insert_open(transaction, row).await,
         SqlStateRecord::OpenPin(row) => insert_open_pin(transaction, row).await,
@@ -293,6 +305,7 @@ async fn replace_encoded(
     match row {
         SqlStateRecord::Filesystem(row) => replace_filesystem(transaction, row).await,
         SqlStateRecord::Inode(row) => replace_inode(transaction, *row).await,
+        SqlStateRecord::ContentMetadata(row) => replace_content_metadata(transaction, row).await,
         SqlStateRecord::DirectoryEntry(row) => replace_directory_entry(transaction, row).await,
         SqlStateRecord::Open(row) => replace_open(transaction, row).await,
         SqlStateRecord::OpenPin(row) => replace_open_pin(transaction, row).await,
@@ -363,14 +376,14 @@ async fn insert_inode(
             "accessed_seconds", "accessed_nanoseconds", "modified_seconds",
             "modified_nanoseconds", "changed_seconds", "changed_nanoseconds",
             "created_seconds", "created_nanoseconds", "logical_size", "link_count",
-            "inode_generation", "kind", "content_file_id", "data_generation",
+            "inode_generation", "kind", "content_file_id", "content_context_id", "data_generation",
             "content_generation", "content_logical_size", "content_manifest_key",
             "content_manifest_digest", "content_storage_method", "directory_generation",
             "symlink_target", "device_major", "device_minor", "directory_parent_inode_id")
            VALUES ($1, $2, $3::numeric, $4::numeric, $5, $6, $7, $8, $9, $10,
                    $11, $12, $13, $14, $15, $16::numeric, $17::numeric,
-                   $18::numeric, $19, $20, $21::numeric, $22::numeric,
-                   $23::numeric, $24, $25, $26, $27::numeric, $28, $29, $30, $31)"#,
+                   $18::numeric, $19, $20, $21, $22::numeric, $23::numeric,
+                   $24::numeric, $25, $26, $27, $28::numeric, $29, $30, $31, $32)"#,
     )
     .bind(row.filesystem_id)
     .bind(row.inode_id)
@@ -392,6 +405,7 @@ async fn insert_inode(
     .bind(row.inode_generation)
     .bind(row.kind)
     .bind(row.content_file_id)
+    .bind(row.content_context_id)
     .bind(row.data_generation)
     .bind(row.content_generation)
     .bind(row.content_logical_size)
@@ -422,12 +436,12 @@ async fn replace_inode(
            "created_seconds" = $14, "created_nanoseconds" = $15,
            "logical_size" = $16::numeric, "link_count" = $17::numeric,
            "inode_generation" = $18::numeric, "kind" = $19, "content_file_id" = $20,
-           "data_generation" = $21::numeric, "content_generation" = $22::numeric,
-           "content_logical_size" = $23::numeric, "content_manifest_key" = $24,
-           "content_manifest_digest" = $25, "content_storage_method" = $26,
-           "directory_generation" = $27::numeric, "symlink_target" = $28,
-           "device_major" = $29, "device_minor" = $30,
-           "directory_parent_inode_id" = $31
+           "content_context_id" = $21, "data_generation" = $22::numeric,
+           "content_generation" = $23::numeric, "content_logical_size" = $24::numeric,
+           "content_manifest_key" = $25, "content_manifest_digest" = $26,
+           "content_storage_method" = $27, "directory_generation" = $28::numeric,
+           "symlink_target" = $29, "device_major" = $30, "device_minor" = $31,
+           "directory_parent_inode_id" = $32
            WHERE "filesystem_id" = $1 AND "inode_id" = $2"#,
     )
     .bind(row.filesystem_id)
@@ -450,6 +464,7 @@ async fn replace_inode(
     .bind(row.inode_generation)
     .bind(row.kind)
     .bind(row.content_file_id)
+    .bind(row.content_context_id)
     .bind(row.data_generation)
     .bind(row.content_generation)
     .bind(row.content_logical_size)
@@ -509,6 +524,25 @@ macro_rules! cast_name {
         Some($cast)
     };
 }
+
+simple_insert_replace!(
+    insert_content_metadata,
+    replace_content_metadata,
+    ContentMetadataRow,
+    "content_metadata",
+    [
+        "filesystem_id" => filesystem_id,
+        "content_file_id" => content_file_id,
+        "owner_inode_id" => owner_inode_id,
+        "context_id" => context_id,
+        "policy_format" => policy_format,
+        "policy_bytes" => policy_bytes,
+        "key_commitment" => key_commitment,
+        "wrapped_key_bytes" => wrapped_key_bytes,
+        "record_revision" => record_revision as "numeric",
+    ],
+    keys = 2
+);
 
 simple_insert_replace!(
     insert_directory_entry,
@@ -677,6 +711,16 @@ async fn delete_by_key(
             )
             .bind(filesystem_id.as_bytes().to_vec())
             .bind(inode_id.as_bytes().to_vec())
+            .execute(transaction)
+            .await
+        }
+        RecordKey::ContentMetadata(filesystem_id, file_id) => {
+            query(
+                r#"DELETE FROM "public"."w9pt_fs_state_content_metadata"
+                   WHERE "filesystem_id" = $1 AND "content_file_id" = $2"#,
+            )
+            .bind(filesystem_id.as_bytes().to_vec())
+            .bind(file_id.as_bytes().to_vec())
             .execute(transaction)
             .await
         }

@@ -17,8 +17,8 @@ use crate::{
     key_codec::SqlRecordKey,
     numeric::{decode_u64, encode_u64},
     row_codec::{
-        DirectoryEntryRow, FilesystemRow, InodeRow, LockRow, MutationRow, OpenPinRow, OpenRow,
-        OrphanRow, SqlStateRecord, WriterLeaseRow, XattrRow, XattrStagingRow,
+        ContentMetadataRow, DirectoryEntryRow, FilesystemRow, InodeRow, LockRow, MutationRow,
+        OpenPinRow, OpenRow, OrphanRow, SqlStateRecord, WriterLeaseRow, XattrRow, XattrStagingRow,
     },
     sqlstate::SqlOperationPhase,
     transaction::{TransactionAccess, begin_transaction, commit_read_transaction},
@@ -34,6 +34,7 @@ const XATTR_FAMILY_TAG: i16 = 8;
 const XATTR_STAGING_FAMILY_TAG: i16 = 9;
 const MUTATION_FAMILY_TAG: i16 = 10;
 const WRITER_LEASE_FAMILY_TAG: i16 = 11;
+const CONTENT_METADATA_FAMILY_TAG: i16 = 12;
 
 const FILESYSTEM_POINT_SQL: &str = r#"
 SELECT "filesystem_id", "state_revision"::text AS "state_revision",
@@ -52,7 +53,7 @@ SELECT "filesystem_id", "inode_id", "qid_path"::text AS "qid_path",
        "modified_seconds", "modified_nanoseconds", "changed_seconds",
        "changed_nanoseconds", "created_seconds", "created_nanoseconds",
        "logical_size"::text AS "logical_size", "link_count"::text AS "link_count",
-       "inode_generation"::text AS "inode_generation", "kind", "content_file_id",
+       "inode_generation"::text AS "inode_generation", "kind", "content_file_id", "content_context_id",
        "data_generation"::text AS "data_generation",
        "content_generation"::text AS "content_generation",
        "content_logical_size"::text AS "content_logical_size", "content_manifest_key",
@@ -71,7 +72,7 @@ SELECT "filesystem_id", "inode_id", "qid_path"::text AS "qid_path",
        "modified_seconds", "modified_nanoseconds", "changed_seconds",
        "changed_nanoseconds", "created_seconds", "created_nanoseconds",
        "logical_size"::text AS "logical_size", "link_count"::text AS "link_count",
-       "inode_generation"::text AS "inode_generation", "kind", "content_file_id",
+       "inode_generation"::text AS "inode_generation", "kind", "content_file_id", "content_context_id",
        "data_generation"::text AS "data_generation",
        "content_generation"::text AS "content_generation",
        "content_logical_size"::text AS "content_logical_size", "content_manifest_key",
@@ -110,6 +111,33 @@ SELECT "inode_id", retained_bytes
 FROM sized
 WHERE prior_bytes <= $4::numeric
 ORDER BY "inode_id"
+"#;
+
+const CONTENT_METADATA_POINT_SQL: &str = r#"
+SELECT "filesystem_id", "content_file_id", "owner_inode_id", "context_id",
+       "policy_format", "policy_bytes", "key_commitment", "wrapped_key_bytes",
+       "record_revision"::text AS "record_revision"
+FROM "public"."w9pt_fs_state_content_metadata"
+WHERE "filesystem_id" = $1 AND "content_file_id" = $2
+"#;
+
+const CONTENT_METADATA_SCAN_SQL: &str = r#"
+WITH candidates AS MATERIALIZED (
+    SELECT "content_file_id",
+           (160 + octet_length("policy_bytes") + COALESCE(octet_length("wrapped_key_bytes"), 0))::bigint AS retained_bytes
+    FROM "public"."w9pt_fs_state_content_metadata"
+    WHERE "filesystem_id" = $1 AND ($2::bytea IS NULL OR "content_file_id" > $2)
+    ORDER BY "content_file_id"
+    LIMIT $3
+), sized AS (
+    SELECT *, COALESCE(sum(retained_bytes) OVER (
+        ORDER BY "content_file_id" ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ), 0::numeric) AS prior_bytes
+    FROM candidates
+)
+SELECT "content_file_id", retained_bytes FROM sized
+WHERE prior_bytes <= $4::numeric
+ORDER BY "content_file_id"
 "#;
 
 const DIRECTORY_ENTRY_POINT_SQL: &str = r#"
@@ -621,6 +649,53 @@ async fn read_point(
             inode,
         });
     }
+    if let ReadQuery::InodeWithContentMetadata(inode_id) = request_query {
+        let inode_result = Box::pin(read_point(
+            transaction,
+            filesystem_id,
+            &ReadQuery::Inode(*inode_id),
+            limits,
+        ))
+        .await?;
+        let ReadResult::Point { record, .. } = inode_result else {
+            unreachable!()
+        };
+        let inode = match record.map(|record| *record) {
+            Some(StateRecord::Inode(inode)) => Some(Box::new(inode)),
+            None => None,
+            _ => return Err(corruption("composite inode row kind", "not inode")),
+        };
+        let metadata =
+            if let Some(file_id) = inode.as_ref().and_then(|inode| inode.content_file_id()) {
+                let result = Box::pin(read_point(
+                    transaction,
+                    filesystem_id,
+                    &ReadQuery::ContentMetadata(file_id),
+                    limits,
+                ))
+                .await?;
+                let ReadResult::Point { record, .. } = result else {
+                    unreachable!()
+                };
+                match record.map(|record| *record) {
+                    Some(StateRecord::ContentMetadata(metadata)) => Some(Box::new(metadata)),
+                    None => None,
+                    _ => {
+                        return Err(corruption(
+                            "composite metadata row kind",
+                            "not content metadata",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+        return Ok(ReadResult::InodeWithContentMetadata {
+            inode_id: *inode_id,
+            inode,
+            metadata,
+        });
+    }
     let key = request_query.point_key(filesystem_id).ok_or_else(|| {
         PostgresStateError::new(
             StateStoreOperation::Read,
@@ -645,6 +720,17 @@ async fn read_point(
             .map_err(execute_error)?
             .map(|row| inode_row(&row).map(|row| SqlStateRecord::Inode(Box::new(row))))
             .transpose()?,
+        ReadQuery::ContentMetadata(file_id) => query(CONTENT_METADATA_POINT_SQL)
+            .bind(filesystem)
+            .bind(file_id.as_bytes().as_slice())
+            .fetch_optional(transaction)
+            .await
+            .map_err(execute_error)?
+            .map(|row| content_metadata_row(&row).map(SqlStateRecord::ContentMetadata))
+            .transpose()?,
+        ReadQuery::InodeWithContentMetadata(_) => {
+            unreachable!("composite read returned before primary-key dispatch")
+        }
         ReadQuery::InodeByQidPath(_) => {
             unreachable!("QID lookup returned before primary-key dispatch")
         }
@@ -775,6 +861,7 @@ pub(crate) async fn fetch_record(
     match result {
         ReadResult::Point { record, .. } => Ok(record.map(|record| *record)),
         ReadResult::InodeByQidPath { .. }
+        | ReadResult::InodeWithContentMetadata { .. }
         | ReadResult::DirectoryPage(_)
         | ReadResult::OpenPinCount { .. }
         | ReadResult::Scan(_) => Err(PostgresStateError::new(
@@ -789,6 +876,7 @@ fn point_query(key: &RecordKey) -> ReadQuery {
     match key {
         RecordKey::Filesystem(_) => ReadQuery::Filesystem,
         RecordKey::Inode(_, inode_id) => ReadQuery::Inode(*inode_id),
+        RecordKey::ContentMetadata(_, file_id) => ReadQuery::ContentMetadata(*file_id),
         RecordKey::DirectoryEntry(_, parent_inode_id, name) => ReadQuery::DirectoryEntry {
             parent_inode_id: *parent_inode_id,
             name: name.clone(),
@@ -953,6 +1041,17 @@ async fn read_scan(
         RecordScan::Inodes { after, .. } => {
             let after = after.map(|value| value.as_bytes().to_vec());
             query(INODE_SCAN_SQL)
+                .bind(filesystem)
+                .bind(after)
+                .bind(limit)
+                .bind(byte_limit.clone())
+                .fetch_all(transaction)
+                .await
+                .map_err(execute_error)?
+        }
+        RecordScan::ContentMetadata { after, .. } => {
+            let after = after.map(|value| value.as_bytes().to_vec());
+            query(CONTENT_METADATA_SCAN_SQL)
                 .bind(filesystem)
                 .bind(after)
                 .bind(limit)
@@ -1157,6 +1256,12 @@ fn decode_scan_candidate(
 
     let (family_tag, component_a, component_b, directory_cookie) = match scan {
         RecordScan::Inodes { .. } => (INODE_FAMILY_TAG, get(row, "inode_id")?, Vec::new(), None),
+        RecordScan::ContentMetadata { .. } => (
+            CONTENT_METADATA_FAMILY_TAG,
+            get(row, "content_file_id")?,
+            Vec::new(),
+            None,
+        ),
         RecordScan::DirectoryEntries {
             parent_inode_id, ..
         } => {
@@ -1222,6 +1327,7 @@ fn decode_scan_candidate(
     .map_err(|error| corruption("invalid SQL scan candidate key", error))?;
     let cursor = match (&key, directory_cookie) {
         (RecordKey::Inode(_, inode_id), None) => ScanResume::Inode(*inode_id),
+        (RecordKey::ContentMetadata(_, file_id), None) => ScanResume::ContentMetadata(*file_id),
         (RecordKey::DirectoryEntry(_, _, _), Some(cookie)) => ScanResume::DirectoryEntry(cookie),
         (RecordKey::Open(_, open_id), None) => ScanResume::Open(*open_id),
         (RecordKey::OpenPin(_, inode_id, open_id), None) => ScanResume::OpenPin(OpenPinCursor {
@@ -1318,6 +1424,9 @@ fn scan_resume(key: &RecordKey, record: &StateRecord) -> Option<ScanResume> {
         (RecordKey::Inode(_, inode_id), StateRecord::Inode(_)) => {
             Some(ScanResume::Inode(*inode_id))
         }
+        (RecordKey::ContentMetadata(_, file_id), StateRecord::ContentMetadata(_)) => {
+            Some(ScanResume::ContentMetadata(*file_id))
+        }
         (RecordKey::DirectoryEntry(_, _, _), StateRecord::DirectoryEntry(entry)) => {
             Some(ScanResume::DirectoryEntry(entry.cookie()))
         }
@@ -1387,6 +1496,13 @@ fn retained_record_bytes(record: &StateRecord) -> Option<usize> {
             }
             (256, variable)
         }
+        StateRecord::ContentMetadata(record) => (
+            96,
+            record
+                .policy_bytes()
+                .len()
+                .checked_add(record.wrapped_key_bytes().map_or(0, <[u8]>::len))?,
+        ),
         StateRecord::DirectoryEntry(record) => (96, record.name().as_bytes().len()),
         StateRecord::Open(_)
         | StateRecord::OpenPin(_)
@@ -1456,6 +1572,7 @@ fn inode_row(row: &PostgresRow) -> Result<InodeRow, PostgresStateError> {
         inode_generation: get(row, "inode_generation")?,
         kind: get(row, "kind")?,
         content_file_id: get(row, "content_file_id")?,
+        content_context_id: get(row, "content_context_id")?,
         data_generation: get(row, "data_generation")?,
         content_generation: get(row, "content_generation")?,
         content_logical_size: get(row, "content_logical_size")?,
@@ -1467,6 +1584,20 @@ fn inode_row(row: &PostgresRow) -> Result<InodeRow, PostgresStateError> {
         symlink_target: get(row, "symlink_target")?,
         device_major: get(row, "device_major")?,
         device_minor: get(row, "device_minor")?,
+    })
+}
+
+fn content_metadata_row(row: &PostgresRow) -> Result<ContentMetadataRow, PostgresStateError> {
+    Ok(ContentMetadataRow {
+        filesystem_id: get(row, "filesystem_id")?,
+        content_file_id: get(row, "content_file_id")?,
+        owner_inode_id: get(row, "owner_inode_id")?,
+        context_id: get(row, "context_id")?,
+        policy_format: get(row, "policy_format")?,
+        policy_bytes: get(row, "policy_bytes")?,
+        key_commitment: get(row, "key_commitment")?,
+        wrapped_key_bytes: get(row, "wrapped_key_bytes")?,
+        record_revision: get(row, "record_revision")?,
     })
 }
 

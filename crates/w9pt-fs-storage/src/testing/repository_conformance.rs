@@ -3,10 +3,222 @@
 use core::fmt;
 
 use crate::{
-    BLOCK_SIZE_V1, ContentRepository, CreationDefaults, FileId, MutationId, Publication,
-    PublishedContent, StorageError, StorageLimits, StorageMethod, TargetStore,
+    BLOCK_SIZE, ContentRepository, CreationDefaults, FileCryptoContext, FileId, MutationId,
+    Publication, PublishedContent, StorageError, StorageLimits, StorageMethod, TargetStore,
     format::ManifestLayout,
 };
+
+/// Exercises committed file contexts across immutable creation, retry, update, and reopen.
+pub async fn check_repository_context_conformance<S: TargetStore + Clone>(
+    first: S,
+    second: S,
+    namespace: &str,
+    contexts: &[FileCryptoContext],
+) -> Result<(), RepositoryConformanceError<S::Error>> {
+    for (index, context) in contexts.iter().enumerate() {
+        check_one_context(first.clone(), second.clone(), namespace, index, context).await?;
+    }
+    Ok(())
+}
+
+async fn check_one_context<S: TargetStore + Clone>(
+    first: S,
+    second: S,
+    namespace: &str,
+    index: usize,
+    context: &FileCryptoContext,
+) -> Result<(), RepositoryConformanceError<S::Error>> {
+    let method = context.policy().method();
+    let prefix = format!("{namespace}/context-matrix/{index}");
+    let writer = open_repository(first, &prefix, opposite(method))?;
+    let retry = open_repository(second.clone(), &prefix, opposite(method))?;
+    let observer = open_repository(second, &prefix, opposite(method))?;
+    let mutation_base = u128::try_from(index)
+        .ok()
+        .and_then(|value| value.checked_mul(0x100))
+        .and_then(|value| 0x40_0000_u128.checked_add(value))
+        .ok_or(RepositoryConformanceError::Assertion(
+            "context matrix mutation identity overflowed",
+        ))?;
+
+    let empty_mutation = MutationId::from_u128(mutation_base + 1);
+    let empty = writer
+        .prepare_create_with_context(context, empty_mutation, 0, b"")
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    let empty_retry = retry
+        .prepare_create_with_context(context, empty_mutation, 0, b"")
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    if empty != empty_retry {
+        return Err(RepositoryConformanceError::Assertion(
+            "committed context did not reproduce empty immutable content",
+        ));
+    }
+    observer
+        .load_manifest_with_context(empty.content(), context)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+
+    let block = u64::from(BLOCK_SIZE);
+    let offset = match method {
+        StorageMethod::Raw => 7,
+        StorageMethod::BlockSplit => block
+            .checked_mul(16_384)
+            .and_then(|value| value.checked_add(7))
+            .ok_or(RepositoryConformanceError::Assertion(
+                "context matrix sparse offset overflowed",
+            ))?,
+    };
+    let data = vec![b'A'; 1_025];
+    let write_mutation = MutationId::from_u128(mutation_base + 2);
+    let written = writer
+        .prepare_write_with_context(empty.content(), context, write_mutation, 0, offset, &data)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    let written_retry = retry
+        .prepare_write_with_context(empty.content(), context, write_mutation, 0, offset, &data)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    if written != written_retry {
+        return Err(RepositoryConformanceError::Assertion(
+            "independent context preparation did not reproduce exact objects",
+        ));
+    }
+    assert_context_range(
+        &observer,
+        written.content(),
+        context,
+        offset,
+        data.len(),
+        &data,
+    )
+    .await?;
+    if offset > 0 {
+        assert_context_range(&observer, written.content(), context, offset - 1, 1, b"\0").await?;
+    }
+    let manifest = observer
+        .load_manifest_with_context(written.content(), context)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    if manifest.method() != method {
+        return Err(RepositoryConformanceError::Assertion(
+            "repository defaults reinterpreted a committed context method",
+        ));
+    }
+    if matches!(method, StorageMethod::BlockSplit)
+        && !matches!(manifest.layout(), ManifestLayout::BlockSplit { root: Some(root), .. } if root.level() == 2)
+    {
+        return Err(RepositoryConformanceError::Assertion(
+            "protected sparse context did not cross the branch boundary",
+        ));
+    }
+
+    let no_op = writer
+        .prepare_write_with_context(
+            written.content(),
+            context,
+            MutationId::from_u128(mutation_base + 3),
+            0,
+            offset,
+            &data,
+        )
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    if no_op.content_changed() || no_op.content() != written.content() {
+        return Err(RepositoryConformanceError::Assertion(
+            "same-byte context write failed no-op reuse",
+        ));
+    }
+
+    let patch_offset = offset
+        .checked_add(3)
+        .ok_or(RepositoryConformanceError::Assertion(
+            "context matrix patch offset overflowed",
+        ))?;
+    let patched = writer
+        .prepare_write_with_context(
+            written.content(),
+            context,
+            MutationId::from_u128(mutation_base + 4),
+            0,
+            patch_offset,
+            b"XYZ",
+        )
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    let mut expected = data[..17].to_vec();
+    expected[3..6].copy_from_slice(b"XYZ");
+    let truncated = writer
+        .prepare_truncate_with_context(
+            patched.content(),
+            context,
+            MutationId::from_u128(mutation_base + 5),
+            0,
+            offset + 17,
+        )
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    assert_context_range(
+        &observer,
+        truncated.content(),
+        context,
+        offset,
+        expected.len(),
+        &expected,
+    )
+    .await?;
+    if !observer
+        .read_with_context(truncated.content(), context, offset + 17, 1)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?
+        .is_empty()
+    {
+        return Err(RepositoryConformanceError::Assertion(
+            "context truncate exposed bytes beyond EOF",
+        ));
+    }
+    let extended = writer
+        .prepare_truncate_with_context(
+            truncated.content(),
+            context,
+            MutationId::from_u128(mutation_base + 6),
+            0,
+            offset + 29,
+        )
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    assert_context_range(
+        &observer,
+        extended.content(),
+        context,
+        offset + 17,
+        12,
+        &[0; 12],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn assert_context_range<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    content: &crate::ContentRef,
+    context: &FileCryptoContext,
+    offset: u64,
+    length: usize,
+    expected: &[u8],
+) -> Result<(), RepositoryConformanceError<S::Error>> {
+    let actual = repository
+        .read_with_context(content, context, offset, length)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    if actual != expected {
+        return Err(RepositoryConformanceError::Assertion(
+            "committed context range differs from byte-vector model",
+        ));
+    }
+    Ok(())
+}
 
 /// Failure returned by reusable repository conformance.
 #[derive(Debug)]
@@ -31,7 +243,7 @@ impl<E: fmt::Display> fmt::Display for RepositoryConformanceError<E> {
 
 impl<E: std::error::Error + 'static> std::error::Error for RepositoryConformanceError<E> {}
 
-/// Exercises both version-1 layouts through two independently held target clients.
+/// Exercises both current layouts through two independently held target clients.
 pub async fn check_repository_conformance<S: TargetStore + Clone>(
     first: S,
     second: S,
@@ -43,6 +255,13 @@ pub async fn check_repository_conformance<S: TargetStore + Clone>(
         namespace,
         StorageMethod::Raw,
         FileId::from_u128(1),
+    )
+    .await?;
+    check_paged_block_boundaries(
+        first.clone(),
+        second.clone(),
+        namespace,
+        FileId::from_u128(0x20_8001),
     )
     .await?;
     check_repository_method_conformance(
@@ -71,6 +290,87 @@ pub async fn check_repository_conformance<S: TargetStore + Clone>(
         0x21_0000,
     )
     .await
+}
+
+async fn check_paged_block_boundaries<S: TargetStore + Clone>(
+    first: S,
+    second: S,
+    namespace: &str,
+    file_id: FileId,
+) -> Result<(), RepositoryConformanceError<S::Error>> {
+    let prefix = format!("{namespace}/block-split/paged-boundaries");
+    let writer = open_repository(first, &prefix, StorageMethod::BlockSplit)?;
+    let observer = open_repository(second, &prefix, StorageMethod::Raw)?;
+    let block = u64::from(BLOCK_SIZE);
+    let boundaries = [(127_u64, b'a'), (128, b'b'), (16_383, b'c'), (16_384, b'd')];
+    let first_mutation = MutationId::from_u128(0x20_8010);
+    let first = writer
+        .prepare_write_from_new(
+            file_id,
+            first_mutation,
+            0,
+            block * boundaries[0].0,
+            &[boundaries[0].1],
+        )
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    let Publication::Published(mut published) = writer
+        .publisher()
+        .create(file_id, first_mutation, &first)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?
+    else {
+        return Err(RepositoryConformanceError::Assertion(
+            "fresh paged boundary head conflicted",
+        ));
+    };
+    for (ordinal, (index, value)) in boundaries.iter().copied().enumerate().skip(1) {
+        let mutation = MutationId::from_u128(0x20_8010 + ordinal as u128);
+        let prepared = writer
+            .prepare_write(published.content(), mutation, 0, block * index, &[value])
+            .await
+            .map_err(RepositoryConformanceError::Storage)?;
+        published = publish_replace(&writer, &published, mutation, &prepared).await?;
+    }
+    for (index, value) in boundaries {
+        assert_range(&observer, published.content(), block * index, 1, &[value]).await?;
+    }
+    assert_range(&observer, published.content(), block * 129, 1, b"\0").await?;
+    let manifest = observer
+        .load_manifest(published.content())
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    let ManifestLayout::BlockSplit {
+        root: Some(root), ..
+    } = manifest.layout()
+    else {
+        return Err(RepositoryConformanceError::Assertion(
+            "paged boundary root is absent",
+        ));
+    };
+    if root.level() != 2 || root.materialized_block_count() != 4 {
+        return Err(RepositoryConformanceError::Assertion(
+            "paged boundary root summary differs",
+        ));
+    }
+
+    let shrink_size = block * 129;
+    let shrink_mutation = MutationId::from_u128(0x20_8020);
+    let shrunk = writer
+        .prepare_truncate(published.content(), shrink_mutation, 0, shrink_size)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    published = publish_replace(&writer, &published, shrink_mutation, &shrunk).await?;
+    let extend_mutation = MutationId::from_u128(0x20_8021);
+    let extended = writer
+        .prepare_truncate(published.content(), extend_mutation, 0, block * 16_385)
+        .await
+        .map_err(RepositoryConformanceError::Storage)?;
+    published = publish_replace(&writer, &published, extend_mutation, &extended).await?;
+    assert_range(&observer, published.content(), block * 127, 1, b"a").await?;
+    assert_range(&observer, published.content(), block * 128, 1, b"b").await?;
+    assert_range(&observer, published.content(), block * 16_384, 1, b"\0").await?;
+    Ok(())
 }
 
 /// Exercises one selected persisted storage method through two target clients.
@@ -210,7 +510,7 @@ async fn check_block_split_lifecycle<S: TargetStore + Clone>(
     let writer = open_repository(first, &prefix, StorageMethod::BlockSplit)?;
     let observer = open_repository(second.clone(), &prefix, StorageMethod::Raw)?;
     let retry = open_repository(second, &prefix, StorageMethod::BlockSplit)?;
-    let block = usize::try_from(BLOCK_SIZE_V1).map_err(|_| {
+    let block = usize::try_from(BLOCK_SIZE).map_err(|_| {
         RepositoryConformanceError::Assertion("block size is not platform-representable")
     })?;
     let two_blocks = block
@@ -358,16 +658,11 @@ async fn check_block_split_lifecycle<S: TargetStore + Clone>(
         .load_manifest(published.content())
         .await
         .map_err(RepositoryConformanceError::Storage)?;
-    let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
+    let ManifestLayout::BlockSplit { .. } = manifest.layout() else {
         return Err(RepositoryConformanceError::Assertion(
             "persisted BlockSplit method changed under Raw creation default",
         ));
     };
-    if blocks.iter().any(|entry| matches!(entry.index(), 1 | 2)) {
-        return Err(RepositoryConformanceError::Assertion(
-            "zero or sparse BlockSplit hole retained a payload reference",
-        ));
-    }
 
     let shrink_size = block
         .checked_mul(3)
@@ -438,7 +733,7 @@ async fn check_publication_boundaries<S: TargetStore + Clone>(
     let mut model = match method {
         StorageMethod::Raw => b"old-published-version".to_vec(),
         StorageMethod::BlockSplit => {
-            let block = usize::try_from(BLOCK_SIZE_V1).map_err(|_| {
+            let block = usize::try_from(BLOCK_SIZE).map_err(|_| {
                 RepositoryConformanceError::Assertion("publication block size is not representable")
             })?;
             let length = block

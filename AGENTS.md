@@ -106,12 +106,15 @@ For block-split content:
 
 - logical blocks are scoped by file ID and block index;
 - logical EOF comes from metadata, never physical padding;
-- a materialized version-1 block decodes to exactly 32 KiB;
+- a materialized current-format block decodes to exactly 32 KiB;
+- a compact BlockSplit manifest references at most one immutable map root;
+- mapping pages use the persisted 128-slot radix profile with at most seven levels;
+- positioned operations traverse only bounded affected paths and never flatten the map;
 - the final block is zero-padded before hashing or storage;
 - missing or all-zero blocks are sparse holes;
 - full-block overwrites do not read old content;
 - partial-block writes perform verified read-modify-write;
-- shrink zeroes the discarded tail of the final retained block;
+- shrink zeroes the discarded tail of the final retained block and detaches whole suffix subtrees without reading their descendants;
 - stored-data hash mismatch is corruption, never an instruction to update metadata.
 
 `w9pt-fs-storage` prepares immutable payloads and returns a portable, self-validating `PreparedContent`/`ContentRef`. In clustered filesystem operation, it must not independently publish a mutable per-file S3 head as a second authority. The filesystem metadata transaction is the sole publisher of current content.

@@ -1,8 +1,8 @@
 #![allow(missing_docs)]
 
 use w9pt_fs_storage::{
-    BLOCK_SIZE_V1, ContentRef, ContentRepository, CreationDefaults, FileId, MutationId,
-    StorageError, StorageLimits, StorageMethod, TargetOperation,
+    BLOCK_SIZE, ContentRef, ContentRepository, CreationDefaults, FileId, MutationId, StorageError,
+    StorageLimits, StorageMethod, TargetOperation,
     format::ManifestLayout,
     testing::{MemoryTarget, block_on},
 };
@@ -28,7 +28,7 @@ fn deterministic_block_trace_matches_byte_vector_at_boundaries() {
             .into_content();
     let mut model = Vec::<u8>::new();
     let mut random = 0x6a09_e667_f3bc_c909_u64;
-    let block = BLOCK_SIZE_V1 as usize;
+    let block = BLOCK_SIZE as usize;
 
     for step in 1..=160_u128 {
         random = random
@@ -166,25 +166,34 @@ fn no_op_corruption_sparse_and_overflow_boundaries_are_explicit() {
         created.content(),
         MutationId::from_u128(4),
         0,
-        u64::from(BLOCK_SIZE_V1) * 3 + 7,
+        u64::from(BLOCK_SIZE) * 3 + 7,
         b"z",
     ))
     .unwrap();
     let manifest = block_on(repository.load_manifest(sparse.content())).unwrap();
-    let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
+    let ManifestLayout::BlockSplit { root, .. } = manifest.layout() else {
         panic!("expected block-split manifest");
     };
     assert_eq!(
-        blocks.iter().map(|entry| entry.index()).collect::<Vec<_>>(),
-        vec![0, 3]
+        root.as_ref().map(|root| root.materialized_block_count()),
+        Some(2)
+    );
+    assert_eq!(
+        root.as_ref().map(|root| root.highest_materialized_block()),
+        Some(3)
     );
 
-    let first_blob_key = blocks[0].blob().key().clone();
+    let first_blob_key = repository.keys().block_payload(
+        sparse.content().file_id(),
+        created.identity(),
+        created.attempt(),
+        0,
+    );
     let mut bytes = target.inspect(&first_blob_key).unwrap().unwrap();
     *bytes.last_mut().unwrap() ^= 1;
     assert!(target.corrupt(&first_blob_key, bytes).unwrap());
     assert!(matches!(
         block_on(repository.read(sparse.content(), 0, 1)),
-        Err(StorageError::Corruption(_))
+        Err(StorageError::Corruption(_) | StorageError::Representation(_))
     ));
 }

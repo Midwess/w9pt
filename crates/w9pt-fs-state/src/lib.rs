@@ -11,6 +11,7 @@
 mod bounded;
 mod change;
 mod commit;
+mod content_metadata;
 mod contract;
 mod error;
 mod ids;
@@ -31,14 +32,15 @@ pub use commit::{
     AmbiguousCommit, COMMIT_PROTOCOL_ORDER, CommitConflict, CommitConflictKind, CommitOutcome,
     CommitProtocolPhase, CommitRequest, CommittedMutation, CounterAdjustment, InodeAttributeUpdate,
     MalformedCommit, MutationContext, MutationMismatch, MutationReplay, Precondition,
-    PublishContent, PublishContentError, PublishXattrStaging, StateChange,
-    validate_publish_content,
+    PublishContent, PublishContentError, PublishXattrStaging, RewrapContentMetadata, StateChange,
+    validate_publish_content, validate_publish_content_with_metadata,
 };
 
 pub use bounded::{
     BoundedValueError, EntryName, GroupId, MutationResult, MutationResultKind, PrincipalId,
     ResultFormatVersion, SymlinkTarget, XattrName, XattrValue,
 };
+pub use content_metadata::{ContentMetadataError, ContentMetadataRecord};
 pub use contract::{
     AuthorityClass, InvalidStateStoreContract, RequiredGuarantee, StateStoreContract,
     StateStoreGuarantees, WriterTopology,

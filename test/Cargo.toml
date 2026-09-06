@@ -13,6 +13,12 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["sin
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["connect", "handshake"] }
 w9pt = { path = "../crates/w9pt" }
+w9pt-fs = { path = "../crates/w9pt-fs" }
+w9pt-fs-state = { path = "../crates/w9pt-fs-state" }
+w9pt-fs-state-postgres = { path = "../crates/w9pt-fs-state-postgres" }
+w9pt-fs-storage = { path = "../crates/w9pt-fs-storage", features = ["compression-lz4", "encryption-aes-siv"] }
+w9pt-fs-storage-s3 = { path = "../crates/w9pt-fs-storage-s3" }
+sea-orm = { version = "=1.1.20", default-features = false, features = ["sqlx-postgres", "runtime-tokio"] }
 
 [[bin]]
 name = "w9pt-tcp-seaweedfs-test"

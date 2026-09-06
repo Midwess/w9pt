@@ -6,6 +6,12 @@ use aws_sdk_s3::{
     Client, Config,
     config::{BehaviorVersion, Credentials, Region},
 };
+#[cfg(feature = "representation-test")]
+use w9pt_fs_storage::{
+    CompressionPolicy, ContentCipher, ContentContextId, FileContextScope, FileCryptoContext,
+    FileId, FileStoragePolicy, MasterKey, MasterKeyId, SecureEntropy, generate_content_metadata,
+    open_committed_context,
+};
 use w9pt_fs_storage::{
     ContentRepository, CreationDefaults, StorageLimits, StorageMethod, TargetGuarantees,
     TargetStore,
@@ -344,6 +350,11 @@ async fn live_pinned_compatible_provider_repository_matrix_remains_unqualified()
         );
         return Ok(());
     }
+    if !cfg!(feature = "representation-test") {
+        return Err(
+            "required compatible-provider matrix lacks representation-test features".into(),
+        );
+    }
     let endpoint = env::var("W9PT_S3_COMPAT_TEST_ENDPOINT")?;
     let bucket = env::var("W9PT_S3_COMPAT_TEST_BUCKET")?;
     let provider = env::var("W9PT_S3_COMPAT_TEST_PROVIDER")?;
@@ -365,11 +376,22 @@ async fn live_pinned_compatible_provider_repository_matrix_remains_unqualified()
     let (wrapped_first, wrapped_second) =
         compatibility_bridge::probe_and_wrap(&first, &second, &namespace).await?;
     check_repository_conformance(
-        wrapped_first,
-        wrapped_second,
+        wrapped_first.clone(),
+        wrapped_second.clone(),
         &format!("{}/matrix", namespace.as_str()),
     )
     .await?;
+    #[cfg(feature = "representation-test")]
+    {
+        let contexts = public_test_contexts()?;
+        w9pt_fs_storage::testing::check_repository_context_conformance(
+            wrapped_first,
+            wrapped_second,
+            &format!("{}/representation", namespace.as_str()),
+            &contexts,
+        )
+        .await?;
+    }
 
     assert_production_guards(&first, &second)?;
     assert_eq!(
@@ -377,6 +399,65 @@ async fn live_pinned_compatible_provider_repository_matrix_remains_unqualified()
         Err(S3ConfigurationError::UnsupportedProviderProfile)
     );
     Ok(())
+}
+
+#[cfg(feature = "representation-test")]
+fn public_test_contexts() -> Result<Vec<FileCryptoContext>, Box<dyn Error>> {
+    struct PublicEntropy(u8);
+
+    impl SecureEntropy for PublicEntropy {
+        type Error = core::convert::Infallible;
+
+        fn fill_secure(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
+            destination.fill(self.0);
+            self.0 = self.0.wrapping_add(1);
+            Ok(())
+        }
+    }
+
+    let master = MasterKey::new(MasterKeyId::new([0xa1; 16]), [0xa2; 32]);
+    let mut contexts = Vec::new();
+    for (method_index, method) in [StorageMethod::Raw, StorageMethod::BlockSplit]
+        .into_iter()
+        .enumerate()
+    {
+        for (policy_index, (compression, cipher)) in [
+            (CompressionPolicy::Identity, ContentCipher::None),
+            (CompressionPolicy::Lz4BlockV1, ContentCipher::None),
+            (CompressionPolicy::Identity, ContentCipher::Aes256SivV1),
+            (CompressionPolicy::Lz4BlockV1, ContentCipher::Aes256SivV1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ordinal = u8::try_from(method_index * 4 + policy_index + 1)?;
+            let file_id = FileId::from_u128(0x50_0000 + u128::from(ordinal));
+            let scope = FileContextScope::new(
+                [0xb1; 16],
+                [ordinal; 16],
+                file_id,
+                ContentContextId::from_u128(0x60_0000 + u128::from(ordinal)),
+            );
+            let policy = FileStoragePolicy::new(method, compression, cipher);
+            let mut entropy = PublicEntropy(ordinal);
+            let candidate = generate_content_metadata(
+                scope,
+                policy,
+                cipher.is_encrypted().then_some(&master),
+                &mut entropy,
+            )?;
+            contexts.push(open_committed_context(
+                scope,
+                candidate.policy_format(),
+                candidate.policy_bytes(),
+                candidate.key_commitment().copied(),
+                candidate.wrapped_key_bytes(),
+                1,
+                cipher.is_encrypted().then_some(&master),
+            )?);
+        }
+    }
+    Ok(contexts)
 }
 
 #[test]

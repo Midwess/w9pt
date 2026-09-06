@@ -11,8 +11,18 @@ pub struct StorageLimitValues {
     pub max_manifest_bytes: usize,
     /// Maximum bytes accepted for any one stored object.
     pub max_object_bytes: usize,
-    /// Maximum entries in one flat block-split manifest.
-    pub max_blocks: u32,
+    /// Maximum encoded immutable mapping-page bytes.
+    pub max_map_page_bytes: usize,
+    /// Maximum materialized blocks represented by one paged map.
+    pub max_materialized_blocks: u64,
+    /// Maximum resident mapping working bytes charged to one operation.
+    pub max_map_working_bytes: usize,
+    /// Maximum compression/encryption scratch and overlapping representation bytes.
+    pub max_representation_working_bytes: usize,
+    /// Maximum logical mapping-page reads dispatched by one operation.
+    pub max_map_page_reads: u32,
+    /// Maximum logical mapping-page writes planned or dispatched by one operation.
+    pub max_map_page_writes: u32,
     /// Maximum bytes returned by one repository read.
     pub max_read_bytes: usize,
     /// Maximum bytes accepted by one repository write.
@@ -27,9 +37,14 @@ impl Default for StorageLimitValues {
     fn default() -> Self {
         Self {
             max_raw_file_bytes: 16 * 1024 * 1024,
-            max_manifest_bytes: 8 * 1024 * 1024,
+            max_manifest_bytes: 4 * 1024,
             max_object_bytes: 64 * 1024 * 1024,
-            max_blocks: 131_072,
+            max_map_page_bytes: 256 * 1024,
+            max_materialized_blocks: 1_u64 << 49,
+            max_map_working_bytes: 8 * 1024 * 1024,
+            max_representation_working_bytes: 64 * 1024 * 1024,
+            max_map_page_reads: 4_096,
+            max_map_page_writes: 2_048,
             max_read_bytes: 8 * 1024 * 1024,
             max_write_bytes: 8 * 1024 * 1024,
             max_publish_retries: 8,
@@ -48,7 +63,15 @@ impl StorageLimits {
         require_nonzero("max_raw_file_bytes", values.max_raw_file_bytes)?;
         require_nonzero("max_manifest_bytes", values.max_manifest_bytes)?;
         require_nonzero("max_object_bytes", values.max_object_bytes)?;
-        require_nonzero("max_blocks", values.max_blocks)?;
+        require_nonzero("max_map_page_bytes", values.max_map_page_bytes)?;
+        require_nonzero("max_materialized_blocks", values.max_materialized_blocks)?;
+        require_nonzero("max_map_working_bytes", values.max_map_working_bytes)?;
+        require_nonzero(
+            "max_representation_working_bytes",
+            values.max_representation_working_bytes,
+        )?;
+        require_nonzero("max_map_page_reads", values.max_map_page_reads)?;
+        require_nonzero("max_map_page_writes", values.max_map_page_writes)?;
         require_nonzero("max_read_bytes", values.max_read_bytes)?;
         require_nonzero("max_write_bytes", values.max_write_bytes)?;
         require_nonzero("max_key_bytes", values.max_key_bytes)?;
@@ -59,11 +82,36 @@ impl StorageLimits {
                 other: "max_object_bytes",
             });
         }
-        const ENVELOPE_BYTES: u64 = 53;
+        if values.max_map_page_bytes > values.max_object_bytes {
+            return Err(ConfigurationError::Inconsistent {
+                field: "max_map_page_bytes",
+                other: "max_object_bytes",
+            });
+        }
+        if values.max_materialized_blocks > (1_u64 << 49) {
+            return Err(ConfigurationError::TooLarge {
+                field: "max_materialized_blocks",
+                maximum: 1_u64 << 49,
+            });
+        }
+        let minimum_map_working =
+            values
+                .max_map_page_bytes
+                .checked_mul(2)
+                .ok_or(ConfigurationError::TooLarge {
+                    field: "max_map_page_bytes",
+                    maximum: u64::MAX,
+                })?;
+        if values.max_map_working_bytes < minimum_map_working {
+            return Err(ConfigurationError::Inconsistent {
+                field: "two mapping-page buffers",
+                other: "max_map_working_bytes",
+            });
+        }
         let max_object_bytes = u64::try_from(values.max_object_bytes).unwrap_or(u64::MAX);
         if values
             .max_raw_file_bytes
-            .checked_add(ENVELOPE_BYTES)
+            .checked_add(crate::representation::RAW_PAYLOAD_MAX_OVERHEAD)
             .is_none_or(|required| required > max_object_bytes)
         {
             return Err(ConfigurationError::Inconsistent {
@@ -71,9 +119,12 @@ impl StorageLimits {
                 other: "max_object_bytes minus envelope",
             });
         }
-        if u64::from(crate::BLOCK_SIZE_V1) + ENVELOPE_BYTES > max_object_bytes {
+        if u64::from(crate::BLOCK_SIZE)
+            .checked_add(crate::representation::BLOCK_PAYLOAD_MAX_OVERHEAD)
+            .is_none_or(|required| required > max_object_bytes)
+        {
             return Err(ConfigurationError::Inconsistent {
-                field: "version-1 block object",
+                field: "current block object",
                 other: "max_object_bytes",
             });
         }
@@ -102,9 +153,34 @@ impl StorageLimits {
         self.0.max_object_bytes
     }
 
-    /// Returns the maximum flat block-entry count.
-    pub const fn max_blocks(self) -> u32 {
-        self.0.max_blocks
+    /// Returns the maximum encoded mapping-page size.
+    pub const fn max_map_page_bytes(self) -> usize {
+        self.0.max_map_page_bytes
+    }
+
+    /// Returns the materialized-block quota.
+    pub const fn max_materialized_blocks(self) -> u64 {
+        self.0.max_materialized_blocks
+    }
+
+    /// Returns the operation-local mapping working-byte budget.
+    pub const fn max_map_working_bytes(self) -> usize {
+        self.0.max_map_working_bytes
+    }
+
+    /// Returns the compression/encryption representation working-byte budget.
+    pub const fn max_representation_working_bytes(self) -> usize {
+        self.0.max_representation_working_bytes
+    }
+
+    /// Returns the operation-local mapping-page read budget.
+    pub const fn max_map_page_reads(self) -> u32 {
+        self.0.max_map_page_reads
+    }
+
+    /// Returns the operation-local mapping-page write budget.
+    pub const fn max_map_page_writes(self) -> u32 {
+        self.0.max_map_page_writes
     }
 
     /// Returns the maximum read result size.
@@ -226,8 +302,18 @@ pub enum LimitKind {
     Manifest,
     /// One encoded target object.
     Object,
-    /// Flat block manifest entry count.
-    BlockCount,
+    /// Materialized block count represented by a sparse map.
+    MaterializedBlocks,
+    /// One encoded mapping page.
+    MapPage,
+    /// Operation-local mapping page reads.
+    MapPageReads,
+    /// Operation-local mapping page writes.
+    MapPageWrites,
+    /// Operation-local resident mapping bytes.
+    MapWorkingBytes,
+    /// Operation-local compression/encryption representation bytes.
+    RepresentationWorkingBytes,
     /// One read result.
     Read,
     /// One write input.

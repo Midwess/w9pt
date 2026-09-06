@@ -3,6 +3,7 @@
 pub mod w9pt_fs_state_authority_heads;
 pub mod w9pt_fs_state_change_commits;
 pub mod w9pt_fs_state_change_keys;
+pub mod w9pt_fs_state_content_metadata;
 pub mod w9pt_fs_state_directory_entries;
 pub mod w9pt_fs_state_filesystem_records;
 pub mod w9pt_fs_state_inodes;

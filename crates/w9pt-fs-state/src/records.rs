@@ -4,12 +4,12 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ClientIncarnationId, DataGeneration, DirectoryCookie, DirectoryGeneration, EntryName,
-    FencingToken, FilesystemId, GroupId, InodeGeneration, InodeId, LeaseDeadline, LeaseId,
-    LockGeneration, LockId, MutationResult, MutationRetention, OpenId, PrincipalId, QidPath,
-    RecordRevision, RequestFingerprint, StateLimitError, StateLimitKind, StateLimits,
-    StateRevision, SymlinkTarget, UnixTimestamp, WriterIncarnationId, WriterScopeId, XattrName,
-    XattrStagingId, XattrValue,
+    ClientIncarnationId, ContentMetadataRecord, DataGeneration, DirectoryCookie,
+    DirectoryGeneration, EntryName, FencingToken, FilesystemId, GroupId, InodeGeneration, InodeId,
+    LeaseDeadline, LeaseId, LockGeneration, LockId, MutationResult, MutationRetention, OpenId,
+    PrincipalId, QidPath, RecordRevision, RequestFingerprint, StateLimitError, StateLimitKind,
+    StateLimits, StateRevision, SymlinkTarget, UnixTimestamp, WriterIncarnationId, WriterScopeId,
+    XattrName, XattrStagingId, XattrValue,
 };
 
 /// Stable semantic family of one authoritative record.
@@ -19,6 +19,8 @@ pub enum RecordFamily {
     Filesystem,
     /// Inode metadata.
     Inode,
+    /// Opaque per-file storage policy and wrapped-key metadata.
+    ContentMetadata,
     /// Directory component mapping.
     DirectoryEntry,
     /// Portable open state.
@@ -46,6 +48,8 @@ pub enum RecordKey {
     Filesystem(FilesystemId),
     /// Inode by stable identity.
     Inode(FilesystemId, InodeId),
+    /// Content metadata by stable storage file identity.
+    ContentMetadata(FilesystemId, w9pt_fs_storage::FileId),
     /// Directory entry by byte-exact component.
     DirectoryEntry(FilesystemId, InodeId, EntryName),
     /// Open by portable identity.
@@ -72,6 +76,7 @@ impl RecordKey {
         match self {
             Self::Filesystem(filesystem_id)
             | Self::Inode(filesystem_id, _)
+            | Self::ContentMetadata(filesystem_id, _)
             | Self::DirectoryEntry(filesystem_id, _, _)
             | Self::Open(filesystem_id, _)
             | Self::OpenPin(filesystem_id, _, _)
@@ -89,6 +94,7 @@ impl RecordKey {
         match self {
             Self::Filesystem(_) => RecordFamily::Filesystem,
             Self::Inode(_, _) => RecordFamily::Inode,
+            Self::ContentMetadata(_, _) => RecordFamily::ContentMetadata,
             Self::DirectoryEntry(_, _, _) => RecordFamily::DirectoryEntry,
             Self::Open(_, _) => RecordFamily::Open,
             Self::OpenPin(_, _, _) => RecordFamily::OpenPin,
@@ -135,6 +141,8 @@ pub enum StateRecord {
     Filesystem(FilesystemRecord),
     /// Inode metadata.
     Inode(InodeRecord),
+    /// Opaque per-file context metadata.
+    ContentMetadata(ContentMetadataRecord),
     /// Directory component mapping.
     DirectoryEntry(DirectoryEntryRecord),
     /// Portable open state.
@@ -161,6 +169,7 @@ impl StateRecord {
         match self {
             Self::Filesystem(_) => RecordFamily::Filesystem,
             Self::Inode(_) => RecordFamily::Inode,
+            Self::ContentMetadata(_) => RecordFamily::ContentMetadata,
             Self::DirectoryEntry(_) => RecordFamily::DirectoryEntry,
             Self::Open(_) => RecordFamily::Open,
             Self::OpenPin(_) => RecordFamily::OpenPin,
@@ -178,6 +187,7 @@ impl StateRecord {
         match self {
             Self::Filesystem(record) => record.record_revision(),
             Self::Inode(record) => record.revision(),
+            Self::ContentMetadata(record) => record.revision(),
             Self::DirectoryEntry(record) => record.revision(),
             Self::Open(record) => record.revision(),
             Self::OpenPin(record) => record.revision(),
@@ -203,6 +213,9 @@ impl StateRecord {
                 *filesystem_id == record.filesystem_id()
             }
             (RecordKey::Inode(_, inode_id), Self::Inode(record)) => *inode_id == record.inode_id(),
+            (RecordKey::ContentMetadata(_, file_id), Self::ContentMetadata(record)) => {
+                *file_id == record.content_file_id()
+            }
             (RecordKey::DirectoryEntry(_, parent, name), Self::DirectoryEntry(record)) => {
                 *parent == record.parent_inode_id() && name == record.name()
             }
@@ -247,6 +260,7 @@ impl StateRecord {
                     .expect("a record revision is always nonzero");
             }
             Self::Inode(record) => record.revision = revision,
+            Self::ContentMetadata(record) => *record = record.clone().with_revision(revision),
             Self::DirectoryEntry(record) => record.revision = revision,
             Self::Open(record) => record.revision = revision,
             Self::OpenPin(record) => record.revision = revision,
@@ -280,6 +294,7 @@ impl StateRecord {
                 }
                 (256, variable)
             }
+            Self::ContentMetadata(record) => return record.retained_bytes(),
             Self::DirectoryEntry(record) => (96, record.name().as_bytes().len()),
             Self::Open(_) | Self::OpenPin(_) | Self::Orphan(_) | Self::Lock(_) => (128, 0),
             Self::Xattr(record) => (
@@ -326,6 +341,23 @@ impl StateRecord {
                     )?;
                 }
                 Ok(())
+            }
+            Self::ContentMetadata(record) => {
+                limits.require_bytes(
+                    StateLimitKind::ContentPolicy,
+                    record.policy_bytes().len(),
+                    limits.max_content_policy_bytes(),
+                )?;
+                limits.require_bytes(
+                    StateLimitKind::WrappedContentKey,
+                    record.wrapped_key_bytes().map_or(0, <[u8]>::len),
+                    limits.max_wrapped_content_key_bytes(),
+                )?;
+                limits.require_bytes(
+                    StateLimitKind::ContentMetadata,
+                    record.retained_bytes().unwrap_or(usize::MAX),
+                    limits.max_content_metadata_bytes(),
+                )
             }
             Self::DirectoryEntry(record) => limits.require_bytes(
                 StateLimitKind::EntryName,
@@ -1306,6 +1338,7 @@ pub struct InodeRecord {
     logical_size: u64,
     link_count: u64,
     inode_generation: InodeGeneration,
+    content_context_id: Option<w9pt_fs_storage::ContentContextId>,
     data: InodeData,
 }
 
@@ -1325,6 +1358,75 @@ impl InodeRecord {
         inode_generation: InodeGeneration,
         data: InodeData,
     ) -> Result<Self, RecordValidationError> {
+        if matches!(data, InodeData::RegularFile { .. }) {
+            return Err(RecordValidationError::MissingContentContext);
+        }
+        Self::new_inner(
+            inode_id,
+            qid_path,
+            revision,
+            mode,
+            owner,
+            group,
+            times,
+            logical_size,
+            link_count,
+            inode_generation,
+            None,
+            data,
+        )
+    }
+
+    /// Creates a checked regular inode with its mandatory content context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_regular(
+        inode_id: InodeId,
+        qid_path: QidPath,
+        revision: RecordRevision,
+        mode: u32,
+        owner: PrincipalId,
+        group: GroupId,
+        times: InodeTimes,
+        logical_size: u64,
+        link_count: u64,
+        inode_generation: InodeGeneration,
+        content_context_id: w9pt_fs_storage::ContentContextId,
+        data: InodeData,
+    ) -> Result<Self, RecordValidationError> {
+        if !matches!(data, InodeData::RegularFile { .. }) {
+            return Err(RecordValidationError::ContentContextOnNonRegularFile);
+        }
+        Self::new_inner(
+            inode_id,
+            qid_path,
+            revision,
+            mode,
+            owner,
+            group,
+            times,
+            logical_size,
+            link_count,
+            inode_generation,
+            Some(content_context_id),
+            data,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        inode_id: InodeId,
+        qid_path: QidPath,
+        revision: RecordRevision,
+        mode: u32,
+        owner: PrincipalId,
+        group: GroupId,
+        times: InodeTimes,
+        logical_size: u64,
+        link_count: u64,
+        inode_generation: InodeGeneration,
+        content_context_id: Option<w9pt_fs_storage::ContentContextId>,
+        data: InodeData,
+    ) -> Result<Self, RecordValidationError> {
         if mode & !0o7777 != 0 {
             return Err(RecordValidationError::InvalidMode { mode });
         }
@@ -1340,6 +1442,7 @@ impl InodeRecord {
             logical_size,
             link_count,
             inode_generation,
+            content_context_id,
             data,
         })
     }
@@ -1412,6 +1515,11 @@ impl InodeRecord {
             } => Some(*content_file_id),
             _ => None,
         }
+    }
+
+    /// Returns the stable regular-file content context when bound.
+    pub const fn content_context_id(&self) -> Option<w9pt_fs_storage::ContentContextId> {
+        self.content_context_id
     }
 
     /// Returns the currently published immutable content reference when present.
@@ -1582,6 +1690,8 @@ pub fn validate_record_set_with_limits(
     let mut directory_cookies = BTreeSet::new();
     let mut qid_paths = BTreeSet::new();
     let mut locks = Vec::new();
+    let mut content_contexts = BTreeSet::new();
+    let mut content_owners = BTreeSet::new();
     for (key, record) in records {
         record.validate_key(key)?;
         let filesystem_id = key.filesystem_id();
@@ -1763,6 +1873,49 @@ pub fn validate_record_set_with_limits(
                         filesystem.root_inode_id(),
                         limits.max_directory_ancestor_depth(),
                     )?;
+                }
+                if let Some(file_id) = inode.content_file_id() {
+                    let context_id = inode.content_context_id().ok_or(
+                        RecordValidationError::MissingRelatedRecord {
+                            relation: "regular inode content context",
+                        },
+                    )?;
+                    let Some(StateRecord::ContentMetadata(metadata)) =
+                        records.get(&RecordKey::ContentMetadata(filesystem_id, file_id))
+                    else {
+                        return Err(RecordValidationError::MissingRelatedRecord {
+                            relation: "regular inode content metadata",
+                        });
+                    };
+                    if metadata.owner_inode_id() != inode.inode_id()
+                        || metadata.context_id() != context_id
+                    {
+                        return Err(RecordValidationError::InvalidRelatedRecord {
+                            relation: "inode content context binding",
+                        });
+                    }
+                }
+            }
+            StateRecord::ContentMetadata(metadata) => {
+                if !content_contexts.insert((filesystem_id, metadata.context_id())) {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "duplicate content context identity",
+                    });
+                }
+                if !content_owners.insert((filesystem_id, metadata.owner_inode_id())) {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "duplicate content metadata owner",
+                    });
+                }
+                if let Some(StateRecord::Inode(owner)) =
+                    records.get(&RecordKey::Inode(filesystem_id, metadata.owner_inode_id()))
+                    && (owner.kind() != InodeKind::RegularFile
+                        || owner.content_file_id() != Some(metadata.content_file_id())
+                        || owner.content_context_id() != Some(metadata.context_id()))
+                {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "content metadata owner binding",
+                    });
                 }
             }
             StateRecord::Mutation(_) | StateRecord::WriterLease(_) => {}
@@ -1970,6 +2123,10 @@ pub enum RecordValidationError {
     },
     /// Inode and content references use different stable file identities.
     ContentFileMismatch,
+    /// A content context was attached to a non-regular inode.
+    ContentContextOnNonRegularFile,
+    /// A regular inode omitted its mandatory content context.
+    MissingContentContext,
     /// Inode and content logical sizes differ.
     ContentSizeMismatch {
         /// Size stored by the inode.
@@ -2052,6 +2209,12 @@ impl fmt::Display for RecordValidationError {
             Self::ContentFileMismatch => {
                 formatter.write_str("inode content file identity mismatch")
             }
+            Self::ContentContextOnNonRegularFile => {
+                formatter.write_str("content context requires a regular inode")
+            }
+            Self::MissingContentContext => {
+                formatter.write_str("regular inode requires a content context")
+            }
             Self::ContentSizeMismatch {
                 inode_size,
                 content_size,
@@ -2100,7 +2263,7 @@ mod tests {
     #[test]
     fn unpublished_regular_file_is_explicit_and_empty() {
         let (owner, group) = identity();
-        let inode = InodeRecord::new(
+        let inode = InodeRecord::new_regular(
             InodeId::from_u128(1),
             QidPath::new(1).unwrap(),
             RecordRevision::new(1).unwrap(),
@@ -2111,6 +2274,7 @@ mod tests {
             0,
             1,
             InodeGeneration::new(1).unwrap(),
+            w9pt_fs_storage::ContentContextId::from_u128(1),
             InodeData::RegularFile {
                 content_file_id: w9pt_fs_storage::FileId::from_u128(1),
                 content: None,
@@ -2136,7 +2300,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            InodeRecord::new(
+            InodeRecord::new_regular(
                 InodeId::from_u128(1),
                 QidPath::new(1).unwrap(),
                 RecordRevision::new(1).unwrap(),
@@ -2147,6 +2311,7 @@ mod tests {
                 2,
                 1,
                 InodeGeneration::new(1).unwrap(),
+                w9pt_fs_storage::ContentContextId::from_u128(1),
                 InodeData::RegularFile {
                     content_file_id: w9pt_fs_storage::FileId::from_u128(1),
                     content: Some(content),

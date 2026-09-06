@@ -1,5 +1,9 @@
 //! Transport-neutral 9P client helpers shared by integration profiles.
 
+#![allow(dead_code)]
+
+pub mod content_target;
+
 use std::{future::Future, io, pin::Pin};
 
 use w9pt::{

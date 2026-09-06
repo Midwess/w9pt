@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use crate::{ConfigurationError, LimitError, ObjectKey};
+use crate::{ConfigurationError, LimitError, ObjectKey, RepresentationError};
 
 /// Invalid relationship between a logical mutation, its base, and prepared content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,7 +173,7 @@ pub enum CorruptionError {
     NonZeroPadding,
     /// A persisted key points outside the configured repository prefix.
     ForeignKey,
-    /// A persisted key does not use the canonical version-1 repository schema.
+    /// A persisted key does not use the canonical current repository schema.
     InvalidKeySchema,
 }
 
@@ -310,6 +310,8 @@ pub enum MissingObjectKind {
     Head,
     /// Immutable file manifest.
     Manifest,
+    /// Immutable block-mapping page.
+    MappingPage,
     /// Immutable raw or block payload.
     Payload,
 }
@@ -335,6 +337,8 @@ pub enum StorageError<E> {
     Limit(LimitError),
     /// Prepared content does not match its mutation or publication base.
     Preparation(PreparationError),
+    /// Compression, encryption, file-key, or protected-context failure.
+    Representation(RepresentationError),
     /// Required target object was absent.
     Missing {
         /// Expected object category.
@@ -356,6 +360,7 @@ impl<E: fmt::Display> fmt::Display for StorageError<E> {
             Self::Ambiguous(error) => error.fmt(formatter),
             Self::Limit(error) => error.fmt(formatter),
             Self::Preparation(error) => error.fmt(formatter),
+            Self::Representation(error) => error.fmt(formatter),
             Self::Missing { kind, key } => write!(formatter, "missing {kind:?} object {key}"),
         }
     }
@@ -396,6 +401,12 @@ impl<E> From<LimitError> for StorageError<E> {
 impl<E> From<PreparationError> for StorageError<E> {
     fn from(error: PreparationError) -> Self {
         Self::Preparation(error)
+    }
+}
+
+impl<E> From<RepresentationError> for StorageError<E> {
+    fn from(error: RepresentationError) -> Self {
+        Self::Representation(error)
     }
 }
 

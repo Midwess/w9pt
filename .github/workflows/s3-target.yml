@@ -24,13 +24,14 @@ jobs:
         run: |
           test -z "$(cargo tree -i rkyv@0.7.46 --workspace --all-features --target all --locked 2>/dev/null)"
           test -z "$(cargo tree -i rsa@0.9.10 --workspace --all-features --target all --locked 2>/dev/null)"
+          test -z "$(cargo tree --manifest-path test/Cargo.toml -i rsa@0.9.10 --target all --locked 2>/dev/null)"
       - name: Audit reachable root dependencies
         run: >-
           cargo audit --file Cargo.lock
           --ignore RUSTSEC-2026-0235
           --ignore RUSTSEC-2023-0071
       - name: Audit standalone integration-test dependencies
-        run: cargo audit --file test/Cargo.lock
+        run: cargo audit --file test/Cargo.lock --ignore RUSTSEC-2023-0071
 
   storage-integration:
     runs-on: ubuntu-latest
@@ -49,6 +50,8 @@ jobs:
       W9PT_S3_COMPAT_TEST_PREFIX: ci/target/w9pt-s3-test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
       W9PT_S3_COMPAT_REPOSITORY_TEST_REQUIRED: "1"
       W9PT_S3_COMPAT_REPOSITORY_TEST_PREFIX: ci/repository/w9pt-s3-test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
+      W9PT_CONTENT_CONTEXT_TEST_REQUIRED: "1"
+      W9PT_CONTENT_CONTEXT_S3_PREFIX: ci/composition/w9pt-s3-test-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
       W9PT_TCP_SEAWEED_TEST_REQUIRED: "1"
       W9PT_WEBSOCKET_SEAWEED_TEST_REQUIRED: "1"
       W9PT_TEST_S3_ENDPOINT: http://127.0.0.1:18333
@@ -87,11 +90,17 @@ jobs:
         run: >-
           cargo test -p w9pt-fs-storage-s3 --test s3_conformance
           live_pinned_compatible_provider_repository_matrix_remains_unqualified
-          --locked -- --exact
+          --features representation-test --locked -- --exact
       - name: Run PostgreSQL migration and state conformance
         run: >-
           cargo test -p w9pt-fs-state-postgres --all-features --locked
           -- --test-threads=1
+      - name: Run PostgreSQL and protected-content composition
+        run: >-
+          cargo test --manifest-path test/Cargo.toml
+          --test content_context_composition
+          postgres_winner_reopens_and_rewraps_encrypted_seaweedfs_content
+          --locked -- --exact
       - name: Run TCP 9P forwarding integration
         run: >-
           cargo test --manifest-path test/Cargo.toml --locked

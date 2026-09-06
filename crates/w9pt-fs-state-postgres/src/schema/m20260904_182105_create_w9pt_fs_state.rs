@@ -13,6 +13,7 @@ use sea_orm_migration::prelude::*;
 use super::entities::{
     w9pt_fs_state_authority_heads as authority_heads,
     w9pt_fs_state_change_commits as change_commits, w9pt_fs_state_change_keys as change_keys,
+    w9pt_fs_state_content_metadata as content_metadata,
     w9pt_fs_state_directory_entries as directory_entries,
     w9pt_fs_state_filesystem_records as filesystem_records, w9pt_fs_state_inodes as inodes,
     w9pt_fs_state_locks as locks, w9pt_fs_state_mutation_results as mutation_results,
@@ -29,6 +30,7 @@ const SCHEMA_MIGRATIONS: &str = "w9pt_fs_state_schema_migrations";
 const AUTHORITY_HEADS: &str = "w9pt_fs_state_authority_heads";
 const FILESYSTEM_RECORDS: &str = "w9pt_fs_state_filesystem_records";
 const INODES: &str = "w9pt_fs_state_inodes";
+const CONTENT_METADATA: &str = "w9pt_fs_state_content_metadata";
 const DIRECTORY_ENTRIES: &str = "w9pt_fs_state_directory_entries";
 const OPENS: &str = "w9pt_fs_state_opens";
 const OPEN_PINS: &str = "w9pt_fs_state_open_pins";
@@ -47,6 +49,7 @@ pub(crate) const TABLE_NAMES: &[&str] = &[
     AUTHORITY_HEADS,
     FILESYSTEM_RECORDS,
     INODES,
+    CONTENT_METADATA,
     DIRECTORY_ENTRIES,
     OPENS,
     OPEN_PINS,
@@ -68,6 +71,10 @@ pub(crate) const INDEX_NAMES: &[&str] = &[
     "w9pt_fs_state_filesystem_records_pkey",
     "w9pt_fs_state_inodes_pkey",
     "w9pt_fs_state_inodes_qid_path_unique",
+    "w9pt_fs_state_content_metadata_pkey",
+    "w9pt_fs_state_content_metadata_context_unique",
+    "w9pt_fs_state_content_metadata_owner_unique",
+    "w9pt_fs_state_content_metadata_binding_unique",
     "w9pt_fs_state_directory_entries_pkey",
     "w9pt_fs_state_directory_entries_cookie_unique",
     "w9pt_fs_state_directory_entries_child_idx",
@@ -125,6 +132,8 @@ pub(crate) const CONSTRAINT_NAMES: &[&str] = &[
     "w9pt_fs_state_inodes_owner_no_nul",
     "w9pt_fs_state_inodes_group_no_nul",
     "w9pt_fs_state_inodes_content_file_id_width",
+    "w9pt_fs_state_inodes_content_context_id_width",
+    "w9pt_fs_state_inodes_content_context_fk",
     "w9pt_fs_state_inodes_data_generation_range",
     "w9pt_fs_state_inodes_content_generation_range",
     "w9pt_fs_state_inodes_content_logical_size_range",
@@ -140,6 +149,20 @@ pub(crate) const CONSTRAINT_NAMES: &[&str] = &[
     "w9pt_fs_state_inodes_content_fields_all_or_none",
     "w9pt_fs_state_inodes_regular_content_consistency",
     "w9pt_fs_state_inodes_kind_specific_shape",
+    "w9pt_fs_state_content_metadata_pkey",
+    "w9pt_fs_state_content_metadata_context_unique",
+    "w9pt_fs_state_content_metadata_owner_unique",
+    "w9pt_fs_state_content_metadata_binding_unique",
+    "w9pt_fs_state_content_metadata_filesystem_id_width",
+    "w9pt_fs_state_content_metadata_content_file_id_width",
+    "w9pt_fs_state_content_metadata_owner_inode_id_width",
+    "w9pt_fs_state_content_metadata_context_id_width",
+    "w9pt_fs_state_content_metadata_policy_format_range",
+    "w9pt_fs_state_content_metadata_policy_bounds",
+    "w9pt_fs_state_content_metadata_key_shape",
+    "w9pt_fs_state_content_metadata_commitment_width",
+    "w9pt_fs_state_content_metadata_wrapped_bounds",
+    "w9pt_fs_state_content_metadata_record_revision_range",
     "w9pt_fs_state_directory_entries_pkey",
     "w9pt_fs_state_directory_entries_cookie_unique",
     "w9pt_fs_state_directory_entries_parent_fk",
@@ -308,6 +331,11 @@ fn production_tables() -> Vec<TableCreateStatement> {
         ),
         generated_table(inodes::Entity, "w9pt_fs_state_inodes_pkey", false),
         generated_table(
+            content_metadata::Entity,
+            "w9pt_fs_state_content_metadata_pkey",
+            false,
+        ),
+        generated_table(
             directory_entries::Entity,
             "w9pt_fs_state_directory_entries_pkey",
             false,
@@ -396,6 +424,23 @@ where
             "w9pt_fs_state_inodes_qid_path_unique",
             &["filesystem_id", "qid_path"],
         ),
+        CONTENT_METADATA => {
+            add_unique_constraint(
+                &mut table,
+                "w9pt_fs_state_content_metadata_context_unique",
+                &["filesystem_id", "context_id"],
+            );
+            add_unique_constraint(
+                &mut table,
+                "w9pt_fs_state_content_metadata_owner_unique",
+                &["filesystem_id", "owner_inode_id"],
+            );
+            add_unique_constraint(
+                &mut table,
+                "w9pt_fs_state_content_metadata_binding_unique",
+                &["filesystem_id", "content_file_id", "context_id"],
+            );
+        }
         DIRECTORY_ENTRIES => add_unique_constraint(
             &mut table,
             "w9pt_fs_state_directory_entries_cookie_unique",
@@ -542,6 +587,9 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
         ADD CONSTRAINT "w9pt_fs_state_inodes_content_file_id_width" CHECK (
             "content_file_id" IS NULL OR octet_length("content_file_id") = 16
         ),
+        ADD CONSTRAINT "w9pt_fs_state_inodes_content_context_id_width" CHECK (
+            "content_context_id" IS NULL OR octet_length("content_context_id") = 16
+        ),
         ADD CONSTRAINT "w9pt_fs_state_inodes_data_generation_range" CHECK (
             "data_generation" IS NULL
             OR "data_generation" BETWEEN 0 AND 18446744073709551615
@@ -623,6 +671,8 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
             (
                 "kind" = 1
                 AND "content_file_id" IS NOT NULL
+                AND "content_context_id" IS NOT NULL
+                AND octet_length("content_context_id") = 16
                 AND "data_generation" IS NOT NULL
                 AND "directory_generation" IS NULL
                 AND "symlink_target" IS NULL
@@ -633,6 +683,7 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
                 "kind" = 2
                 AND "logical_size" = 0
                 AND "content_file_id" IS NULL
+                AND "content_context_id" IS NULL
                 AND "data_generation" IS NULL
                 AND "content_generation" IS NULL
                 AND "directory_generation" IS NOT NULL
@@ -644,6 +695,7 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
                 "kind" = 3
                 AND "logical_size" = octet_length("symlink_target")
                 AND "content_file_id" IS NULL
+                AND "content_context_id" IS NULL
                 AND "data_generation" IS NULL
                 AND "content_generation" IS NULL
                 AND "directory_generation" IS NULL
@@ -655,6 +707,7 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
                 "kind" IN (4, 5)
                 AND "logical_size" = 0
                 AND "content_file_id" IS NULL
+                AND "content_context_id" IS NULL
                 AND "data_generation" IS NULL
                 AND "content_generation" IS NULL
                 AND "directory_generation" IS NULL
@@ -666,6 +719,7 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
                 "kind" IN (6, 7)
                 AND "logical_size" = 0
                 AND "content_file_id" IS NULL
+                AND "content_context_id" IS NULL
                 AND "data_generation" IS NULL
                 AND "content_generation" IS NULL
                 AND "directory_generation" IS NULL
@@ -893,13 +947,26 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
         ADD CONSTRAINT "w9pt_fs_state_change_commits_origin_kind_tag" CHECK ("origin_kind" IN (1, 2)),
         ADD CONSTRAINT "w9pt_fs_state_change_commits_origin_id_width" CHECK (octet_length("origin_id") = 16),
         ADD CONSTRAINT "w9pt_fs_state_change_commits_key_count_range" CHECK ("key_count" BETWEEN 1 AND 16385);"#,
+    r#"ALTER TABLE "public"."w9pt_fs_state_content_metadata"
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_filesystem_id_width" CHECK (octet_length("filesystem_id") = 16),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_content_file_id_width" CHECK (octet_length("content_file_id") = 16),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_owner_inode_id_width" CHECK (octet_length("owner_inode_id") = 16),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_context_id_width" CHECK (octet_length("context_id") = 16),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_policy_format_range" CHECK ("policy_format" BETWEEN 1 AND 65535),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_policy_bounds" CHECK (octet_length("policy_bytes") BETWEEN 1 AND 512),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_key_shape" CHECK (num_nonnulls("key_commitment", "wrapped_key_bytes") IN (0, 2)),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_commitment_width" CHECK ("key_commitment" IS NULL OR octet_length("key_commitment") = 32),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_wrapped_bounds" CHECK ("wrapped_key_bytes" IS NULL OR octet_length("wrapped_key_bytes") BETWEEN 1 AND 512),
+        ADD CONSTRAINT "w9pt_fs_state_content_metadata_record_revision_range" CHECK (
+            "record_revision" BETWEEN 1 AND 18446744073709551615
+        );"#,
     r#"ALTER TABLE "public"."w9pt_fs_state_change_keys"
         ADD CONSTRAINT "w9pt_fs_state_change_keys_filesystem_id_width" CHECK (octet_length("filesystem_id") = 16),
         ADD CONSTRAINT "w9pt_fs_state_change_keys_revision_range" CHECK (
             "revision" BETWEEN 1 AND 18446744073709551615
         ),
         ADD CONSTRAINT "w9pt_fs_state_change_keys_ordinal_range" CHECK ("ordinal" BETWEEN 0 AND 16384),
-        ADD CONSTRAINT "w9pt_fs_state_change_keys_family_tag" CHECK ("family_tag" BETWEEN 1 AND 11),
+        ADD CONSTRAINT "w9pt_fs_state_change_keys_family_tag" CHECK ("family_tag" BETWEEN 1 AND 12),
         ADD CONSTRAINT "w9pt_fs_state_change_keys_component_a_width" CHECK (
             "component_a" IS NULL OR octet_length("component_a") = 16
         ),
@@ -909,7 +976,7 @@ const CHECK_CONSTRAINT_DDL: &[&str] = &[
         ADD CONSTRAINT "w9pt_fs_state_change_keys_component_shape" CHECK (
             ("family_tag" = 1 AND "component_a" IS NULL AND "component_b" IS NULL)
             OR (
-                "family_tag" IN (2, 4, 6, 9, 10, 11)
+                "family_tag" IN (2, 4, 6, 9, 10, 11, 12)
                 AND "component_a" IS NOT NULL
                 AND "component_b" IS NULL
             )
@@ -954,6 +1021,12 @@ const DEFERRED_FOREIGN_KEY_DDL: &[&str] = &[
             "filesystem_id", "directory_parent_inode_id"
         ) REFERENCES "public"."w9pt_fs_state_inodes" ("filesystem_id", "inode_id")
         DEFERRABLE INITIALLY DEFERRED;"#,
+    r#"ALTER TABLE "public"."w9pt_fs_state_inodes"
+        ADD CONSTRAINT "w9pt_fs_state_inodes_content_context_fk" FOREIGN KEY (
+            "filesystem_id", "content_file_id", "content_context_id"
+        ) REFERENCES "public"."w9pt_fs_state_content_metadata" (
+            "filesystem_id", "content_file_id", "context_id"
+        ) DEFERRABLE INITIALLY DEFERRED;"#,
     r#"ALTER TABLE "public"."w9pt_fs_state_directory_entries"
         ADD CONSTRAINT "w9pt_fs_state_directory_entries_parent_fk" FOREIGN KEY (
             "filesystem_id", "parent_inode_id"

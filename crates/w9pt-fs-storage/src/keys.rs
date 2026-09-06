@@ -5,8 +5,15 @@ use crate::{
     ObjectKey, OperationFingerprint, PreparationIdentity, StorageLimits,
 };
 
-const LONGEST_SUFFIX_BYTES: usize =
-    "/v1/data/".len() + 32 + 1 + 32 + 1 + 16 + 1 + 64 + 1 + 64 + 1 + 8 + "/blocks/".len() + 16;
+const BLOCK_PAYLOAD_SUFFIX_BYTES: usize =
+    "/v3/data/".len() + 32 + 1 + 32 + 1 + 16 + 1 + 64 + 1 + 64 + 1 + 8 + "/blocks/".len() + 16;
+const MAP_PAGE_SUFFIX_BYTES: usize =
+    "/v3/maps/".len() + 32 + 1 + 32 + 1 + 16 + 1 + 64 + 1 + 64 + 1 + 8 + 1 + 2 + 1 + 16;
+const LONGEST_SUFFIX_BYTES: usize = if BLOCK_PAYLOAD_SUFFIX_BYTES > MAP_PAGE_SUFFIX_BYTES {
+    BLOCK_PAYLOAD_SUFFIX_BYTES
+} else {
+    MAP_PAGE_SUFFIX_BYTES
+};
 
 /// Validated private object keyspace for one repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +47,10 @@ impl PreparationKey {
 }
 
 impl KeySpace {
-    /// Validates a private prefix and its longest version-1 key.
+    pub(crate) fn ensure_owned(&self, key: &ObjectKey) -> Result<(), CorruptionError> {
+        self.components(key).map(|_| ())
+    }
+    /// Validates a private prefix and its longest current-format key.
     pub fn new(
         prefix: impl Into<String>,
         limits: StorageLimits,
@@ -76,7 +86,7 @@ impl KeySpace {
         )?;
         if longest > limits.max_key_bytes() {
             return Err(ConfigurationError::InvalidPrefix {
-                reason: "version-1 key exceeds max_key_bytes",
+                reason: "current-format key exceeds max_key_bytes",
             });
         }
         Ok(Self {
@@ -87,13 +97,13 @@ impl KeySpace {
 
     /// Returns the canonical repository format marker key.
     pub fn format(&self) -> ObjectKey {
-        self.key(format_args!("{}/v1/format", self.prefix))
+        self.key(format_args!("{}/v3/format", self.prefix))
     }
 
     /// Returns the sole mutable publication key for a file.
     pub fn head(&self, file_id: FileId) -> ObjectKey {
         self.key(format_args!(
-            "{}/v1/refs/files/{}",
+            "{}/v3/refs/files/{}",
             self.prefix,
             IdHex(file_id.as_bytes())
         ))
@@ -107,7 +117,7 @@ impl KeySpace {
         attempt: u32,
     ) -> ObjectKey {
         self.key(format_args!(
-            "{}/v1/manifests/{}/{}/{:016x}/{}/{}/{attempt:08x}",
+            "{}/v3/manifests/{}/{}/{:016x}/{}/{}/{attempt:08x}",
             self.prefix,
             IdHex(file_id.as_bytes()),
             IdHex(identity.mutation_id().as_bytes()),
@@ -125,7 +135,7 @@ impl KeySpace {
         attempt: u32,
     ) -> ObjectKey {
         self.key(format_args!(
-            "{}/v1/data/{}/{}/{:016x}/{}/{}/{attempt:08x}/raw",
+            "{}/v3/data/{}/{}/{:016x}/{}/{}/{attempt:08x}/raw",
             self.prefix,
             IdHex(file_id.as_bytes()),
             IdHex(identity.mutation_id().as_bytes()),
@@ -144,7 +154,7 @@ impl KeySpace {
         block_index: u64,
     ) -> ObjectKey {
         self.key(format_args!(
-            "{}/v1/data/{}/{}/{:016x}/{}/{}/{attempt:08x}/blocks/{block_index:016x}",
+            "{}/v3/data/{}/{}/{:016x}/{}/{}/{attempt:08x}/blocks/{block_index:016x}",
             self.prefix,
             IdHex(file_id.as_bytes()),
             IdHex(identity.mutation_id().as_bytes()),
@@ -154,13 +164,84 @@ impl KeySpace {
         ))
     }
 
+    /// Returns an attempt- and location-specific immutable mapping-page key.
+    pub fn map_page(
+        &self,
+        file_id: FileId,
+        identity: PreparationIdentity,
+        attempt: u32,
+        level: u8,
+        first_block: u64,
+    ) -> ObjectKey {
+        self.key(format_args!(
+            "{}/v3/maps/{}/{}/{:016x}/{}/{}/{attempt:08x}/{level:02x}/{first_block:016x}",
+            self.prefix,
+            IdHex(file_id.as_bytes()),
+            IdHex(identity.mutation_id().as_bytes()),
+            identity.base().generation(),
+            IdHex(identity.base().manifest_digest().as_bytes()),
+            IdHex(identity.fingerprint().as_bytes()),
+        ))
+    }
+
+    /// Returns a protected-token immutable manifest key with no public fingerprint.
+    pub fn protected_manifest(&self, file_id: FileId, token: [u8; 32]) -> ObjectKey {
+        self.key(format_args!(
+            "{}/v3/protected/{}/{}/manifest",
+            self.prefix,
+            IdHex(file_id.as_bytes()),
+            IdHex(&token),
+        ))
+    }
+
+    /// Returns a protected-token raw payload key.
+    pub fn protected_raw_payload(&self, file_id: FileId, token: [u8; 32]) -> ObjectKey {
+        self.key(format_args!(
+            "{}/v3/protected/{}/{}/raw",
+            self.prefix,
+            IdHex(file_id.as_bytes()),
+            IdHex(&token),
+        ))
+    }
+
+    /// Returns a protected-token block payload key.
+    pub fn protected_block_payload(
+        &self,
+        file_id: FileId,
+        token: [u8; 32],
+        block_index: u64,
+    ) -> ObjectKey {
+        self.key(format_args!(
+            "{}/v3/protected/{}/{}/blocks/{block_index:016x}",
+            self.prefix,
+            IdHex(file_id.as_bytes()),
+            IdHex(&token),
+        ))
+    }
+
+    /// Returns a protected-token mapping page key.
+    pub fn protected_map_page(
+        &self,
+        file_id: FileId,
+        token: [u8; 32],
+        level: u8,
+        first_block: u64,
+    ) -> ObjectKey {
+        self.key(format_args!(
+            "{}/v3/protected/{}/{}/maps/{level:02x}/{first_block:016x}",
+            self.prefix,
+            IdHex(file_id.as_bytes()),
+            IdHex(&token),
+        ))
+    }
+
     pub(crate) fn parse_manifest(
         &self,
         expected_file: FileId,
         key: &ObjectKey,
     ) -> Result<PreparationKey, CorruptionError> {
         let components = self.components(key)?;
-        if components.len() != 8 || components[0] != "v1" || components[1] != "manifests" {
+        if components.len() != 8 || components[0] != "v3" || components[1] != "manifests" {
             return Err(CorruptionError::InvalidKeySchema);
         }
         parse_preparation_components(expected_file, &components[2..])
@@ -173,7 +254,7 @@ impl KeySpace {
     ) -> Result<(), CorruptionError> {
         let components = self.components(key)?;
         if components.len() != 9
-            || components[0] != "v1"
+            || components[0] != "v3"
             || components[1] != "data"
             || components[8] != "raw"
         {
@@ -190,10 +271,29 @@ impl KeySpace {
     ) -> Result<(), CorruptionError> {
         let components = self.components(key)?;
         if components.len() != 10
-            || components[0] != "v1"
+            || components[0] != "v3"
             || components[1] != "data"
             || components[8] != "blocks"
             || parse_fixed_hex_u64(components[9], 16)? != block_index
+        {
+            return Err(CorruptionError::InvalidKeySchema);
+        }
+        parse_preparation_components(file_id, &components[2..8]).map(|_| ())
+    }
+
+    pub(crate) fn validate_map_page(
+        &self,
+        file_id: FileId,
+        level: u8,
+        first_block: u64,
+        key: &ObjectKey,
+    ) -> Result<(), CorruptionError> {
+        let components = self.components(key)?;
+        if components.len() != 10
+            || components[0] != "v3"
+            || components[1] != "maps"
+            || parse_fixed_hex_u64(components[8], 2)? != u64::from(level)
+            || parse_fixed_hex_u64(components[9], 16)? != first_block
         {
             return Err(CorruptionError::InvalidKeySchema);
         }
@@ -312,18 +412,23 @@ mod tests {
         let keys = KeySpace::new("private/root", StorageLimits::default()).unwrap();
         assert_eq!(
             keys.head(FileId::from_u128(1)).as_str(),
-            "private/root/v1/refs/files/00000000000000000000000000000001"
+            "private/root/v3/refs/files/00000000000000000000000000000001"
         );
         assert_eq!(
             keys.block_payload(FileId::from_u128(1), identity(), 3, 4)
                 .as_str(),
             concat!(
-                "private/root/v1/data/00000000000000000000000000000001/",
+                "private/root/v3/data/00000000000000000000000000000001/",
                 "00000000000000000000000000000002/0000000000000000/",
                 "0000000000000000000000000000000000000000000000000000000000000000/",
                 "0303030303030303030303030303030303030303030303030303030303030303/",
                 "00000003/blocks/0000000000000004"
             )
+        );
+        assert!(
+            keys.map_page(FileId::from_u128(1), identity(), 3, 2, 16_384)
+                .as_str()
+                .ends_with("/00000003/02/0000000000004000")
         );
     }
 
@@ -343,6 +448,19 @@ mod tests {
             ..crate::StorageLimitValues::default()
         };
         assert!(KeySpace::new("private", StorageLimits::new(values).unwrap()).is_err());
+
+        let limits = StorageLimits::default();
+        let exact = "p".repeat(limits.max_key_bytes() - BLOCK_PAYLOAD_SUFFIX_BYTES);
+        let exact_keys = KeySpace::new(exact, limits).unwrap();
+        assert_eq!(
+            exact_keys
+                .block_payload(FileId::from_u128(1), identity(), 0, u64::MAX)
+                .as_str()
+                .len(),
+            limits.max_key_bytes()
+        );
+        let too_long = "p".repeat(limits.max_key_bytes() - MAP_PAGE_SUFFIX_BYTES);
+        assert!(KeySpace::new(too_long, limits).is_err());
     }
 
     #[test]
@@ -354,7 +472,7 @@ mod tests {
             file_id,
             7,
             3,
-            ObjectKey::new("private/v1/manifests/base").unwrap(),
+            ObjectKey::new("private/v2/manifests/base").unwrap(),
             Digest::new([4; 32]),
             StorageMethod::Raw,
         )
@@ -366,7 +484,7 @@ mod tests {
             file_id,
             8,
             3,
-            ObjectKey::new("private/v1/manifests/other").unwrap(),
+            ObjectKey::new("private/v2/manifests/other").unwrap(),
             Digest::new([5; 32]),
             StorageMethod::Raw,
         )
@@ -400,5 +518,19 @@ mod tests {
             .unwrap();
         keys.validate_block_payload(file_id, 7, &keys.block_payload(file_id, identity, 3, 7))
             .unwrap();
+        keys.validate_map_page(
+            file_id,
+            2,
+            16_384,
+            &keys.map_page(file_id, identity, 3, 2, 16_384),
+        )
+        .unwrap();
+        assert_eq!(
+            keys.parse_manifest(
+                file_id,
+                &ObjectKey::new("private/v1/manifests/old-development-data").unwrap(),
+            ),
+            Err(CorruptionError::InvalidKeySchema)
+        );
     }
 }

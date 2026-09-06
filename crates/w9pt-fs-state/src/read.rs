@@ -218,6 +218,8 @@ pub struct XattrCursor {
 pub enum ScanResume {
     /// Last inode returned.
     Inode(InodeId),
+    /// Last content file identity returned.
+    ContentMetadata(w9pt_fs_storage::FileId),
     /// Last directory cookie returned.
     DirectoryEntry(DirectoryCookie),
     /// Last open returned.
@@ -243,6 +245,7 @@ impl ScanResume {
     pub const fn family(&self) -> RecordFamily {
         match self {
             Self::Inode(_) => RecordFamily::Inode,
+            Self::ContentMetadata(_) => RecordFamily::ContentMetadata,
             Self::DirectoryEntry(_) => RecordFamily::DirectoryEntry,
             Self::Open(_) => RecordFamily::Open,
             Self::OpenPin(_) => RecordFamily::OpenPin,
@@ -263,6 +266,13 @@ pub enum RecordScan {
     Inodes {
         /// Exclusive resume identity.
         after: Option<InodeId>,
+        /// Page bounds.
+        bounds: ScanBounds,
+    },
+    /// Content metadata in stable content-file identity order.
+    ContentMetadata {
+        /// Exclusive resume identity.
+        after: Option<w9pt_fs_storage::FileId>,
         /// Page bounds.
         bounds: ScanBounds,
     },
@@ -338,6 +348,7 @@ impl RecordScan {
     pub const fn family(&self) -> RecordFamily {
         match self {
             Self::Inodes { .. } => RecordFamily::Inode,
+            Self::ContentMetadata { .. } => RecordFamily::ContentMetadata,
             Self::DirectoryEntries { .. } => RecordFamily::DirectoryEntry,
             Self::Opens { .. } => RecordFamily::Open,
             Self::OpenPins { .. } => RecordFamily::OpenPin,
@@ -354,6 +365,7 @@ impl RecordScan {
     pub const fn bounds(&self) -> ScanBounds {
         match self {
             Self::Inodes { bounds, .. }
+            | Self::ContentMetadata { bounds, .. }
             | Self::DirectoryEntries { bounds, .. }
             | Self::Opens { bounds, .. }
             | Self::OpenPins { bounds, .. }
@@ -374,6 +386,10 @@ pub enum ReadQuery {
     Filesystem,
     /// Read one inode.
     Inode(InodeId),
+    /// Read one content metadata record by storage file identity.
+    ContentMetadata(w9pt_fs_storage::FileId),
+    /// Read a regular inode and its selected context from one snapshot.
+    InodeWithContentMetadata(InodeId),
     /// Read one inode by its per-filesystem stable QID path.
     InodeByQidPath(QidPath),
     /// Read one directory component.
@@ -437,6 +453,10 @@ impl ReadQuery {
         match self {
             Self::Filesystem => Some(RecordKey::Filesystem(filesystem_id)),
             Self::Inode(inode_id) => Some(RecordKey::Inode(filesystem_id, *inode_id)),
+            Self::ContentMetadata(file_id) => {
+                Some(RecordKey::ContentMetadata(filesystem_id, *file_id))
+            }
+            Self::InodeWithContentMetadata(_) => None,
             Self::InodeByQidPath(_) => None,
             Self::DirectoryEntry {
                 parent_inode_id,
@@ -713,6 +733,13 @@ fn scan_cursor(scan: &RecordScan, key: &RecordKey, record: &StateRecord) -> Opti
             StateRecord::Inode(_),
         ) if after.is_none_or(|cursor| *inode_id > cursor) => Some(ScanResume::Inode(*inode_id)),
         (
+            RecordScan::ContentMetadata { after, .. },
+            RecordKey::ContentMetadata(_, file_id),
+            StateRecord::ContentMetadata(_),
+        ) if after.is_none_or(|cursor| *file_id > cursor) => {
+            Some(ScanResume::ContentMetadata(*file_id))
+        }
+        (
             RecordScan::DirectoryEntries {
                 parent_inode_id,
                 after,
@@ -810,6 +837,15 @@ pub enum ReadResult {
         /// Present checked inode, or `None` when absent in this filesystem.
         inode: Option<Box<InodeRecord>>,
     },
+    /// Composite regular inode/context result from one authoritative snapshot.
+    InodeWithContentMetadata {
+        /// Exact requested inode identity.
+        inode_id: InodeId,
+        /// Present inode, or `None` when absent.
+        inode: Option<Box<InodeRecord>>,
+        /// Matching selected context, absent with a missing/unbound inode.
+        metadata: Option<Box<crate::ContentMetadataRecord>>,
+    },
     /// One-revision semantic directory page.
     DirectoryPage(DirectoryPage),
     /// Fixed-size authoritative open-pin count.
@@ -895,6 +931,23 @@ impl StateSnapshot {
                         }
                     }
                 }
+                (
+                    ReadQuery::InodeWithContentMetadata(expected),
+                    ReadResult::InodeWithContentMetadata {
+                        inode_id,
+                        inode,
+                        metadata,
+                    },
+                ) if expected == inode_id => match (inode, metadata) {
+                    (None, None) => {}
+                    (Some(inode), Some(metadata))
+                        if inode.inode_id() == *inode_id
+                            && inode.content_file_id() == Some(metadata.content_file_id())
+                            && inode.content_context_id() == Some(metadata.context_id())
+                            && inode.revision().get() <= revision.get()
+                            && metadata.revision().get() <= revision.get() => {}
+                    _ => return Err(InvalidStateSnapshot::UnexpectedResult { index }),
+                },
                 (query, ReadResult::Point { key, record })
                     if query.point_key(batch.filesystem_id).as_ref() == Some(key) =>
                 {

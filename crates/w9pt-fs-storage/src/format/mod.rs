@@ -1,5 +1,6 @@
 //! Checked versioned persistent-object encoding.
 
+mod block_map;
 mod envelope;
 mod head;
 mod manifest;
@@ -9,9 +10,7 @@ use core::fmt;
 
 pub use envelope::{Envelope, ObjectKind, decode_envelope, encode_envelope};
 pub use head::{FileHead, decode_head, encode_head};
-pub use manifest::{
-    BlobRef, BlockEntry, FileManifest, ManifestLayout, decode_manifest, encode_manifest,
-};
+pub use manifest::{BlobRef, FileManifest, ManifestLayout, decode_manifest, encode_manifest};
 pub(crate) use primitives::{Reader, Writer};
 
 use crate::{CorruptionError, FormatError, LimitError};
@@ -56,3 +55,7 @@ impl From<LimitError> for PersistentFormatError {
         Self::Limit(error)
     }
 }
+pub use block_map::{
+    BlockMapPage, BranchEntry, LeafEntry, PageRef, aligned_page_start, decode_block_map_page,
+    encode_block_map_page, minimum_root_level, page_coverage, page_slot, validate_page_context,
+};

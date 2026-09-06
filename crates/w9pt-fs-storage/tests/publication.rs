@@ -1,8 +1,8 @@
 #![allow(missing_docs)]
 
 use w9pt_fs_storage::{
-    ConflictError, ContentRepository, CreationDefaults, FileId, MutationId, Publication,
-    PublishedContent, StorageError, StorageLimitValues, StorageLimits, StorageMethod,
+    BLOCK_SIZE, ConflictError, ContentRepository, CreationDefaults, FileId, MutationId,
+    Publication, PublishedContent, StorageError, StorageLimitValues, StorageLimits, StorageMethod,
     testing::{MemoryTarget, block_on},
 };
 
@@ -158,4 +158,55 @@ fn repeated_conflicts_stop_at_the_configured_bound() {
         result,
         Err(StorageError::Conflict(ConflictError { conflicts: 2 }))
     ));
+}
+
+#[test]
+fn independent_clients_reprepare_disjoint_writes_across_branch_pages() {
+    let target = MemoryTarget::new();
+    let writer_a = repository(target.clone(), 3);
+    let writer_b = repository(target.clone(), 3);
+    let observer = repository(target, 3);
+    let file_id = FileId::from_u128(20);
+    let initial = create_published(&writer_a, file_id, b"");
+    let mut interfere = Some(initial);
+    let a_mutation = MutationId::from_u128(21);
+    let b_mutation = MutationId::from_u128(22);
+    let a_offset = u64::from(BLOCK_SIZE) * 127;
+    let b_offset = u64::from(BLOCK_SIZE) * 16_384;
+
+    let published = block_on(writer_b.publisher().mutate_rebased(
+        file_id,
+        b_mutation,
+        move |repository, base, attempt| {
+            let writer_a = writer_a.clone();
+            let current_for_a = if attempt == 0 { interfere.take() } else { None };
+            async move {
+                let prepared_b = repository
+                    .prepare_write(&base, b_mutation, attempt, b_offset, b"B")
+                    .await?;
+                if let Some(current) = current_for_a {
+                    let prepared_a = writer_a
+                        .prepare_write(current.content(), a_mutation, 0, a_offset, b"A")
+                        .await?;
+                    assert!(matches!(
+                        writer_a
+                            .publisher()
+                            .replace(&current, a_mutation, &prepared_a)
+                            .await?,
+                        Publication::Published(_)
+                    ));
+                }
+                Ok(prepared_b)
+            }
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        block_on(observer.read(published.content(), a_offset, 1)).unwrap(),
+        b"A"
+    );
+    assert_eq!(
+        block_on(observer.read(published.content(), b_offset, 1)).unwrap(),
+        b"B"
+    );
 }

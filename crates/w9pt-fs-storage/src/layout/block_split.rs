@@ -1,17 +1,22 @@
-//! Sparse fixed-size block-split layout.
+//! Sparse fixed-size block-split layout over immutable radix mapping pages.
 
 use std::collections::BTreeMap;
 
 use crate::{
-    BLOCK_SIZE_V1, ContentRef, ContentRepository, Digest, FileId, FormatError, LimitError,
-    LimitKind, MutationId, PreparationIdentity, PreparedContent, StorageError, StorageMethod,
-    TargetStore,
-    format::{BlobRef, BlockEntry, FileManifest, ManifestLayout, encode_manifest},
+    BLOCK_SIZE, ContentRef, ContentRepository, Digest, FileCryptoContext, FileId, FormatError,
+    LimitError, LimitKind, MutationId, PreparationIdentity, PreparedContent, StorageError,
+    StorageMethod, TargetStore,
+    format::{BlobRef, FileManifest, ManifestLayout, PageRef, encode_manifest, minimum_root_level},
     layout::{BlockSpans, LogicalRange},
+};
+
+use super::block_map::{
+    MapBudget, MapCursor, RewriteMode, highest_old_excluding, retained_summary, rewrite_tree,
 };
 
 pub(crate) async fn create<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     mutation_id: MutationId,
     attempt: u32,
@@ -19,43 +24,12 @@ pub(crate) async fn create<S: TargetStore>(
 ) -> Result<PreparedContent, StorageError<S::Error>> {
     let identity = PreparationIdentity::for_create(mutation_id, StorageMethod::BlockSplit, bytes)?;
     check_write_bound(repository, bytes.len())?;
-    let logical_size =
-        u64::try_from(bytes.len()).map_err(|_| crate::RangeError::LengthConversion)?;
-    let nonzero_blocks = bytes
-        .chunks(BLOCK_SIZE_V1 as usize)
-        .filter(|chunk| chunk.iter().any(|byte| *byte != 0))
-        .count();
-    check_block_count(repository, nonzero_blocks)?;
-
-    let mut blocks = Vec::with_capacity(nonzero_blocks);
-    let mut stores = Vec::with_capacity(nonzero_blocks);
-    for (index, chunk) in bytes.chunks(BLOCK_SIZE_V1 as usize).enumerate() {
-        if chunk.iter().all(|byte| *byte == 0) {
-            continue;
-        }
-        let mut canonical = vec![0; BLOCK_SIZE_V1 as usize];
-        canonical[..chunk.len()].copy_from_slice(chunk);
-        let index = u64::try_from(index).map_err(|_| FormatError::ArithmeticOverflow {
-            field: "block index",
-        })?;
-        let blob = expected_block_blob(repository, file_id, identity, attempt, index, &canonical);
-        blocks.push(BlockEntry::new(index, blob));
-        stores.push((index, canonical));
-    }
-    let manifest = FileManifest::block_split(file_id, 1, logical_size, blocks);
-    encode_manifest(&manifest, repository.limits()).map_err(StorageError::from)?;
-    for (index, canonical) in stores {
-        repository
-            .store_block_payload(file_id, identity, attempt, index, &canonical)
-            .await?;
-    }
-    repository
-        .prepare_manifest(&manifest, identity, attempt, true)
-        .await
+    prepare_new_write(repository, context, file_id, identity, attempt, 0, bytes).await
 }
 
 pub(crate) async fn read<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     manifest: &FileManifest,
     offset: u64,
     length: usize,
@@ -68,47 +42,42 @@ pub(crate) async fn read<S: TargetStore>(
     if range.is_empty() {
         return Ok(output);
     }
-    let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
-        return Err(FormatError::NonCanonical {
-            field: "block-split layout",
-        }
-        .into());
-    };
-
+    let root = block_root(manifest)?;
+    let mut budget = MapBudget::new(repository.limits(), 0)?;
+    let mut cursor = MapCursor::new(repository, context, manifest.file_id(), root);
     for span in BlockSpans::new(range)? {
-        let Ok(position) = blocks.binary_search_by_key(&span.block_index(), BlockEntry::index)
-        else {
+        let Some(blob) = cursor.lookup(span.block_index(), &mut budget).await? else {
             continue;
         };
-        let block = repository.load_payload(blocks[position].blob()).await?;
-        if block.len() != BLOCK_SIZE_V1 as usize {
-            return Err(crate::CorruptionError::InvalidLength {
-                field: "block plaintext",
-                expected: u64::from(BLOCK_SIZE_V1),
-                actual: u64::try_from(block.len()).unwrap_or(u64::MAX),
-            }
-            .into());
-        }
+        let block = repository.load_payload(context, &blob).await?;
+        validate_block_length(&block)?;
         validate_final_padding(manifest, span.block_index(), &block)?;
-        let source_start = span.within_block() as usize;
-        let span_len = span.len() as usize;
-        let source_end = source_start + span_len;
-        let destination_start = span.buffer_offset();
-        let destination_end = destination_start + span_len;
-        output[destination_start..destination_end]
+        let source_start = usize::try_from(span.within_block())
+            .map_err(|_| crate::RangeError::LengthConversion)?;
+        let span_len =
+            usize::try_from(span.len()).map_err(|_| crate::RangeError::LengthConversion)?;
+        let source_end =
+            source_start
+                .checked_add(span_len)
+                .ok_or(FormatError::ArithmeticOverflow {
+                    field: "block read range",
+                })?;
+        let destination_end =
+            span.buffer_offset()
+                .checked_add(span_len)
+                .ok_or(FormatError::ArithmeticOverflow {
+                    field: "read output range",
+                })?;
+        output[span.buffer_offset()..destination_end]
             .copy_from_slice(&block[source_start..source_end]);
     }
     Ok(output)
 }
 
-enum PlannedBlock {
-    Hole,
-    Reuse(BlobRef),
-    Store(Vec<u8>),
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     base: &ContentRef,
     manifest: &FileManifest,
     mutation_id: MutationId,
@@ -120,142 +89,127 @@ pub(crate) async fn write<S: TargetStore>(
     check_write_bound(repository, data.len())?;
     let range = LogicalRange::from_usize(offset, data.len())?;
     if data.is_empty() {
-        return Ok(PreparedContent::new(base.clone(), false, identity, attempt));
+        return Ok(PreparedContent::new(
+            base.clone(),
+            false,
+            identity,
+            attempt,
+            context.binding().clone(),
+        ));
     }
-    let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
-        return Err(FormatError::NonCanonical {
-            field: "block-split layout",
-        }
-        .into());
+    let root = block_root(manifest)?;
+    let update_bound = block_span_count(range)?;
+    let mut budget = MapBudget::new(repository.limits(), update_bound)?;
+    let preflight = plan_write_pass(
+        repository,
+        context,
+        manifest,
+        root,
+        identity,
+        attempt,
+        range,
+        data,
+        &mut budget,
+        false,
+    )
+    .await?;
+    if !preflight.content_changed {
+        return Ok(PreparedContent::new(
+            base.clone(),
+            false,
+            identity,
+            attempt,
+            context.binding().clone(),
+        ));
+    }
+    let preflight_count = preflight.materialized_count;
+    let preflight_highest = preflight.highest;
+    check_materialized_count(repository, preflight_count)?;
+    let desired_level = preflight_highest.map(minimum_root_level).transpose()?;
+    let preflight_root = if let Some(level) = desired_level {
+        rewrite_tree(
+            repository,
+            context,
+            manifest.file_id(),
+            root,
+            &preflight.updates,
+            None,
+            level,
+            identity,
+            attempt,
+            &mut budget,
+            RewriteMode::Preflight,
+        )
+        .await?
+    } else {
+        None
     };
-    let old_blocks = blocks
-        .iter()
-        .map(|entry| (entry.index(), entry.blob().clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut planned = BTreeMap::<u64, PlannedBlock>::new();
-    let mut content_changed = range.end() > manifest.logical_size();
-
-    for span in BlockSpans::new(range)? {
-        let old = old_blocks.get(&span.block_index());
-        let input_start = span.buffer_offset();
-        let input_end = input_start + span.len() as usize;
-        let mut block = if span.is_full_block() {
-            data[input_start..input_end].to_vec()
-        } else if let Some(old) = old {
-            let block = repository.load_payload(old).await?;
-            validate_final_padding(manifest, span.block_index(), &block)?;
-            block
-        } else {
-            vec![0; BLOCK_SIZE_V1 as usize]
-        };
-        if block.len() != BLOCK_SIZE_V1 as usize {
-            return Err(crate::CorruptionError::InvalidLength {
-                field: "block plaintext",
-                expected: u64::from(BLOCK_SIZE_V1),
-                actual: u64::try_from(block.len()).unwrap_or(u64::MAX),
-            }
-            .into());
-        }
-        if !span.is_full_block() {
-            let block_start = span.within_block() as usize;
-            let block_end = block_start + span.len() as usize;
-            block[block_start..block_end].copy_from_slice(&data[input_start..input_end]);
-        }
-
-        let plan = if block.iter().all(|byte| *byte == 0) {
-            if old.is_some() {
-                content_changed = true;
-            }
-            PlannedBlock::Hole
-        } else {
-            let digest = Digest::blake3(&block);
-            if let Some(old) = old.filter(|old| old.digest() == digest) {
-                PlannedBlock::Reuse(old.clone())
-            } else {
-                content_changed = true;
-                PlannedBlock::Store(block)
-            }
-        };
-        planned.insert(span.block_index(), plan);
-    }
-
-    let removed = planned
-        .iter()
-        .filter(|(index, plan)| {
-            old_blocks.contains_key(index) && matches!(plan, PlannedBlock::Hole)
-        })
-        .count();
-    let added = planned
-        .iter()
-        .filter(|(index, plan)| {
-            !old_blocks.contains_key(index) && !matches!(plan, PlannedBlock::Hole)
-        })
-        .count();
-    let result_count = old_blocks
-        .len()
-        .checked_sub(removed)
-        .and_then(|count| count.checked_add(added))
-        .ok_or(FormatError::ArithmeticOverflow {
-            field: "block entry count",
-        })?;
-    check_block_count(repository, result_count)?;
-
-    if !content_changed {
-        return Ok(PreparedContent::new(base.clone(), false, identity, attempt));
-    }
-    let mut result_blocks = old_blocks;
-    let mut stores = Vec::<(u64, Vec<u8>)>::new();
-    for (index, plan) in planned {
-        match plan {
-            PlannedBlock::Hole => {
-                result_blocks.remove(&index);
-            }
-            PlannedBlock::Reuse(blob) => {
-                result_blocks.insert(index, blob);
-            }
-            PlannedBlock::Store(block) => {
-                let blob = expected_block_blob(
-                    repository,
-                    manifest.file_id(),
-                    identity,
-                    attempt,
-                    index,
-                    &block,
-                );
-                result_blocks.insert(index, blob);
-                stores.push((index, block));
-            }
-        }
-    }
-    let generation =
-        manifest
-            .generation()
-            .checked_add(1)
-            .ok_or(FormatError::ArithmeticOverflow {
-                field: "content generation",
-            })?;
-    let result_manifest = FileManifest::block_split(
+    validate_root_summary(&preflight_root, preflight_count, preflight_highest)?;
+    let logical_size = manifest.logical_size().max(range.end());
+    let generation = next_generation(manifest)?;
+    let expected_manifest = FileManifest::block_split(
         manifest.file_id(),
         generation,
-        manifest.logical_size().max(range.end()),
-        result_blocks
-            .into_iter()
-            .map(|(index, blob)| BlockEntry::new(index, blob))
-            .collect(),
+        logical_size,
+        preflight_root.clone(),
     );
-    encode_manifest(&result_manifest, repository.limits()).map_err(StorageError::from)?;
-    for (index, block) in stores {
-        repository
-            .store_block_payload(manifest.file_id(), identity, attempt, index, &block)
-            .await?;
+    encode_manifest(&expected_manifest, repository.limits()).map_err(StorageError::from)?;
+    drop(preflight);
+    budget.reserve_replay()?;
+
+    let prepared = plan_write_pass(
+        repository,
+        context,
+        manifest,
+        root,
+        identity,
+        attempt,
+        range,
+        data,
+        &mut budget,
+        true,
+    )
+    .await?;
+    if prepared.materialized_count != preflight_count || prepared.highest != preflight_highest {
+        return Err(crate::CorruptionError::IdentityMismatch {
+            field: "write preflight",
+        }
+        .into());
     }
+    let actual_root = if let Some(level) = desired_level {
+        rewrite_tree(
+            repository,
+            context,
+            manifest.file_id(),
+            root,
+            &prepared.updates,
+            None,
+            level,
+            identity,
+            attempt,
+            &mut budget,
+            RewriteMode::Store,
+        )
+        .await?
+    } else {
+        None
+    };
+    if actual_root != preflight_root {
+        return Err(crate::CorruptionError::IdentityMismatch {
+            field: "write map replay",
+        }
+        .into());
+    }
+    let result_manifest =
+        FileManifest::block_split(manifest.file_id(), generation, logical_size, actual_root);
     repository
-        .prepare_manifest(&result_manifest, identity, attempt, true)
+        .prepare_manifest(context, &result_manifest, identity, attempt, true)
         .await
 }
 
 pub(crate) async fn write_from_new<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     mutation_id: MutationId,
     attempt: u32,
@@ -269,42 +223,287 @@ pub(crate) async fn write_from_new<S: TargetStore>(
         data,
     )?;
     check_write_bound(repository, data.len())?;
+    prepare_new_write(
+        repository, context, file_id, identity, attempt, offset, data,
+    )
+    .await
+}
+
+async fn prepare_new_write<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
+    file_id: FileId,
+    identity: PreparationIdentity,
+    attempt: u32,
+    offset: u64,
+    data: &[u8],
+) -> Result<PreparedContent, StorageError<S::Error>> {
     let range = LogicalRange::from_usize(offset, data.len())?;
     let logical_size = if data.is_empty() { 0 } else { range.end() };
-    let mut blocks = Vec::new();
-    let mut stores = Vec::new();
-    if !data.is_empty() {
-        for span in BlockSpans::new(range)? {
-            let input_start = span.buffer_offset();
-            let input_end = input_start + span.len() as usize;
-            let mut block = vec![0; BLOCK_SIZE_V1 as usize];
-            let block_start = span.within_block() as usize;
-            let block_end = block_start + span.len() as usize;
-            block[block_start..block_end].copy_from_slice(&data[input_start..input_end]);
-            if block.iter().all(|byte| *byte == 0) {
-                continue;
+    let empty_manifest = FileManifest::block_split(file_id, 1, 0, None);
+    let update_bound = block_span_count(range)?;
+    let mut budget = MapBudget::new(repository.limits(), update_bound)?;
+    let preflight = plan_write_pass(
+        repository,
+        context,
+        &empty_manifest,
+        None,
+        identity,
+        attempt,
+        range,
+        data,
+        &mut budget,
+        false,
+    )
+    .await?;
+    let preflight_count = preflight.materialized_count;
+    let preflight_highest = preflight.highest;
+    check_materialized_count(repository, preflight_count)?;
+    let desired_level = preflight_highest.map(minimum_root_level).transpose()?;
+    let preflight_root = if let Some(level) = desired_level {
+        rewrite_tree(
+            repository,
+            context,
+            file_id,
+            None,
+            &preflight.updates,
+            None,
+            level,
+            identity,
+            attempt,
+            &mut budget,
+            RewriteMode::Preflight,
+        )
+        .await?
+    } else {
+        None
+    };
+    validate_root_summary(&preflight_root, preflight_count, preflight_highest)?;
+    let expected_manifest =
+        FileManifest::block_split(file_id, 1, logical_size, preflight_root.clone());
+    encode_manifest(&expected_manifest, repository.limits()).map_err(StorageError::from)?;
+    drop(preflight);
+    budget.reserve_replay()?;
+
+    let prepared = plan_write_pass(
+        repository,
+        context,
+        &empty_manifest,
+        None,
+        identity,
+        attempt,
+        range,
+        data,
+        &mut budget,
+        true,
+    )
+    .await?;
+    if prepared.materialized_count != preflight_count || prepared.highest != preflight_highest {
+        return Err(crate::CorruptionError::IdentityMismatch {
+            field: "new write preflight",
+        }
+        .into());
+    }
+    let actual_root = if let Some(level) = desired_level {
+        rewrite_tree(
+            repository,
+            context,
+            file_id,
+            None,
+            &prepared.updates,
+            None,
+            level,
+            identity,
+            attempt,
+            &mut budget,
+            RewriteMode::Store,
+        )
+        .await?
+    } else {
+        None
+    };
+    if actual_root != preflight_root {
+        return Err(crate::CorruptionError::IdentityMismatch {
+            field: "new write map replay",
+        }
+        .into());
+    }
+    let manifest = FileManifest::block_split(file_id, 1, logical_size, actual_root);
+    repository
+        .prepare_manifest(context, &manifest, identity, attempt, true)
+        .await
+}
+
+struct WritePlan {
+    updates: BTreeMap<u64, Option<BlobRef>>,
+    materialized_count: u64,
+    highest: Option<u64>,
+    content_changed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_write_pass<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
+    manifest: &FileManifest,
+    root: Option<&PageRef>,
+    identity: PreparationIdentity,
+    attempt: u32,
+    range: LogicalRange,
+    data: &[u8],
+    budget: &mut MapBudget,
+    store_payloads: bool,
+) -> Result<WritePlan, StorageError<S::Error>> {
+    let mut updates = BTreeMap::new();
+    let mut cursor = MapCursor::new(repository, context, manifest.file_id(), root);
+    verify_distant_partial_tail(repository, context, manifest, range, &mut cursor, budget).await?;
+    let mut materialized_count = root.map_or(0, PageRef::materialized_block_count);
+    let mut content_changed = range.end() > manifest.logical_size();
+    for span in BlockSpans::new(range)? {
+        let old = cursor.lookup(span.block_index(), budget).await?;
+        let input_start = span.buffer_offset();
+        let input_end = input_start
+            .checked_add(
+                usize::try_from(span.len()).map_err(|_| crate::RangeError::LengthConversion)?,
+            )
+            .ok_or(FormatError::ArithmeticOverflow {
+                field: "write input range",
+            })?;
+        let mut block = if span.is_full_block() {
+            data[input_start..input_end].to_vec()
+        } else if let Some(old) = &old {
+            let block = repository.load_payload(context, old).await?;
+            validate_block_length(&block)?;
+            validate_final_padding(manifest, span.block_index(), &block)?;
+            block
+        } else {
+            vec![0; BLOCK_SIZE as usize]
+        };
+        validate_block_length(&block)?;
+        if !span.is_full_block() {
+            let start = usize::try_from(span.within_block())
+                .map_err(|_| crate::RangeError::LengthConversion)?;
+            let end = start
+                .checked_add(
+                    usize::try_from(span.len()).map_err(|_| crate::RangeError::LengthConversion)?,
+                )
+                .ok_or(FormatError::ArithmeticOverflow {
+                    field: "block write range",
+                })?;
+            block[start..end].copy_from_slice(&data[input_start..input_end]);
+        }
+        let replacement = if block.iter().all(|byte| *byte == 0) {
+            None
+        } else if old
+            .as_ref()
+            .is_some_and(|old| old.digest() == Digest::blake3(&block))
+        {
+            old.clone()
+        } else if store_payloads {
+            Some(
+                repository
+                    .store_block_payload(
+                        context,
+                        manifest.file_id(),
+                        identity,
+                        attempt,
+                        span.block_index(),
+                        &block,
+                    )
+                    .await?,
+            )
+        } else {
+            Some(expected_block_blob(
+                repository,
+                context,
+                manifest.file_id(),
+                identity,
+                attempt,
+                span.block_index(),
+                &block,
+            )?)
+        };
+        if replacement != old {
+            content_changed = true;
+            match (old.is_some(), replacement.is_some()) {
+                (false, true) => {
+                    materialized_count = materialized_count.checked_add(1).ok_or(
+                        FormatError::ArithmeticOverflow {
+                            field: "materialized block count",
+                        },
+                    )?
+                }
+                (true, false) => {
+                    materialized_count = materialized_count.checked_sub(1).ok_or(
+                        FormatError::ArithmeticOverflow {
+                            field: "materialized block count",
+                        },
+                    )?
+                }
+                _ => {}
             }
-            let index = span.block_index();
-            let blob = expected_block_blob(repository, file_id, identity, attempt, index, &block);
-            blocks.push(BlockEntry::new(index, blob));
-            stores.push((index, block));
+            updates.insert(span.block_index(), replacement);
         }
     }
-    check_block_count(repository, blocks.len())?;
-    let manifest = FileManifest::block_split(file_id, 1, logical_size, blocks);
-    encode_manifest(&manifest, repository.limits()).map_err(StorageError::from)?;
-    for (index, block) in stores {
-        repository
-            .store_block_payload(file_id, identity, attempt, index, &block)
-            .await?;
+    let old_highest = highest_old_excluding(
+        repository,
+        context,
+        manifest.file_id(),
+        root,
+        &updates,
+        budget,
+    )
+    .await?;
+    let new_highest = updates
+        .iter()
+        .rev()
+        .find_map(|(index, value)| value.as_ref().map(|_| *index));
+    Ok(WritePlan {
+        updates,
+        materialized_count,
+        highest: match (old_highest, new_highest) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (old, new) => old.or(new),
+        },
+        content_changed,
+    })
+}
+
+async fn verify_distant_partial_tail<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
+    manifest: &FileManifest,
+    range: LogicalRange,
+    cursor: &mut MapCursor<'_, S>,
+    budget: &mut MapBudget,
+) -> Result<(), StorageError<S::Error>> {
+    let block_size = u64::from(BLOCK_SIZE);
+    if range.end() <= manifest.logical_size() || manifest.logical_size().is_multiple_of(block_size)
+    {
+        return Ok(());
     }
-    repository
-        .prepare_manifest(&manifest, identity, attempt, true)
-        .await
+    let final_index = manifest.logical_size() / block_size;
+    let final_start = final_index * block_size;
+    let final_end = final_start
+        .checked_add(block_size)
+        .ok_or(FormatError::ArithmeticOverflow {
+            field: "old final block",
+        })?;
+    let touches = range.start() < final_end && range.end() > final_start;
+    if touches {
+        return Ok(());
+    }
+    if let Some(blob) = cursor.lookup(final_index, budget).await? {
+        let block = repository.load_payload(context, &blob).await?;
+        validate_block_length(&block)?;
+        validate_final_padding(manifest, final_index, &block)?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn truncate<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     base: &ContentRef,
     manifest: &FileManifest,
     mutation_id: MutationId,
@@ -313,100 +512,239 @@ pub(crate) async fn truncate<S: TargetStore>(
 ) -> Result<PreparedContent, StorageError<S::Error>> {
     let identity = PreparationIdentity::for_truncate(mutation_id, base, logical_size);
     if logical_size == manifest.logical_size() {
-        return Ok(PreparedContent::new(base.clone(), false, identity, attempt));
+        return Ok(PreparedContent::new(
+            base.clone(),
+            false,
+            identity,
+            attempt,
+            context.binding().clone(),
+        ));
     }
-    let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
-        return Err(FormatError::NonCanonical {
-            field: "block-split layout",
-        }
-        .into());
-    };
-    let mut result = blocks
-        .iter()
-        .map(|entry| (entry.index(), entry.blob().clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut tail_store = None::<(u64, Vec<u8>)>;
-    let block_size = u64::from(BLOCK_SIZE_V1);
-    let old_final_index = manifest.logical_size() / block_size;
-    let old_final_block = if !manifest.logical_size().is_multiple_of(block_size) {
-        if let Some(old) = result.get(&old_final_index) {
-            let block = repository.load_payload(old).await?;
-            validate_block_length(&block)?;
-            validate_final_padding(manifest, old_final_index, &block)?;
-            Some((old_final_index, block))
+    let root = block_root(manifest)?;
+    let mut budget = MapBudget::new(repository.limits(), 1)?;
+    let preflight = plan_truncate_pass(
+        repository,
+        context,
+        manifest,
+        root,
+        identity,
+        attempt,
+        logical_size,
+        &mut budget,
+        false,
+    )
+    .await?;
+    let preflight_count = preflight.materialized_count;
+    let preflight_highest = preflight.highest;
+    check_materialized_count(repository, preflight_count)?;
+    let desired_level = preflight_highest.map(minimum_root_level).transpose()?;
+    let preflight_root = if logical_size < manifest.logical_size() {
+        if let Some(level) = desired_level {
+            rewrite_tree(
+                repository,
+                context,
+                manifest.file_id(),
+                root,
+                &preflight.updates,
+                Some(visible_blocks(logical_size)),
+                level,
+                identity,
+                attempt,
+                &mut budget,
+                RewriteMode::Preflight,
+            )
+            .await?
         } else {
             None
         }
     } else {
-        None
+        root.cloned()
     };
+    validate_root_summary(&preflight_root, preflight_count, preflight_highest)?;
+    let generation = next_generation(manifest)?;
+    let expected_manifest = FileManifest::block_split(
+        manifest.file_id(),
+        generation,
+        logical_size,
+        preflight_root.clone(),
+    );
+    encode_manifest(&expected_manifest, repository.limits()).map_err(StorageError::from)?;
+    drop(preflight);
+    budget.reserve_replay()?;
 
-    if logical_size < manifest.logical_size() {
-        let first_discarded =
-            logical_size / block_size + u64::from(!logical_size.is_multiple_of(block_size));
-        result.retain(|index, _| *index < first_discarded);
+    let prepared = plan_truncate_pass(
+        repository,
+        context,
+        manifest,
+        root,
+        identity,
+        attempt,
+        logical_size,
+        &mut budget,
+        true,
+    )
+    .await?;
+    if prepared.materialized_count != preflight_count || prepared.highest != preflight_highest {
+        return Err(crate::CorruptionError::IdentityMismatch {
+            field: "truncate preflight",
+        }
+        .into());
+    }
+    let actual_root = if logical_size < manifest.logical_size() {
+        if let Some(level) = desired_level {
+            rewrite_tree(
+                repository,
+                context,
+                manifest.file_id(),
+                root,
+                &prepared.updates,
+                Some(visible_blocks(logical_size)),
+                level,
+                identity,
+                attempt,
+                &mut budget,
+                RewriteMode::Store,
+            )
+            .await?
+        } else {
+            None
+        }
+    } else {
+        root.cloned()
+    };
+    if actual_root != preflight_root {
+        return Err(crate::CorruptionError::IdentityMismatch {
+            field: "truncate map replay",
+        }
+        .into());
+    }
+    let result_manifest =
+        FileManifest::block_split(manifest.file_id(), generation, logical_size, actual_root);
+    repository
+        .prepare_manifest(context, &result_manifest, identity, attempt, true)
+        .await
+}
 
-        let visible_tail = logical_size % block_size;
+struct TruncatePlan {
+    updates: BTreeMap<u64, Option<BlobRef>>,
+    materialized_count: u64,
+    highest: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_truncate_pass<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
+    manifest: &FileManifest,
+    root: Option<&PageRef>,
+    identity: PreparationIdentity,
+    attempt: u32,
+    logical_size: u64,
+    budget: &mut MapBudget,
+    store_payloads: bool,
+) -> Result<TruncatePlan, StorageError<S::Error>> {
+    let block_size = u64::from(BLOCK_SIZE);
+    let mut updates = BTreeMap::new();
+    if logical_size > manifest.logical_size() {
+        if !manifest.logical_size().is_multiple_of(block_size) {
+            let index = manifest.logical_size() / block_size;
+            let mut cursor = MapCursor::new(repository, context, manifest.file_id(), root);
+            if let Some(blob) = cursor.lookup(index, budget).await? {
+                let block = repository.load_payload(context, &blob).await?;
+                validate_block_length(&block)?;
+                validate_final_padding(manifest, index, &block)?;
+            }
+        }
+        return Ok(TruncatePlan {
+            updates,
+            materialized_count: root.map_or(0, PageRef::materialized_block_count),
+            highest: root.map(PageRef::highest_materialized_block),
+        });
+    }
+
+    let cutoff = visible_blocks(logical_size);
+    let summary = retained_summary(
+        repository,
+        context,
+        manifest.file_id(),
+        root,
+        cutoff,
+        budget,
+    )
+    .await?;
+    let mut materialized_count = summary.map_or(0, |(count, _)| count);
+    let mut highest = summary.map(|(_, highest)| highest);
+    let visible_tail = logical_size % block_size;
+    if visible_tail != 0 {
         let final_index = logical_size / block_size;
-        if visible_tail != 0
-            && let Some(old) = result.get(&final_index).cloned()
-        {
-            let mut block = match &old_final_block {
-                Some((index, block)) if *index == final_index => block.clone(),
-                _ => repository.load_payload(&old).await?,
-            };
+        let mut cursor = MapCursor::new(repository, context, manifest.file_id(), root);
+        if let Some(old) = cursor.lookup(final_index, budget).await? {
+            let mut block = repository.load_payload(context, &old).await?;
             validate_block_length(&block)?;
             validate_final_padding(manifest, final_index, &block)?;
             let tail =
                 usize::try_from(visible_tail).map_err(|_| crate::RangeError::LengthConversion)?;
             block[tail..].fill(0);
-            if block.iter().all(|byte| *byte == 0) {
-                result.remove(&final_index);
-            } else if Digest::blake3(&block) != old.digest() {
-                let blob = expected_block_blob(
+            let replacement = if block.iter().all(|byte| *byte == 0) {
+                None
+            } else if Digest::blake3(&block) == old.digest() {
+                Some(old.clone())
+            } else if store_payloads {
+                Some(
+                    repository
+                        .store_block_payload(
+                            context,
+                            manifest.file_id(),
+                            identity,
+                            attempt,
+                            final_index,
+                            &block,
+                        )
+                        .await?,
+                )
+            } else {
+                Some(expected_block_blob(
                     repository,
+                    context,
                     manifest.file_id(),
                     identity,
                     attempt,
                     final_index,
                     &block,
-                );
-                result.insert(final_index, blob);
-                tail_store = Some((final_index, block));
+                )?)
+            };
+            if replacement.as_ref() != Some(&old) {
+                if replacement.is_none() {
+                    materialized_count = materialized_count.checked_sub(1).ok_or(
+                        FormatError::ArithmeticOverflow {
+                            field: "materialized block count",
+                        },
+                    )?;
+                    highest = retained_summary(
+                        repository,
+                        context,
+                        manifest.file_id(),
+                        root,
+                        final_index,
+                        budget,
+                    )
+                    .await?
+                    .map(|(_, highest)| highest);
+                }
+                updates.insert(final_index, replacement);
             }
         }
     }
-
-    check_block_count(repository, result.len())?;
-    let generation =
-        manifest
-            .generation()
-            .checked_add(1)
-            .ok_or(FormatError::ArithmeticOverflow {
-                field: "content generation",
-            })?;
-    let result_manifest = FileManifest::block_split(
-        manifest.file_id(),
-        generation,
-        logical_size,
-        result
-            .into_iter()
-            .map(|(index, blob)| BlockEntry::new(index, blob))
-            .collect(),
-    );
-    encode_manifest(&result_manifest, repository.limits()).map_err(StorageError::from)?;
-    if let Some((index, block)) = tail_store {
-        repository
-            .store_block_payload(manifest.file_id(), identity, attempt, index, &block)
-            .await?;
-    }
-    repository
-        .prepare_manifest(&result_manifest, identity, attempt, true)
-        .await
+    Ok(TruncatePlan {
+        updates,
+        materialized_count,
+        highest,
+    })
 }
 
 pub(crate) async fn truncate_from_new<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     mutation_id: MutationId,
     attempt: u32,
@@ -417,20 +755,74 @@ pub(crate) async fn truncate_from_new<S: TargetStore>(
         StorageMethod::BlockSplit,
         logical_size,
     );
-    let manifest = FileManifest::block_split(file_id, 1, logical_size, Vec::new());
+    let manifest = FileManifest::block_split(file_id, 1, logical_size, None);
     encode_manifest(&manifest, repository.limits()).map_err(StorageError::from)?;
     repository
-        .prepare_manifest(&manifest, identity, attempt, true)
+        .prepare_manifest(context, &manifest, identity, attempt, true)
         .await
 }
 
+fn block_root(manifest: &FileManifest) -> Result<Option<&PageRef>, FormatError> {
+    let ManifestLayout::BlockSplit { root, .. } = manifest.layout() else {
+        return Err(FormatError::NonCanonical {
+            field: "block-split layout",
+        });
+    };
+    Ok(root.as_ref())
+}
+
+fn visible_blocks(logical_size: u64) -> u64 {
+    logical_size / u64::from(BLOCK_SIZE)
+        + u64::from(!logical_size.is_multiple_of(u64::from(BLOCK_SIZE)))
+}
+
+fn block_span_count(range: LogicalRange) -> Result<usize, FormatError> {
+    if range.is_empty() {
+        return Ok(0);
+    }
+    let first = range.start() / u64::from(BLOCK_SIZE);
+    let last = (range.end() - 1) / u64::from(BLOCK_SIZE);
+    usize::try_from(last - first + 1).map_err(|_| FormatError::ArithmeticOverflow {
+        field: "block span count",
+    })
+}
+
+fn next_generation(manifest: &FileManifest) -> Result<u64, FormatError> {
+    manifest
+        .generation()
+        .checked_add(1)
+        .ok_or(FormatError::ArithmeticOverflow {
+            field: "content generation",
+        })
+}
+
+fn validate_root_summary<E>(
+    root: &Option<PageRef>,
+    count: u64,
+    highest: Option<u64>,
+) -> Result<(), StorageError<E>> {
+    match (root, highest) {
+        (None, None) if count == 0 => Ok(()),
+        (Some(root), Some(highest))
+            if root.materialized_block_count() == count
+                && root.highest_materialized_block() == highest =>
+        {
+            Ok(())
+        }
+        _ => Err(crate::CorruptionError::IdentityMismatch {
+            field: "map root summary",
+        }
+        .into()),
+    }
+}
+
 fn validate_block_length<E>(block: &[u8]) -> Result<(), StorageError<E>> {
-    if block.len() == BLOCK_SIZE_V1 as usize {
+    if block.len() == BLOCK_SIZE as usize {
         Ok(())
     } else {
         Err(crate::CorruptionError::InvalidLength {
             field: "block plaintext",
-            expected: u64::from(BLOCK_SIZE_V1),
+            expected: u64::from(BLOCK_SIZE),
             actual: u64::try_from(block.len()).unwrap_or(u64::MAX),
         }
         .into())
@@ -439,20 +831,14 @@ fn validate_block_length<E>(block: &[u8]) -> Result<(), StorageError<E>> {
 
 fn expected_block_blob<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     identity: PreparationIdentity,
     attempt: u32,
     block_index: u64,
     block: &[u8],
-) -> BlobRef {
-    BlobRef::new(
-        repository
-            .keys()
-            .block_payload(file_id, identity, attempt, block_index),
-        u64::from(BLOCK_SIZE_V1),
-        u64::from(BLOCK_SIZE_V1),
-        Digest::blake3(block),
-    )
+) -> Result<BlobRef, StorageError<S::Error>> {
+    repository.expected_block_payload(context, file_id, identity, attempt, block_index, block)
 }
 
 fn validate_final_padding<E>(
@@ -460,7 +846,7 @@ fn validate_final_padding<E>(
     block_index: u64,
     block: &[u8],
 ) -> Result<(), StorageError<E>> {
-    let block_size = u64::from(BLOCK_SIZE_V1);
+    let block_size = u64::from(BLOCK_SIZE);
     let final_index = manifest.logical_size() / block_size;
     let visible = manifest.logical_size() % block_size;
     if visible == 0 || block_index != final_index {
@@ -477,16 +863,16 @@ fn validate_final_padding<E>(
     }
 }
 
-fn check_block_count<S: TargetStore>(
+fn check_materialized_count<S: TargetStore>(
     repository: &ContentRepository<S>,
-    actual: usize,
+    actual: u64,
 ) -> Result<(), LimitError> {
-    let limit = repository.limits().max_blocks();
-    if u64::try_from(actual).unwrap_or(u64::MAX) > u64::from(limit) {
+    let limit = repository.limits().max_materialized_blocks();
+    if actual > limit {
         Err(LimitError::new(
-            LimitKind::BlockCount,
-            u64::try_from(actual).unwrap_or(u64::MAX),
-            u64::from(limit),
+            LimitKind::MaterializedBlocks,
+            actual,
+            limit,
         ))
     } else {
         Ok(())
@@ -522,444 +908,5 @@ fn check_write_bound<S: TargetStore>(
         ))
     } else {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        CreationDefaults, StorageLimits, StorageMethod,
-        testing::{MemoryTarget, block_on},
-    };
-
-    fn repository(target: MemoryTarget) -> ContentRepository<MemoryTarget> {
-        ContentRepository::new(
-            target,
-            "private",
-            CreationDefaults::new(StorageMethod::BlockSplit),
-            StorageLimits::default(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn sparse_blocks_assemble_in_order_and_slice_at_eof() {
-        let target = MemoryTarget::new();
-        let repository = repository(target);
-        let block = BLOCK_SIZE_V1 as usize;
-        let mut bytes = vec![0; block * 2 + 3];
-        bytes[block - 1] = 1;
-        bytes[block * 2..].copy_from_slice(b"end");
-        let prepared = block_on(create(
-            &repository,
-            FileId::from_u128(1),
-            MutationId::from_u128(1),
-            0,
-            &bytes,
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(prepared.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].index(), 0);
-        assert_eq!(blocks[1].index(), 2);
-        assert_eq!(
-            block_on(read(&repository, &manifest, (block - 2) as u64, block + 9)).unwrap(),
-            bytes[block - 2..].to_vec()
-        );
-    }
-
-    #[test]
-    fn full_overwrite_skips_old_read_while_partial_write_verifies_it() {
-        let target = MemoryTarget::new();
-        let repository = repository(target.clone());
-        let block = BLOCK_SIZE_V1 as usize;
-        let initial = block_on(create(
-            &repository,
-            FileId::from_u128(1),
-            MutationId::from_u128(1),
-            0,
-            &vec![1; block],
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(initial.content())).unwrap();
-
-        target.clear_trace().unwrap();
-        let full = block_on(write(
-            &repository,
-            initial.content(),
-            &manifest,
-            MutationId::from_u128(2),
-            0,
-            0,
-            &vec![2; block],
-        ))
-        .unwrap();
-        assert!(
-            target
-                .trace()
-                .unwrap()
-                .iter()
-                .all(|event| event.operation != crate::TargetOperation::Get)
-        );
-
-        let full_manifest = block_on(repository.load_manifest(full.content())).unwrap();
-        target.clear_trace().unwrap();
-        let partial = block_on(write(
-            &repository,
-            full.content(),
-            &full_manifest,
-            MutationId::from_u128(3),
-            0,
-            7,
-            b"x",
-        ))
-        .unwrap();
-        assert!(
-            target
-                .trace()
-                .unwrap()
-                .iter()
-                .any(|event| event.operation == crate::TargetOperation::Get)
-        );
-        let partial_manifest = block_on(repository.load_manifest(partial.content())).unwrap();
-        let result = block_on(read(&repository, &partial_manifest, 0, block)).unwrap();
-        assert_eq!(result[7], b'x');
-        assert!(result[..7].iter().all(|byte| *byte == 2));
-        assert!(result[8..].iter().all(|byte| *byte == 2));
-    }
-
-    #[test]
-    fn unchanged_blocks_are_reused_and_zero_blocks_become_holes() {
-        let target = MemoryTarget::new();
-        let repository = repository(target.clone());
-        let block = BLOCK_SIZE_V1 as usize;
-        let initial = block_on(create(
-            &repository,
-            FileId::from_u128(1),
-            MutationId::from_u128(1),
-            0,
-            &vec![7; block],
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(initial.content())).unwrap();
-
-        target.clear_trace().unwrap();
-        let unchanged = block_on(write(
-            &repository,
-            initial.content(),
-            &manifest,
-            MutationId::from_u128(2),
-            0,
-            11,
-            &[7; 10],
-        ))
-        .unwrap();
-        assert!(!unchanged.content_changed());
-        assert!(
-            target
-                .trace()
-                .unwrap()
-                .iter()
-                .all(|event| event.operation != crate::TargetOperation::PutIfAbsent)
-        );
-
-        let hole = block_on(write(
-            &repository,
-            initial.content(),
-            &manifest,
-            MutationId::from_u128(3),
-            0,
-            0,
-            &vec![0; block],
-        ))
-        .unwrap();
-        let hole_manifest = block_on(repository.load_manifest(hole.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = hole_manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        assert!(blocks.is_empty());
-        assert_eq!(
-            block_on(read(&repository, &hole_manifest, 0, block)).unwrap(),
-            vec![0; block]
-        );
-    }
-
-    #[test]
-    fn final_blocks_are_zero_padded_and_sparse_gaps_stay_absent() {
-        let target = MemoryTarget::new();
-        let repository = repository(target);
-        let block = u64::from(BLOCK_SIZE_V1);
-        let initial = block_on(create(
-            &repository,
-            FileId::from_u128(1),
-            MutationId::from_u128(1),
-            0,
-            b"abc",
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(initial.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        let canonical = block_on(repository.load_payload(blocks[0].blob())).unwrap();
-        assert_eq!(&canonical[..3], b"abc");
-        assert!(canonical[3..].iter().all(|byte| *byte == 0));
-
-        let extended = block_on(write(
-            &repository,
-            initial.content(),
-            &manifest,
-            MutationId::from_u128(2),
-            0,
-            block * 3 + 5,
-            b"x",
-        ))
-        .unwrap();
-        let extended_manifest = block_on(repository.load_manifest(extended.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = extended_manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        assert_eq!(
-            blocks.iter().map(BlockEntry::index).collect::<Vec<_>>(),
-            vec![0, 3]
-        );
-        let gap = block_on(read(
-            &repository,
-            &extended_manifest,
-            3,
-            usize::try_from(block * 3 + 3).unwrap(),
-        ))
-        .unwrap();
-        assert!(gap[..gap.len() - 1].iter().all(|byte| *byte == 0));
-        assert_eq!(*gap.last().unwrap(), b'x');
-    }
-
-    #[test]
-    fn shrink_zeroes_retained_tail_and_extension_does_not_restore_it() {
-        let target = MemoryTarget::new();
-        let repository = repository(target.clone());
-        let block = BLOCK_SIZE_V1 as usize;
-        let mut initial_bytes = vec![9; block + 7];
-        initial_bytes[..3].copy_from_slice(b"abc");
-        let initial = block_on(create(
-            &repository,
-            FileId::from_u128(1),
-            MutationId::from_u128(1),
-            0,
-            &initial_bytes,
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(initial.content())).unwrap();
-        let shrunk = block_on(truncate(
-            &repository,
-            initial.content(),
-            &manifest,
-            MutationId::from_u128(2),
-            0,
-            3,
-        ))
-        .unwrap();
-        let shrunk_manifest = block_on(repository.load_manifest(shrunk.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = shrunk_manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        assert_eq!(blocks.len(), 1);
-
-        target.clear_trace().unwrap();
-        let extended = block_on(truncate(
-            &repository,
-            shrunk.content(),
-            &shrunk_manifest,
-            MutationId::from_u128(3),
-            0,
-            (block + 7) as u64,
-        ))
-        .unwrap();
-        assert!(target.trace().unwrap().iter().all(|event| {
-            event.operation != crate::TargetOperation::PutIfAbsent
-                || !event.key.as_str().contains("/blocks/")
-        }));
-        let extended_manifest = block_on(repository.load_manifest(extended.content())).unwrap();
-        let bytes = block_on(read(&repository, &extended_manifest, 0, block + 7)).unwrap();
-        assert_eq!(&bytes[..3], b"abc");
-        assert!(bytes[3..].iter().all(|byte| *byte == 0));
-
-        let zero = block_on(truncate(
-            &repository,
-            extended.content(),
-            &extended_manifest,
-            MutationId::from_u128(4),
-            0,
-            0,
-        ))
-        .unwrap();
-        let zero_manifest = block_on(repository.load_manifest(zero.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = zero_manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn block_count_and_manifest_size_fail_before_payload_upload() {
-        let target = MemoryTarget::new();
-        let repository = repository(target.clone());
-        let block = BLOCK_SIZE_V1 as usize;
-        let initial = block_on(create(
-            &repository,
-            FileId::from_u128(1),
-            MutationId::from_u128(1),
-            0,
-            &vec![1; block],
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(initial.content())).unwrap();
-
-        let values = crate::StorageLimitValues {
-            max_blocks: 1,
-            ..crate::StorageLimitValues::default()
-        };
-        let count_limited = ContentRepository::new(
-            target.clone(),
-            "private",
-            CreationDefaults::new(StorageMethod::BlockSplit),
-            StorageLimits::new(values).unwrap(),
-        )
-        .unwrap();
-        target.clear_trace().unwrap();
-        assert!(matches!(
-            block_on(write(
-                &count_limited,
-                initial.content(),
-                &manifest,
-                MutationId::from_u128(2),
-                0,
-                block as u64,
-                &vec![2; block],
-            )),
-            Err(StorageError::Limit(LimitError {
-                kind: LimitKind::BlockCount,
-                ..
-            }))
-        ));
-        assert!(
-            target
-                .trace()
-                .unwrap()
-                .iter()
-                .all(|event| event.operation != crate::TargetOperation::PutIfAbsent)
-        );
-
-        let base_manifest_bytes = target
-            .inspect(initial.content().manifest_key())
-            .unwrap()
-            .unwrap()
-            .len();
-        let values = crate::StorageLimitValues {
-            max_manifest_bytes: base_manifest_bytes,
-            ..crate::StorageLimitValues::default()
-        };
-        let manifest_limited = ContentRepository::new(
-            target.clone(),
-            "private",
-            CreationDefaults::new(StorageMethod::BlockSplit),
-            StorageLimits::new(values).unwrap(),
-        )
-        .unwrap();
-        target.clear_trace().unwrap();
-        assert!(matches!(
-            block_on(write(
-                &manifest_limited,
-                initial.content(),
-                &manifest,
-                MutationId::from_u128(3),
-                0,
-                block as u64,
-                &vec![2; block],
-            )),
-            Err(StorageError::Limit(LimitError {
-                kind: LimitKind::Manifest,
-                ..
-            }))
-        ));
-        assert!(
-            target
-                .trace()
-                .unwrap()
-                .iter()
-                .all(|event| event.operation != crate::TargetOperation::PutIfAbsent)
-        );
-    }
-
-    #[test]
-    fn truncate_rejects_nonzero_old_final_padding_before_extension() {
-        let target = MemoryTarget::new();
-        let repository = repository(target.clone());
-        let file_id = FileId::from_u128(1);
-        let created = block_on(create(
-            &repository,
-            file_id,
-            MutationId::from_u128(1),
-            0,
-            b"A",
-        ))
-        .unwrap();
-        let manifest = block_on(repository.load_manifest(created.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
-            panic!("expected block-split manifest");
-        };
-        let blob_key = blocks[0].blob().key().clone();
-        let mut noncanonical = vec![0; BLOCK_SIZE_V1 as usize];
-        noncanonical[..2].copy_from_slice(b"AB");
-        let payload = crate::format::encode_envelope(
-            crate::format::ObjectKind::Payload,
-            &noncanonical,
-            repository.limits().max_object_bytes(),
-        )
-        .unwrap();
-        assert!(target.corrupt(&blob_key, payload).unwrap());
-
-        let corrupt_manifest = FileManifest::block_split(
-            file_id,
-            created.content().generation(),
-            1,
-            vec![BlockEntry::new(
-                0,
-                BlobRef::new(
-                    blob_key,
-                    u64::from(BLOCK_SIZE_V1),
-                    u64::from(BLOCK_SIZE_V1),
-                    Digest::blake3(&noncanonical),
-                ),
-            )],
-        );
-        let encoded_manifest = encode_manifest(&corrupt_manifest, repository.limits()).unwrap();
-        assert!(
-            target
-                .corrupt(created.content().manifest_key(), encoded_manifest.clone())
-                .unwrap()
-        );
-        let corrupt_content = ContentRef::from_persisted(
-            file_id,
-            created.content().generation(),
-            1,
-            created.content().manifest_key().clone(),
-            Digest::blake3(&encoded_manifest),
-            StorageMethod::BlockSplit,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            block_on(
-                repository.prepare_truncate(&corrupt_content, MutationId::from_u128(2), 0, 2,)
-            ),
-            Err(StorageError::Corruption(
-                crate::CorruptionError::NonZeroPadding
-            ))
-        ));
     }
 }

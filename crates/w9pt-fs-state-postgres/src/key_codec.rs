@@ -19,6 +19,7 @@ const XATTR_TAG: i16 = 8;
 const XATTR_STAGING_TAG: i16 = 9;
 const MUTATION_TAG: i16 = 10;
 const WRITER_LEASE_TAG: i16 = 11;
+const CONTENT_METADATA_TAG: i16 = 12;
 
 /// Canonical sortable components persisted in `change_keys`.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -35,6 +36,11 @@ impl SqlRecordKey {
         let (family_tag, component_a, component_b) = match key {
             RecordKey::Filesystem(_) => (FILESYSTEM_TAG, Vec::new(), Vec::new()),
             RecordKey::Inode(_, inode_id) => (INODE_TAG, inode_id.as_bytes().to_vec(), Vec::new()),
+            RecordKey::ContentMetadata(_, file_id) => (
+                CONTENT_METADATA_TAG,
+                file_id.as_bytes().to_vec(),
+                Vec::new(),
+            ),
             RecordKey::DirectoryEntry(_, parent_id, name) => (
                 DIRECTORY_ENTRY_TAG,
                 parent_id.as_bytes().to_vec(),
@@ -129,7 +135,11 @@ impl SqlRecordKey {
                 filesystem_id,
                 WriterScopeId::new(fixed_component("writer_scope_id", self.component_a)?),
             )),
-            tag if !(FILESYSTEM_TAG..=WRITER_LEASE_TAG).contains(&tag) => {
+            CONTENT_METADATA_TAG if self.component_b.is_empty() => Ok(RecordKey::ContentMetadata(
+                filesystem_id,
+                w9pt_fs_storage::FileId::new(fixed_component("content_file_id", self.component_a)?),
+            )),
+            tag if !(FILESYSTEM_TAG..=CONTENT_METADATA_TAG).contains(&tag) => {
                 Err(KeyCodecError::UnknownFamilyTag(tag))
             }
             _ => Err(KeyCodecError::InvalidComponentShape {

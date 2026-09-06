@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use w9pt_fs_storage::{
-    BLOCK_SIZE_V1, ContentRepository, CreationDefaults, FileId, MutationId, Publication,
+    BLOCK_SIZE, ContentRepository, CreationDefaults, FileId, MutationId, Publication,
     StorageLimits, StorageMethod, TargetOperation,
     testing::{FailureTiming, MemoryTarget, block_on},
 };
@@ -30,8 +30,8 @@ fn assert_reopen_is_atomic(stage: FailureStage) {
     let file_id = FileId::from_u128(1);
     let initial_mutation = MutationId::from_u128(1);
     let update_mutation = MutationId::from_u128(2);
-    let old_bytes = vec![1; BLOCK_SIZE_V1 as usize];
-    let new_bytes = vec![2; BLOCK_SIZE_V1 as usize];
+    let old_bytes = vec![1; BLOCK_SIZE as usize];
+    let new_bytes = vec![2; BLOCK_SIZE as usize];
     let initial = block_on(repo.prepare_create(file_id, initial_mutation, 0, &old_bytes)).unwrap();
     let Publication::Published(published) =
         block_on(repo.publisher().create(file_id, initial_mutation, &initial)).unwrap()

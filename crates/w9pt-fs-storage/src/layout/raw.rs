@@ -1,14 +1,15 @@
 //! Bounded whole-file raw layout.
 
 use crate::{
-    ContentRef, ContentRepository, Digest, FileId, FormatError, LimitError, LimitKind, MutationId,
-    PreparationIdentity, PreparedContent, StorageError, StorageMethod, TargetStore,
+    ContentRef, ContentRepository, FileCryptoContext, FileId, FormatError, LimitError, LimitKind,
+    MutationId, PreparationIdentity, PreparedContent, StorageError, StorageMethod, TargetStore,
     format::{BlobRef, FileManifest, ManifestLayout, encode_manifest},
     layout::LogicalRange,
 };
 
-pub(crate) async fn create<S: TargetStore>(
+pub(crate) async fn create_with_context<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     mutation_id: MutationId,
     attempt: u32,
@@ -28,23 +29,24 @@ pub(crate) async fn create<S: TargetStore>(
         None
     } else {
         Some(expected_raw_blob(
-            repository, file_id, identity, attempt, bytes,
-        ))
+            repository, context, file_id, identity, attempt, bytes,
+        )?)
     };
     let manifest = FileManifest::raw(file_id, 1, logical_size, blob);
     encode_manifest(&manifest, repository.limits()).map_err(StorageError::from)?;
     if !bytes.is_empty() {
         repository
-            .store_raw_payload(file_id, identity, attempt, bytes)
+            .store_raw_payload(context, file_id, identity, attempt, bytes)
             .await?;
     }
     repository
-        .prepare_manifest(&manifest, identity, attempt, true)
+        .prepare_manifest(context, &manifest, identity, attempt, true)
         .await
 }
 
-pub(crate) async fn read<S: TargetStore>(
+pub(crate) async fn read_with_context<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     manifest: &FileManifest,
     offset: u64,
     length: usize,
@@ -54,14 +56,16 @@ pub(crate) async fn read<S: TargetStore>(
     if range.is_empty() {
         return Ok(Vec::new());
     }
-    let bytes = load_all(repository, manifest).await?;
+    let bytes = load_all(repository, context, manifest).await?;
     let start = usize::try_from(range.start()).map_err(|_| crate::RangeError::LengthConversion)?;
     let end = usize::try_from(range.end()).map_err(|_| crate::RangeError::LengthConversion)?;
     Ok(bytes[start..end].to_vec())
 }
 
-pub(crate) async fn write<S: TargetStore>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_with_context<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     base: &ContentRef,
     manifest: &FileManifest,
     mutation_id: MutationId,
@@ -73,7 +77,13 @@ pub(crate) async fn write<S: TargetStore>(
     check_write_bound(repository, data.len())?;
     let range = LogicalRange::from_usize(offset, data.len())?;
     if data.is_empty() {
-        return Ok(PreparedContent::new(base.clone(), false, identity, attempt));
+        return Ok(PreparedContent::new(
+            base.clone(),
+            false,
+            identity,
+            attempt,
+            context.binding().clone(),
+        ));
     }
     let logical_size = manifest.logical_size().max(range.end());
     check_raw_bound(repository, logical_size)?;
@@ -86,12 +96,18 @@ pub(crate) async fn write<S: TargetStore>(
     })?;
     let start = usize::try_from(range.start()).map_err(|_| crate::RangeError::LengthConversion)?;
     let end = usize::try_from(range.end()).map_err(|_| crate::RangeError::LengthConversion)?;
-    let old = load_all(repository, manifest).await?;
+    let old = load_all(repository, context, manifest).await?;
     let mut result = old.clone();
     result.resize(result_len, 0);
     result[start..end].copy_from_slice(data);
     if result == old {
-        return Ok(PreparedContent::new(base.clone(), false, identity, attempt));
+        return Ok(PreparedContent::new(
+            base.clone(),
+            false,
+            identity,
+            attempt,
+            context.binding().clone(),
+        ));
     }
 
     let generation =
@@ -101,20 +117,28 @@ pub(crate) async fn write<S: TargetStore>(
             .ok_or(FormatError::ArithmeticOverflow {
                 field: "content generation",
             })?;
-    let blob = expected_raw_blob(repository, manifest.file_id(), identity, attempt, &result);
+    let blob = expected_raw_blob(
+        repository,
+        context,
+        manifest.file_id(),
+        identity,
+        attempt,
+        &result,
+    )?;
     let result_manifest =
         FileManifest::raw(manifest.file_id(), generation, logical_size, Some(blob));
     encode_manifest(&result_manifest, repository.limits()).map_err(StorageError::from)?;
     repository
-        .store_raw_payload(manifest.file_id(), identity, attempt, &result)
+        .store_raw_payload(context, manifest.file_id(), identity, attempt, &result)
         .await?;
     repository
-        .prepare_manifest(&result_manifest, identity, attempt, true)
+        .prepare_manifest(context, &result_manifest, identity, attempt, true)
         .await
 }
 
-pub(crate) async fn write_from_new<S: TargetStore>(
+pub(crate) async fn write_from_new_with_context<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     mutation_id: MutationId,
     attempt: u32,
@@ -142,21 +166,23 @@ pub(crate) async fn write_from_new<S: TargetStore>(
         result[start..end].copy_from_slice(data);
     }
     let blob = (!result.is_empty())
-        .then(|| expected_raw_blob(repository, file_id, identity, attempt, &result));
+        .then(|| expected_raw_blob(repository, context, file_id, identity, attempt, &result))
+        .transpose()?;
     let manifest = FileManifest::raw(file_id, 1, logical_size, blob);
     encode_manifest(&manifest, repository.limits()).map_err(StorageError::from)?;
     if !result.is_empty() {
         repository
-            .store_raw_payload(file_id, identity, attempt, &result)
+            .store_raw_payload(context, file_id, identity, attempt, &result)
             .await?;
     }
     repository
-        .prepare_manifest(&manifest, identity, attempt, true)
+        .prepare_manifest(context, &manifest, identity, attempt, true)
         .await
 }
 
-pub(crate) async fn truncate<S: TargetStore>(
+pub(crate) async fn truncate_with_context<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     base: &ContentRef,
     manifest: &FileManifest,
     mutation_id: MutationId,
@@ -166,7 +192,13 @@ pub(crate) async fn truncate<S: TargetStore>(
     let identity = PreparationIdentity::for_truncate(mutation_id, base, logical_size);
     check_raw_bound(repository, logical_size)?;
     if logical_size == manifest.logical_size() {
-        return Ok(PreparedContent::new(base.clone(), false, identity, attempt));
+        return Ok(PreparedContent::new(
+            base.clone(),
+            false,
+            identity,
+            attempt,
+            context.binding().clone(),
+        ));
     }
     let result_len = usize::try_from(logical_size).map_err(|_| {
         LimitError::new(
@@ -175,7 +207,7 @@ pub(crate) async fn truncate<S: TargetStore>(
             repository.limits().max_raw_file_bytes(),
         )
     })?;
-    let mut result = load_all(repository, manifest).await?;
+    let mut result = load_all(repository, context, manifest).await?;
     result.resize(result_len, 0);
     let generation =
         manifest
@@ -189,26 +221,28 @@ pub(crate) async fn truncate<S: TargetStore>(
     } else {
         Some(expected_raw_blob(
             repository,
+            context,
             manifest.file_id(),
             identity,
             attempt,
             &result,
-        ))
+        )?)
     };
     let result_manifest = FileManifest::raw(manifest.file_id(), generation, logical_size, blob);
     encode_manifest(&result_manifest, repository.limits()).map_err(StorageError::from)?;
     if !result.is_empty() {
         repository
-            .store_raw_payload(manifest.file_id(), identity, attempt, &result)
+            .store_raw_payload(context, manifest.file_id(), identity, attempt, &result)
             .await?;
     }
     repository
-        .prepare_manifest(&result_manifest, identity, attempt, true)
+        .prepare_manifest(context, &result_manifest, identity, attempt, true)
         .await
 }
 
-pub(crate) async fn truncate_from_new<S: TargetStore>(
+pub(crate) async fn truncate_from_new_with_context<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     mutation_id: MutationId,
     attempt: u32,
@@ -226,37 +260,34 @@ pub(crate) async fn truncate_from_new<S: TargetStore>(
     })?;
     let result = vec![0; result_len];
     let blob = (!result.is_empty())
-        .then(|| expected_raw_blob(repository, file_id, identity, attempt, &result));
+        .then(|| expected_raw_blob(repository, context, file_id, identity, attempt, &result))
+        .transpose()?;
     let manifest = FileManifest::raw(file_id, 1, logical_size, blob);
     encode_manifest(&manifest, repository.limits()).map_err(StorageError::from)?;
     if !result.is_empty() {
         repository
-            .store_raw_payload(file_id, identity, attempt, &result)
+            .store_raw_payload(context, file_id, identity, attempt, &result)
             .await?;
     }
     repository
-        .prepare_manifest(&manifest, identity, attempt, true)
+        .prepare_manifest(context, &manifest, identity, attempt, true)
         .await
 }
 
 fn expected_raw_blob<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     file_id: FileId,
     identity: PreparationIdentity,
     attempt: u32,
     bytes: &[u8],
-) -> BlobRef {
-    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    BlobRef::new(
-        repository.keys().raw_payload(file_id, identity, attempt),
-        length,
-        length,
-        Digest::blake3(bytes),
-    )
+) -> Result<BlobRef, StorageError<S::Error>> {
+    repository.expected_raw_payload(context, file_id, identity, attempt, bytes)
 }
 
 async fn load_all<S: TargetStore>(
     repository: &ContentRepository<S>,
+    context: &FileCryptoContext,
     manifest: &FileManifest,
 ) -> Result<Vec<u8>, StorageError<S::Error>> {
     check_raw_bound(repository, manifest.logical_size())?;
@@ -272,7 +303,7 @@ async fn load_all<S: TargetStore>(
             .into());
         }
     };
-    let bytes = repository.load_payload(blob).await?;
+    let bytes = repository.load_payload(context, blob).await?;
     let expected = usize::try_from(manifest.logical_size()).map_err(|_| {
         LimitError::new(
             LimitKind::RawFile,
@@ -333,6 +364,76 @@ fn check_write_bound<S: TargetStore>(
     } else {
         Ok(())
     }
+}
+
+#[cfg(test)]
+async fn create<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    file_id: FileId,
+    mutation_id: MutationId,
+    attempt: u32,
+    bytes: &[u8],
+) -> Result<PreparedContent, StorageError<S::Error>> {
+    let context = FileCryptoContext::plain_for_file(file_id, StorageMethod::Raw);
+    create_with_context(repository, &context, file_id, mutation_id, attempt, bytes).await
+}
+
+#[cfg(test)]
+async fn read<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    manifest: &FileManifest,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, StorageError<S::Error>> {
+    let context = FileCryptoContext::plain_for_file(manifest.file_id(), StorageMethod::Raw);
+    read_with_context(repository, &context, manifest, offset, length).await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn write<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    base: &ContentRef,
+    manifest: &FileManifest,
+    mutation_id: MutationId,
+    attempt: u32,
+    offset: u64,
+    data: &[u8],
+) -> Result<PreparedContent, StorageError<S::Error>> {
+    let context = FileCryptoContext::plain_for_file(manifest.file_id(), StorageMethod::Raw);
+    write_with_context(
+        repository,
+        &context,
+        base,
+        manifest,
+        mutation_id,
+        attempt,
+        offset,
+        data,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn truncate<S: TargetStore>(
+    repository: &ContentRepository<S>,
+    base: &ContentRef,
+    manifest: &FileManifest,
+    mutation_id: MutationId,
+    attempt: u32,
+    logical_size: u64,
+) -> Result<PreparedContent, StorageError<S::Error>> {
+    let context = FileCryptoContext::plain_for_file(manifest.file_id(), StorageMethod::Raw);
+    truncate_with_context(
+        repository,
+        &context,
+        base,
+        manifest,
+        mutation_id,
+        attempt,
+        logical_size,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -663,7 +764,7 @@ mod tests {
         assert!(target.corrupt(blob.key(), bytes).unwrap());
         assert!(matches!(
             block_on(read(&repository, &manifest, 0, 8)),
-            Err(StorageError::Corruption(_))
+            Err(StorageError::Corruption(_) | StorageError::Representation(_))
         ));
     }
 

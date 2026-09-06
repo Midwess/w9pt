@@ -9,7 +9,8 @@ use w9pt_fs_state::{
     CommitRequest, CommittedMutation, FenceValidation, FilesystemId, InodeData, InodeId,
     InodeRecord, LockId, MalformedCommit, MutationRecord, MutationReplay, OpenId, Precondition,
     RecordKey, RecordRevision, RecordValidationError, StateChange, StateRecord, StateRevision,
-    StateStoreAdapterError, StateStoreOperation, XattrRecord, validate_publish_content,
+    StateStoreAdapterError, StateStoreOperation, XattrRecord,
+    validate_publish_content_with_metadata,
 };
 use w9pt_fs_storage::StorageMethod;
 
@@ -277,8 +278,15 @@ async fn execute_once(
         CommitAttemptError::State(corruption("authority revision exhausted its u64 range"))
     })?;
     for change in request.changes() {
-        if let Some(outcome) =
-            apply_change(&mut transaction, request, change, &records, next_revision).await?
+        if let Some(outcome) = apply_change(
+            &mut transaction,
+            request,
+            change,
+            &records,
+            next_revision,
+            config.limits(),
+        )
+        .await?
         {
             rollback(transaction).await?;
             return Ok(outcome);
@@ -984,6 +992,7 @@ async fn apply_change(
     change: &StateChange,
     records: &BTreeMap<RecordKey, Option<StateRecord>>,
     revision: StateRevision,
+    limits: w9pt_fs_state::StateLimits,
 ) -> Result<Option<CommitOutcome>, CommitAttemptError> {
     let key = change.primary_key(request.filesystem_id());
     let presence = match change {
@@ -1007,7 +1016,8 @@ async fn apply_change(
             if let (Some(StateRecord::Inode(current)), StateRecord::Inode(replacement)) =
                 (present(records, &key), record)
                 && (current.content() != replacement.content()
-                    || current.content_file_id() != replacement.content_file_id())
+                    || current.content_file_id() != replacement.content_file_id()
+                    || current.content_context_id() != replacement.content_context_id())
             {
                 return Ok(Some(CommitOutcome::MalformedRequest(
                     MalformedCommit::ContentReplacementRequiresPreparedPublication,
@@ -1224,8 +1234,30 @@ async fn apply_change(
                 Some(record) => record,
                 None => return Ok(Some(missing_conflict(request, key))),
             };
-            if let Err(error) = validate_publish_content(publication, &request.mutation(), current)
-            {
+            let metadata_key = RecordKey::ContentMetadata(
+                request.filesystem_id(),
+                publication.prepared.context_binding().file_id(),
+            );
+            let metadata = fetch_record(
+                transaction,
+                &metadata_key,
+                schema_limits(),
+                w9pt_fs_state::StateStoreOperation::Commit,
+            )
+            .await
+            .map_err(CommitAttemptError::State)?;
+            let validation = match metadata {
+                Some(StateRecord::ContentMetadata(metadata)) => {
+                    validate_publish_content_with_metadata(
+                        publication,
+                        &request.mutation(),
+                        current,
+                        &metadata,
+                    )
+                }
+                _ => Err(w9pt_fs_state::PublishContentError::ContentContextMismatch),
+            };
+            if let Err(error) = validation {
                 return Ok(Some(CommitOutcome::MalformedRequest(
                     MalformedCommit::InvalidPublication(error),
                 )));
@@ -1281,6 +1313,54 @@ async fn apply_change(
             .bind(i32::try_from(mode).expect("validated inode mode fits i32"))
             .bind(owner.as_bytes().to_vec())
             .bind(group.as_bytes().to_vec())
+            .execute(transaction)
+            .await
+            .map_err(state_statement)?;
+            result.rows_affected()
+        }
+        StateChange::RewrapContentMetadata(rewrap) => {
+            let current = match present(records, &key) {
+                Some(StateRecord::ContentMetadata(metadata)) => metadata,
+                _ => return Ok(Some(missing_conflict(request, key))),
+            };
+            if current.context_id() != rewrap.expected_context_id
+                || current.revision() != rewrap.expected_revision
+                || current.wrapped_key_bytes().is_none()
+            {
+                return Ok(Some(CommitOutcome::Conflict(CommitConflict {
+                    precondition_index: request.preconditions().len(),
+                    kind: CommitConflictKind::RecordRevision {
+                        key,
+                        expected: rewrap.expected_revision,
+                        actual: current.revision(),
+                    },
+                })));
+            }
+            if let Err(error) = current.validate_rewrap(
+                rewrap.expected_context_id,
+                &rewrap.wrapped_key_bytes,
+                limits,
+            ) {
+                let malformed = match error {
+                    w9pt_fs_state::ContentMetadataError::Limit(error) => {
+                        MalformedCommit::Limit(error)
+                    }
+                    _ => MalformedCommit::InvalidContentMetadataRewrap,
+                };
+                return Ok(Some(CommitOutcome::MalformedRequest(malformed)));
+            }
+            let result = query(
+                r#"UPDATE "public"."w9pt_fs_state_content_metadata"
+                   SET "wrapped_key_bytes" = $3, "record_revision" = $4::numeric
+                   WHERE "filesystem_id" = $1 AND "content_file_id" = $2
+                     AND "context_id" = $5 AND "record_revision" = $6::numeric"#,
+            )
+            .bind(request.filesystem_id().as_bytes().to_vec())
+            .bind(rewrap.content_file_id.as_bytes().to_vec())
+            .bind(rewrap.wrapped_key_bytes.clone())
+            .bind(encode_u64(revision.get()))
+            .bind(rewrap.expected_context_id.as_bytes().to_vec())
+            .bind(encode_u64(rewrap.expected_revision.get()))
             .execute(transaction)
             .await
             .map_err(state_statement)?;
@@ -1863,6 +1943,7 @@ fn targeted_inode_ids(
             StateChange::PublishContent(publication) => {
                 inodes.insert(publication.inode_id);
             }
+            StateChange::RewrapContentMetadata(_) => {}
             StateChange::PublishXattrStaging(publication) => {
                 inodes.insert(publication.inode_id);
             }
@@ -1897,6 +1978,9 @@ fn collect_record_inodes(record: &StateRecord, inodes: &mut BTreeSet<InodeId>) {
             if let Some(parent_inode_id) = record.directory_parent() {
                 inodes.insert(parent_inode_id);
             }
+        }
+        StateRecord::ContentMetadata(record) => {
+            inodes.insert(record.owner_inode_id());
         }
         StateRecord::DirectoryEntry(record) => {
             inodes.insert(record.parent_inode_id());
@@ -2165,6 +2249,13 @@ fn estimate_record(record: &StateRecord) -> Option<usize> {
             }
             (256, variable)
         }
+        StateRecord::ContentMetadata(record) => (
+            160,
+            record
+                .policy_bytes()
+                .len()
+                .checked_add(record.wrapped_key_bytes().map_or(0, <[u8]>::len))?,
+        ),
         StateRecord::DirectoryEntry(record) => (96, record.name().as_bytes().len()),
         StateRecord::Open(_)
         | StateRecord::OpenPin(_)

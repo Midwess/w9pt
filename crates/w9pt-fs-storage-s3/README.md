@@ -96,8 +96,11 @@ points, and Multi-Region Access Points are outside the version-0.1 profile.
 Conditional uploads use single-part `PutObject`, an exact content length,
 CRC32C SDK transfer integrity, and one SDK mutation attempt. The SDK ETag is an
 opaque concurrency token only; it is never interpreted as MD5 or trusted as the
-content digest. `w9pt-fs-storage` envelopes and BLAKE3 digests remain the
-persistent integrity authority.
+content digest. `w9pt-fs-storage` v3 authenticated representation and BLAKE3
+digests remain the persistent integrity authority. Optional client-side
+AES-SIV is separate from bucket-default server-side encryption; the adapter
+sees only already-protected object bytes and never receives the master KEK or
+per-file DEK.
 
 Bucket-default SSE-S3 or SSE-KMS is deployment policy. SSE-C is excluded because
 it would make the adapter own secret headers on every read and write. Normal
@@ -131,7 +134,10 @@ validation.
 Version 0.1 is correctness-first:
 
 - raw partial writes read and replace one complete bounded payload;
-- block-split files issue sequential requests for sparse 32 KiB logical blocks;
+- block-split reads fetch only the immutable radix-page paths and sparse 32 KiB
+  payloads intersecting the positioned range, reusing the active path;
+- block-split mutations use bounded two-pass traversal and child-before-parent
+  immutable page creation; suffix pruning detaches whole discarded subtrees;
 - there is no multipart upload, caching, read-ahead, coalescing, packed blocks,
   request pool, or transfer manager;
 - each request incurs normal S3 latency and request charges.
@@ -159,14 +165,18 @@ The prefix must be caller-supplied, relative, and end in a test marker with a
 unique run ID. Cleanup additionally requires a test-marked bucket and expected
 owner. Required mode fails when bucket, region, or prefix is absent.
 Qualification constructs two clients independently, first establishes their
-writable guarantees, then runs target concurrency plus raw/block-split
-repository reopen/write/truncate/publication checks.
+writable guarantees, then runs target concurrency plus raw/paged-block-split
+repository reopen/write/truncate/publication checks across leaf and branch boundaries.
 
 CI also starts the digest-pinned SeaweedFS 4.42 artifact, verifies the service
 identity, and requires the two-client writable target probes to pass against its
 ephemeral bucket. Only after those probes, a private external-test wrapper runs
-the bounded Raw/BlockSplit lifecycle and standalone publication-boundary matrix
-through the real adapter. The ordinary targets remain unqualified before and
+the bounded Raw/paged-BlockSplit lifecycle, all four Identity/LZ4 and None/SIV
+representation combinations, and the standalone publication-boundary matrix
+through the real adapter. A separate composed test commits a generated wrapped
+DEK in PostgreSQL, prepares encrypted sparse content, reopens it through an
+independent client, and proves that rewrap leaves all S3 objects unchanged. The
+ordinary targets remain unqualified before and
 after this work. Passing emulator probes and repository composition is recorded
 only as behavioral evidence: the compatible-provider constructor still fails
 closed until the profile has production durability, restart, multi-node, TLS,

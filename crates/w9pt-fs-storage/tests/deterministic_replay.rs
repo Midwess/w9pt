@@ -1,8 +1,8 @@
 #![allow(missing_docs)]
 
 use w9pt_fs_storage::{
-    BLOCK_SIZE_V1, ContentRef, ContentRepository, CreationDefaults, FileId, MutationId,
-    Publication, PublishedContent, StorageLimits, StorageMethod,
+    BLOCK_SIZE, ContentRef, ContentRepository, CreationDefaults, FileId, MutationId, Publication,
+    PublishedContent, StorageLimits, StorageMethod,
     testing::{MemoryTarget, TargetTraceEvent, block_on},
 };
 
@@ -18,7 +18,7 @@ struct ReplayResult {
 }
 
 fn operations() -> Vec<Operation> {
-    let block = BLOCK_SIZE_V1 as usize;
+    let block = BLOCK_SIZE as usize;
     vec![
         Operation::Write {
             offset: block - 1,

@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 
 use w9pt_fs_storage::{
-    BLOCK_SIZE_V1, BaseContentIdentity, ContentRepository, CorruptionError, CreationDefaults,
-    FileId, LimitError, LimitKind, MutationId, PreparationIdentity, StorageError,
-    StorageLimitValues, StorageLimits, StorageMethod, TargetOperation,
+    BLOCK_SIZE, BaseContentIdentity, ContentRepository, CorruptionError, CreationDefaults, FileId,
+    LimitError, LimitKind, MutationId, PreparationIdentity, StorageError, StorageLimitValues,
+    StorageLimits, StorageMethod, TargetOperation,
     format::ManifestLayout,
     testing::{FailureTiming, MemoryTarget, TracePhase, block_on},
 };
@@ -24,7 +24,7 @@ fn positioned_first_writes_match_a_byte_vector_model() {
         let offset = if method == StorageMethod::Raw {
             17
         } else {
-            u64::from(BLOCK_SIZE_V1) * 3 + 17
+            u64::from(BLOCK_SIZE) * 3 + 17
         };
         let bytes = b"model";
         let prepared = block_on(repository.prepare_write_from_new(
@@ -140,14 +140,14 @@ fn limits_and_failure_ordering_stop_before_manifest_publication() {
         StorageMethod::BlockSplit,
         limited_target.clone(),
         StorageLimits::new(StorageLimitValues {
-            max_blocks: 1,
+            max_materialized_blocks: 1,
             ..StorageLimitValues::default()
         })
         .unwrap(),
     );
-    let mut two_blocks = vec![0; BLOCK_SIZE_V1 as usize + 1];
+    let mut two_blocks = vec![0; BLOCK_SIZE as usize + 1];
     two_blocks[0] = 1;
-    two_blocks[BLOCK_SIZE_V1 as usize] = 1;
+    two_blocks[BLOCK_SIZE as usize] = 1;
     assert!(matches!(
         block_on(limited.prepare_write_from_new(
             FileId::from_u128(11),
@@ -157,7 +157,7 @@ fn limits_and_failure_ordering_stop_before_manifest_publication() {
             &two_blocks,
         )),
         Err(StorageError::Limit(LimitError {
-            kind: LimitKind::BlockCount,
+            kind: LimitKind::MaterializedBlocks,
             ..
         }))
     ));
@@ -196,7 +196,15 @@ fn limits_and_failure_ordering_stop_before_manifest_publication() {
             })
             .map(|event| event.key)
             .collect::<Vec<_>>();
-        assert_eq!(puts, vec![payload_key, manifest_key]);
+        let expected = match method {
+            StorageMethod::Raw => vec![payload_key, manifest_key],
+            StorageMethod::BlockSplit => vec![
+                payload_key,
+                repository.keys().map_page(file_id, identity, 0, 0, 0),
+                manifest_key,
+            ],
+        };
+        assert_eq!(puts, expected);
     }
 
     let target = MemoryTarget::new();
@@ -241,16 +249,16 @@ fn block_truncates_are_all_holes_and_raw_truncates_materialize_zeros() {
             FileId::from_u128(17),
             MutationId::from_u128(18),
             0,
-            u64::from(BLOCK_SIZE_V1) * 2 + 1,
+            u64::from(BLOCK_SIZE) * 2 + 1,
         ))
         .unwrap();
         let manifest = block_on(repository.load_manifest(prepared.content())).unwrap();
         match manifest.layout() {
             ManifestLayout::Raw { blob } => assert!(blob.is_some()),
-            ManifestLayout::BlockSplit { blocks, .. } => assert!(blocks.is_empty()),
+            ManifestLayout::BlockSplit { root, .. } => assert!(root.is_none()),
         }
         assert_eq!(
-            block_on(repository.read(prepared.content(), u64::from(BLOCK_SIZE_V1) * 2 - 1, 2,))
+            block_on(repository.read(prepared.content(), u64::from(BLOCK_SIZE) * 2 - 1, 2,))
                 .unwrap(),
             [0, 0]
         );

@@ -17,6 +17,12 @@ pub struct StateLimitValues {
     pub max_group_bytes: usize,
     /// Maximum bytes in one symbolic-link target.
     pub max_symlink_bytes: usize,
+    /// Maximum opaque storage policy bytes per content metadata record.
+    pub max_content_policy_bytes: usize,
+    /// Maximum opaque wrapped-key bytes per content metadata record.
+    pub max_wrapped_content_key_bytes: usize,
+    /// Maximum total retained bytes per content metadata record.
+    pub max_content_metadata_bytes: usize,
     /// Maximum bytes in one retained terminal mutation result.
     pub max_mutation_result_bytes: usize,
     /// Maximum queries in one consistent read batch.
@@ -58,6 +64,9 @@ impl Default for StateLimitValues {
             max_principal_bytes: 1_024,
             max_group_bytes: 1_024,
             max_symlink_bytes: 16 * 1024,
+            max_content_policy_bytes: 512,
+            max_wrapped_content_key_bytes: 512,
+            max_content_metadata_bytes: 2 * 1024,
             max_mutation_result_bytes: 1024 * 1024,
             max_read_queries: 256,
             max_directory_ancestor_depth: 1_024,
@@ -94,6 +103,18 @@ impl StateLimits {
             ("max_principal_bytes", to_u64(values.max_principal_bytes)),
             ("max_group_bytes", to_u64(values.max_group_bytes)),
             ("max_symlink_bytes", to_u64(values.max_symlink_bytes)),
+            (
+                "max_content_policy_bytes",
+                to_u64(values.max_content_policy_bytes),
+            ),
+            (
+                "max_wrapped_content_key_bytes",
+                to_u64(values.max_wrapped_content_key_bytes),
+            ),
+            (
+                "max_content_metadata_bytes",
+                to_u64(values.max_content_metadata_bytes),
+            ),
             (
                 "max_mutation_result_bytes",
                 to_u64(values.max_mutation_result_bytes),
@@ -145,6 +166,14 @@ impl StateLimits {
                 container: "max_transaction_bytes",
             });
         }
+        if values.max_content_policy_bytes > values.max_content_metadata_bytes
+            || values.max_wrapped_content_key_bytes > values.max_content_metadata_bytes
+        {
+            return Err(InvalidStateLimits::Inconsistent {
+                field: "content metadata component",
+                container: "max_content_metadata_bytes",
+            });
+        }
         Ok(Self(values))
     }
 
@@ -181,6 +210,21 @@ impl StateLimits {
     /// Returns the maximum symlink target length.
     pub const fn max_symlink_bytes(self) -> usize {
         self.0.max_symlink_bytes
+    }
+
+    /// Returns the maximum opaque file policy size.
+    pub const fn max_content_policy_bytes(self) -> usize {
+        self.0.max_content_policy_bytes
+    }
+
+    /// Returns the maximum opaque wrapped file-key size.
+    pub const fn max_wrapped_content_key_bytes(self) -> usize {
+        self.0.max_wrapped_content_key_bytes
+    }
+
+    /// Returns the maximum retained content metadata size.
+    pub const fn max_content_metadata_bytes(self) -> usize {
+        self.0.max_content_metadata_bytes
     }
 
     /// Returns the maximum retained result length.
@@ -334,6 +378,12 @@ pub enum StateLimitKind {
     Group,
     /// Symbolic-link target bytes.
     Symlink,
+    /// Opaque file storage policy bytes.
+    ContentPolicy,
+    /// Opaque wrapped per-file key bytes.
+    WrappedContentKey,
+    /// Total retained content metadata bytes.
+    ContentMetadata,
     /// Retained mutation result bytes.
     MutationResult,
     /// Queries in one read batch.

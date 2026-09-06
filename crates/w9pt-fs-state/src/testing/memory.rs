@@ -12,14 +12,14 @@ use crate::{
     CommitOutcome, CommitRequest, CommittedMutation, DirectoryCookie, DirectoryPage,
     DirectoryPageEntry, FenceValidation, FencingToken, FilesystemStateStore, LeaseOperationId,
     LeaseRejection, LeaseTimeAuthority, LockCursor, MalformedCommit, ManualLeaseClock,
-    MutationMismatch, MutationRecord, OpenPinCursor, Precondition, ReadBatch, ReadConsistency,
-    ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, RecordScan, ReleaseLeaseOutcome,
-    ReleaseWriterLease, RenewLeaseOutcome, RenewWriterLease, RequestFingerprint, ScanPage,
-    ScanResume, StateChange, StateLimits, StateRecord, StateRevision, StateSnapshot,
-    StateStoreAdapterError, StateStoreContract, StateStoreOperation, WriterLeaseGrant,
-    WriterScopeId, WriterTopology, XattrCursor, grant_writer_lease, renew_current_lease,
-    validate_lease_release, validate_publish_content, validate_record_set_with_limits,
-    validate_writer_fence,
+    MutationMismatch, MutationRecord, OpenPinCursor, Precondition, PublishContentError, ReadBatch,
+    ReadConsistency, ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, RecordScan,
+    ReleaseLeaseOutcome, ReleaseWriterLease, RenewLeaseOutcome, RenewWriterLease,
+    RequestFingerprint, ScanPage, ScanResume, StateChange, StateLimits, StateRecord, StateRevision,
+    StateSnapshot, StateStoreAdapterError, StateStoreContract, StateStoreOperation,
+    WriterLeaseGrant, WriterScopeId, WriterTopology, XattrCursor, grant_writer_lease,
+    renew_current_lease, validate_lease_release, validate_publish_content_with_metadata,
+    validate_record_set_with_limits, validate_writer_fence,
 };
 
 #[derive(Debug)]
@@ -287,6 +287,35 @@ impl MemoryStateStore {
                 });
                 continue;
             }
+            if let ReadQuery::InodeWithContentMetadata(inode_id) = query {
+                let inode = match state
+                    .records
+                    .get(&RecordKey::Inode(request.filesystem_id(), *inode_id))
+                {
+                    Some(StateRecord::Inode(inode)) => Some(Box::new(inode.clone())),
+                    _ => None,
+                };
+                let metadata = inode
+                    .as_ref()
+                    .and_then(|inode| inode.content_file_id())
+                    .and_then(|file_id| {
+                        match state.records.get(&RecordKey::ContentMetadata(
+                            request.filesystem_id(),
+                            file_id,
+                        )) {
+                            Some(StateRecord::ContentMetadata(metadata)) => {
+                                Some(Box::new(metadata.clone()))
+                            }
+                            _ => None,
+                        }
+                    });
+                results.push(ReadResult::InodeWithContentMetadata {
+                    inode_id: *inode_id,
+                    inode,
+                    metadata,
+                });
+                continue;
+            }
             if let Some(key) = query.point_key(request.filesystem_id()) {
                 results.push(ReadResult::Point {
                     record: state.records.get(&key).cloned().map(Box::new),
@@ -467,6 +496,7 @@ impl MemoryStateStore {
                 request.mutation(),
                 change,
                 record_revision,
+                self.contract.limits(),
             ) {
                 Ok(()) => {
                     for key in affected {
@@ -1421,6 +1451,7 @@ fn validate_monotonic_transitions(
                     && expected_inode == Some(replacement.inode_generation())
                     && current.content() == replacement.content()
                     && current.content_file_id() == replacement.content_file_id()
+                    && current.content_context_id() == replacement.content_context_id()
                     && directory_valid
                     && directory_parent_transition_valid(records, request, current, replacement)
             }
@@ -1561,6 +1592,7 @@ fn apply_change(
     mutation: crate::MutationContext,
     change: &StateChange,
     revision: RecordRevision,
+    limits: StateLimits,
 ) -> Result<(), ApplyFailure> {
     let key = change.primary_key(filesystem_id);
     match change {
@@ -1678,18 +1710,65 @@ fn apply_change(
             })?;
         }
         StateChange::PublishContent(publication) => {
+            let metadata = records
+                .get(&key)
+                .and_then(|record| match record {
+                    StateRecord::Inode(inode) => inode.content_file_id(),
+                    _ => None,
+                })
+                .and_then(|file_id| {
+                    records.get(&RecordKey::ContentMetadata(filesystem_id, file_id))
+                })
+                .and_then(|record| match record {
+                    StateRecord::ContentMetadata(metadata) => Some(metadata.clone()),
+                    _ => None,
+                });
             let Some(StateRecord::Inode(inode)) = records.get_mut(&key) else {
                 return Err(ApplyFailure::Conflict(CommitConflictKind::RecordMissing(
                     key,
                 )));
             };
-            validate_publish_content(publication, &mutation, inode).map_err(|error| {
+            let validation = metadata
+                .as_ref()
+                .ok_or(PublishContentError::ContentContextMismatch)
+                .and_then(|metadata| {
+                    validate_publish_content_with_metadata(publication, &mutation, inode, metadata)
+                });
+            validation.map_err(|error| {
                 ApplyFailure::Malformed(MalformedCommit::InvalidPublication(error))
             })?;
             inode.publish_content(publication);
             let updated = records
                 .remove(&key)
                 .expect("publication inode remains present")
+                .with_revision(revision);
+            records.insert(key, updated);
+        }
+        StateChange::RewrapContentMetadata(rewrap) => {
+            let Some(StateRecord::ContentMetadata(metadata)) = records.get_mut(&key) else {
+                return Err(ApplyFailure::Conflict(CommitConflictKind::RecordMissing(
+                    key,
+                )));
+            };
+            if metadata.revision() != rewrap.expected_revision {
+                return Err(ApplyFailure::Conflict(CommitConflictKind::RecordRevision {
+                    key,
+                    expected: rewrap.expected_revision,
+                    actual: metadata.revision(),
+                }));
+            }
+            metadata
+                .rewrap(
+                    rewrap.expected_context_id,
+                    rewrap.wrapped_key_bytes.clone(),
+                    limits,
+                )
+                .map_err(|_| {
+                    ApplyFailure::Malformed(MalformedCommit::InvalidContentMetadataRewrap)
+                })?;
+            let updated = records
+                .remove(&key)
+                .expect("rewrapped metadata remains present")
                 .with_revision(revision);
             records.insert(key, updated);
         }
@@ -1924,6 +2003,11 @@ fn scan_resume(
             if *fs == filesystem_id && after.is_none_or(|cursor| *inode_id > cursor) =>
         {
             Some(ScanResume::Inode(*inode_id))
+        }
+        (RecordKey::ContentMetadata(fs, file_id), RecordScan::ContentMetadata { after, .. })
+            if *fs == filesystem_id && after.is_none_or(|cursor| *file_id > cursor) =>
+        {
+            Some(ScanResume::ContentMetadata(*file_id))
         }
         (RecordKey::Open(fs, open_id), RecordScan::Opens { after, .. })
             if *fs == filesystem_id && after.is_none_or(|cursor| *open_id > cursor) =>
@@ -2744,6 +2828,7 @@ mod tests {
                 ),
                 &change,
                 revision,
+                StateLimits::default(),
             )
             .is_ok()
         );

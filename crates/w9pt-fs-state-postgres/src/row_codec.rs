@@ -3,16 +3,16 @@
 use core::fmt;
 
 use w9pt_fs_state::{
-    BoundedValueError, ClientIncarnationId, DeviceNumbers, DirectoryCookie, DirectoryEntryRecord,
-    DirectoryGeneration, EntryName, FencingToken, FilesystemId, FilesystemRecord, GroupId,
-    InodeData, InodeGeneration, InodeId, InodeRecord, InodeTimes, InvalidValue, LeaseDeadline,
-    LeaseId, LockGeneration, LockId, LockKind, LockOwner, LockRange, LockRangeEnd, LockRecord,
-    MutationRecord, MutationResult, MutationResultKind, MutationRetention, OpenAccess, OpenId,
-    OpenPinRecord, OpenRecord, OrphanRecord, PrincipalId, QidPath, RecordKey, RecordRevision,
-    RecordValidationError, RequestFingerprint, ResultFormatVersion, StateLimitError, StateLimits,
-    StateRecord, StateRevision, SymlinkTarget, UnixTimestamp, WriterIncarnationId,
-    WriterLeaseRecord, WriterScopeId, XattrName, XattrRecord, XattrStagingId, XattrStagingRecord,
-    XattrValue,
+    BoundedValueError, ClientIncarnationId, ContentMetadataRecord, DeviceNumbers, DirectoryCookie,
+    DirectoryEntryRecord, DirectoryGeneration, EntryName, FencingToken, FilesystemId,
+    FilesystemRecord, GroupId, InodeData, InodeGeneration, InodeId, InodeKind, InodeRecord,
+    InodeTimes, InvalidValue, LeaseDeadline, LeaseId, LockGeneration, LockId, LockKind, LockOwner,
+    LockRange, LockRangeEnd, LockRecord, MutationRecord, MutationResult, MutationResultKind,
+    MutationRetention, OpenAccess, OpenId, OpenPinRecord, OpenRecord, OrphanRecord, PrincipalId,
+    QidPath, RecordKey, RecordRevision, RecordValidationError, RequestFingerprint,
+    ResultFormatVersion, StateLimitError, StateLimits, StateRecord, StateRevision, SymlinkTarget,
+    UnixTimestamp, WriterIncarnationId, WriterLeaseRecord, WriterScopeId, XattrName, XattrRecord,
+    XattrStagingId, XattrStagingRecord, XattrValue,
 };
 use w9pt_fs_storage::{
     ContentRef, Digest, FileId, InvalidContentRef, InvalidObjectKey, MutationId, ObjectKey,
@@ -45,6 +45,7 @@ const STORAGE_BLOCK_SPLIT_TAG: i16 = 2;
 pub(crate) enum SqlStateRecord {
     Filesystem(FilesystemRow),
     Inode(Box<InodeRow>),
+    ContentMetadata(ContentMetadataRow),
     DirectoryEntry(DirectoryEntryRow),
     Open(OpenRow),
     OpenPin(OpenPinRow),
@@ -76,6 +77,17 @@ impl SqlStateRecord {
             StateRecord::Inode(record) => {
                 Self::Inode(Box::new(encode_inode(filesystem_id, record)))
             }
+            StateRecord::ContentMetadata(record) => Self::ContentMetadata(ContentMetadataRow {
+                filesystem_id,
+                content_file_id: record.content_file_id().as_bytes().to_vec(),
+                owner_inode_id: record.owner_inode_id().as_bytes().to_vec(),
+                context_id: record.context_id().as_bytes().to_vec(),
+                policy_format: i32::from(record.policy_format()),
+                policy_bytes: record.policy_bytes().to_vec(),
+                key_commitment: record.key_commitment().map(|bytes| bytes.to_vec()),
+                wrapped_key_bytes: record.wrapped_key_bytes().map(<[u8]>::to_vec),
+                record_revision: encode_u64(record.revision().get()),
+            }),
             StateRecord::DirectoryEntry(record) => Self::DirectoryEntry(DirectoryEntryRow {
                 filesystem_id,
                 parent_inode_id: record.parent_inode_id().as_bytes().to_vec(),
@@ -177,6 +189,7 @@ impl SqlStateRecord {
         let (key, record) = match self {
             Self::Filesystem(row) => decode_filesystem(row)?,
             Self::Inode(row) => decode_inode(*row, limits)?,
+            Self::ContentMetadata(row) => decode_content_metadata(row, limits)?,
             Self::DirectoryEntry(row) => decode_directory_entry(row, limits)?,
             Self::Open(row) => decode_open(row)?,
             Self::OpenPin(row) => decode_open_pin(row)?,
@@ -232,6 +245,7 @@ pub(crate) struct InodeRow {
     pub(crate) inode_generation: String,
     pub(crate) kind: i16,
     pub(crate) content_file_id: Option<Vec<u8>>,
+    pub(crate) content_context_id: Option<Vec<u8>>,
     pub(crate) data_generation: Option<String>,
     pub(crate) content_generation: Option<String>,
     pub(crate) content_logical_size: Option<String>,
@@ -243,6 +257,20 @@ pub(crate) struct InodeRow {
     pub(crate) symlink_target: Option<Vec<u8>>,
     pub(crate) device_major: Option<i64>,
     pub(crate) device_minor: Option<i64>,
+}
+
+/// Primitive `content_metadata` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContentMetadataRow {
+    pub(crate) filesystem_id: Vec<u8>,
+    pub(crate) content_file_id: Vec<u8>,
+    pub(crate) owner_inode_id: Vec<u8>,
+    pub(crate) context_id: Vec<u8>,
+    pub(crate) policy_format: i32,
+    pub(crate) policy_bytes: Vec<u8>,
+    pub(crate) key_commitment: Option<Vec<u8>>,
+    pub(crate) wrapped_key_bytes: Option<Vec<u8>>,
+    pub(crate) record_revision: String,
 }
 
 /// Primitive `directory_entries` row.
@@ -382,6 +410,7 @@ fn encode_inode(filesystem_id: Vec<u8>, record: &InodeRecord) -> InodeRow {
         inode_generation: encode_u64(record.inode_generation().get()),
         kind: 0,
         content_file_id: None,
+        content_context_id: record.content_context_id().map(|id| id.as_bytes().to_vec()),
         data_generation: None,
         content_generation: None,
         content_logical_size: None,
@@ -467,44 +496,111 @@ fn decode_inode(
     let filesystem_id = FilesystemId::new(fixed_bytes("filesystem_id", row.filesystem_id.clone())?);
     let inode_id = InodeId::new(fixed_bytes("inode_id", row.inode_id.clone())?);
     let data = decode_inode_data(&row, limits)?;
-    let record = InodeRecord::new(
-        inode_id,
-        decode_qid_path("qid_path", &row.qid_path)?,
-        decode_record_revision("record_revision", &row.record_revision)?,
-        decode_u32("mode", i64::from(row.mode))?,
-        PrincipalId::new(row.owner, limits).map_err(RowCodecError::Bounded)?,
-        GroupId::new(row.group_id, limits).map_err(RowCodecError::Bounded)?,
-        InodeTimes {
-            accessed: decode_timestamp(
-                "accessed_nanoseconds",
-                row.accessed_seconds,
-                row.accessed_nanoseconds,
-            )?,
-            modified: decode_timestamp(
-                "modified_nanoseconds",
-                row.modified_seconds,
-                row.modified_nanoseconds,
-            )?,
-            changed: decode_timestamp(
-                "changed_nanoseconds",
-                row.changed_seconds,
-                row.changed_nanoseconds,
-            )?,
-            created: decode_timestamp(
-                "created_nanoseconds",
-                row.created_seconds,
-                row.created_nanoseconds,
-            )?,
-        },
-        decode_u64_value("logical_size", &row.logical_size)?,
-        decode_u64_value("link_count", &row.link_count)?,
-        decode_inode_generation("inode_generation", &row.inode_generation)?,
-        data,
-    )
-    .map_err(RowCodecError::InvalidRecord)?;
+    let qid_path = decode_qid_path("qid_path", &row.qid_path)?;
+    let revision = decode_record_revision("record_revision", &row.record_revision)?;
+    let mode = decode_u32("mode", i64::from(row.mode))?;
+    let owner = PrincipalId::new(row.owner, limits).map_err(RowCodecError::Bounded)?;
+    let group = GroupId::new(row.group_id, limits).map_err(RowCodecError::Bounded)?;
+    let times = InodeTimes {
+        accessed: decode_timestamp(
+            "accessed_nanoseconds",
+            row.accessed_seconds,
+            row.accessed_nanoseconds,
+        )?,
+        modified: decode_timestamp(
+            "modified_nanoseconds",
+            row.modified_seconds,
+            row.modified_nanoseconds,
+        )?,
+        changed: decode_timestamp(
+            "changed_nanoseconds",
+            row.changed_seconds,
+            row.changed_nanoseconds,
+        )?,
+        created: decode_timestamp(
+            "created_nanoseconds",
+            row.created_seconds,
+            row.created_nanoseconds,
+        )?,
+    };
+    let logical_size = decode_u64_value("logical_size", &row.logical_size)?;
+    let link_count = decode_u64_value("link_count", &row.link_count)?;
+    let inode_generation = decode_inode_generation("inode_generation", &row.inode_generation)?;
+    let record = match (data.kind(), row.content_context_id) {
+        (InodeKind::RegularFile, Some(context_id)) => InodeRecord::new_regular(
+            inode_id,
+            qid_path,
+            revision,
+            mode,
+            owner,
+            group,
+            times,
+            logical_size,
+            link_count,
+            inode_generation,
+            w9pt_fs_storage::ContentContextId::new(fixed_bytes("content_context_id", context_id)?),
+            data,
+        )
+        .map_err(RowCodecError::InvalidRecord)?,
+        (InodeKind::RegularFile, None) => {
+            return Err(RowCodecError::MissingField {
+                record: "regular inode",
+                field: "content_context_id",
+            });
+        }
+        (_, Some(_)) => {
+            return Err(RowCodecError::InvalidShape {
+                record: "inode",
+                detail: "content context belongs only to regular files",
+            });
+        }
+        (_, None) => InodeRecord::new(
+            inode_id,
+            qid_path,
+            revision,
+            mode,
+            owner,
+            group,
+            times,
+            logical_size,
+            link_count,
+            inode_generation,
+            data,
+        )
+        .map_err(RowCodecError::InvalidRecord)?,
+    };
     Ok((
         RecordKey::Inode(filesystem_id, inode_id),
         StateRecord::Inode(record),
+    ))
+}
+
+fn decode_content_metadata(
+    row: ContentMetadataRow,
+    limits: StateLimits,
+) -> Result<(RecordKey, StateRecord), RowCodecError> {
+    let filesystem_id = FilesystemId::new(fixed_bytes("filesystem_id", row.filesystem_id)?);
+    let file_id = FileId::new(fixed_bytes("content_file_id", row.content_file_id)?);
+    let record = ContentMetadataRecord::new(
+        InodeId::new(fixed_bytes("owner_inode_id", row.owner_inode_id)?),
+        file_id,
+        w9pt_fs_storage::ContentContextId::new(fixed_bytes("context_id", row.context_id)?),
+        decode_u16("policy_format", i64::from(row.policy_format))?,
+        row.policy_bytes,
+        row.key_commitment
+            .map(|bytes| fixed_bytes("key_commitment", bytes))
+            .transpose()?,
+        row.wrapped_key_bytes,
+        decode_record_revision("record_revision", &row.record_revision)?,
+        limits,
+    )
+    .map_err(|_| RowCodecError::InvalidShape {
+        record: "content metadata",
+        detail: "opaque content metadata failed validation",
+    })?;
+    Ok((
+        RecordKey::ContentMetadata(filesystem_id, file_id),
+        StateRecord::ContentMetadata(record),
     ))
 }
 
@@ -990,6 +1086,7 @@ fn require_inode_shape(record: &'static str, valid: bool) -> Result<(), RowCodec
 
 fn content_values_absent(row: &InodeRow) -> bool {
     row.content_file_id.is_none()
+        && row.content_context_id.is_none()
         && row.data_generation.is_none()
         && row.content_generation.is_none()
         && row.content_logical_size.is_none()
@@ -1141,20 +1238,40 @@ mod tests {
         data: InodeData,
         limits: StateLimits,
     ) -> InodeRecord {
-        InodeRecord::new(
-            inode_id,
-            QidPath::new(1).unwrap(),
-            revision(),
-            0o6754,
-            PrincipalId::new(b"owner".to_vec(), limits).unwrap(),
-            GroupId::new(b"group".to_vec(), limits).unwrap(),
-            times(),
-            logical_size,
-            u64::MAX,
-            InodeGeneration::new(u64::MAX).unwrap(),
-            data,
-        )
-        .unwrap()
+        let owner = PrincipalId::new(b"owner".to_vec(), limits).unwrap();
+        let group = GroupId::new(b"group".to_vec(), limits).unwrap();
+        if data.kind() == InodeKind::RegularFile {
+            InodeRecord::new_regular(
+                inode_id,
+                QidPath::new(1).unwrap(),
+                revision(),
+                0o6754,
+                owner,
+                group,
+                times(),
+                logical_size,
+                u64::MAX,
+                InodeGeneration::new(u64::MAX).unwrap(),
+                w9pt_fs_storage::ContentContextId::new(*inode_id.as_bytes()),
+                data,
+            )
+            .unwrap()
+        } else {
+            InodeRecord::new(
+                inode_id,
+                QidPath::new(1).unwrap(),
+                revision(),
+                0o6754,
+                owner,
+                group,
+                times(),
+                logical_size,
+                u64::MAX,
+                InodeGeneration::new(u64::MAX).unwrap(),
+                data,
+            )
+            .unwrap()
+        }
     }
 
     fn all_records(limits: StateLimits) -> Vec<(RecordKey, StateRecord)> {

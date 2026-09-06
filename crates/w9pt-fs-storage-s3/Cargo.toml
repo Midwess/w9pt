@@ -18,6 +18,10 @@ w9pt-fs-storage = { path = "../w9pt-fs-storage" }
 [features]
 default = ["default-https-client"]
 default-https-client = ["aws-sdk-s3/default-https-client"]
+representation-test = [
+    "w9pt-fs-storage/compression-lz4",
+    "w9pt-fs-storage/encryption-aes-siv",
+]
 
 [dev-dependencies]
 aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio"] }

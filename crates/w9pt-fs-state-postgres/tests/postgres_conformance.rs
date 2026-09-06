@@ -233,6 +233,7 @@ async fn reset_conformance_state(pool: &DatabaseConnection) -> Result<(), DbErr>
         r#"DELETE FROM "public"."w9pt_fs_state_opens" WHERE "filesystem_id" = $1"#,
         r#"DELETE FROM "public"."w9pt_fs_state_filesystem_records" WHERE "filesystem_id" = $1"#,
         r#"DELETE FROM "public"."w9pt_fs_state_inodes" WHERE "filesystem_id" = $1"#,
+        r#"DELETE FROM "public"."w9pt_fs_state_content_metadata" WHERE "filesystem_id" = $1"#,
         r#"DELETE FROM "public"."w9pt_fs_state_mutation_results" WHERE "filesystem_id" = $1"#,
         r#"DELETE FROM "public"."w9pt_fs_state_writer_lease_operations" WHERE "filesystem_id" = $1"#,
         r#"DELETE FROM "public"."w9pt_fs_state_writer_fences" WHERE "filesystem_id" = $1"#,

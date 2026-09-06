@@ -150,6 +150,22 @@ const UNIQUE_CONSTRAINTS: &[(&str, ConstraintAction)] = &[
     ),
     ("inodes_pkey", ConstraintAction::RecheckSemanticState),
     (
+        "content_metadata_pkey",
+        ConstraintAction::RecheckSemanticState,
+    ),
+    (
+        "content_metadata_context_unique",
+        ConstraintAction::RecheckSemanticState,
+    ),
+    (
+        "content_metadata_owner_unique",
+        ConstraintAction::RecheckSemanticState,
+    ),
+    (
+        "content_metadata_binding_unique",
+        ConstraintAction::RecheckSemanticState,
+    ),
+    (
         "inodes_qid_path_unique",
         ConstraintAction::RecheckSemanticState,
     ),
@@ -196,6 +212,10 @@ const FOREIGN_KEY_CONSTRAINTS: &[(&str, ConstraintAction)] = &[
     ),
     (
         "inodes_directory_parent_fk",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "inodes_content_context_fk",
         ConstraintAction::InvariantFailure,
     ),
     ("opens_inode_fk", ConstraintAction::InvariantFailure),
@@ -306,6 +326,10 @@ const CHECK_CONSTRAINTS: &[(&str, ConstraintAction)] = &[
         ConstraintAction::InvariantFailure,
     ),
     (
+        "inodes_content_context_id_width",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
         "inodes_data_generation_range",
         ConstraintAction::InvariantFailure,
     ),
@@ -359,6 +383,46 @@ const CHECK_CONSTRAINTS: &[(&str, ConstraintAction)] = &[
     ),
     (
         "inodes_kind_specific_shape",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_filesystem_id_width",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_content_file_id_width",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_owner_inode_id_width",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_context_id_width",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_policy_format_range",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_policy_bounds",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_key_shape",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_commitment_width",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_wrapped_bounds",
+        ConstraintAction::InvariantFailure,
+    ),
+    (
+        "content_metadata_record_revision_range",
         ConstraintAction::InvariantFailure,
     ),
     (

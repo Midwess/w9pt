@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use w9pt_fs_storage::{
-    BLOCK_SIZE_V1, RangeError,
+    BLOCK_SIZE, RangeError,
     layout::{BlockSpans, LogicalRange},
 };
 
@@ -33,7 +33,7 @@ fn eof_clamping_preserves_only_visible_bytes() {
 
 #[test]
 fn unaligned_cross_block_range_has_ordered_buffer_spans() {
-    let block = u64::from(BLOCK_SIZE_V1);
+    let block = u64::from(BLOCK_SIZE);
     let range = LogicalRange::new(block - 2, block + 5).unwrap();
     let spans = BlockSpans::new(range).unwrap().collect::<Vec<_>>();
     let values = spans
@@ -50,16 +50,16 @@ fn unaligned_cross_block_range_has_ordered_buffer_spans() {
     assert_eq!(
         values,
         vec![
-            (0, BLOCK_SIZE_V1 - 2, 0, 2),
-            (1, 0, 2, BLOCK_SIZE_V1),
-            (2, 0, BLOCK_SIZE_V1 as usize + 2, 3),
+            (0, BLOCK_SIZE - 2, 0, 2),
+            (1, 0, 2, BLOCK_SIZE),
+            (2, 0, BLOCK_SIZE as usize + 2, 3),
         ]
     );
 }
 
 #[test]
 fn exact_full_block_is_identified_without_neighbor_spans() {
-    let range = LogicalRange::new(u64::from(BLOCK_SIZE_V1), u64::from(BLOCK_SIZE_V1)).unwrap();
+    let range = LogicalRange::new(u64::from(BLOCK_SIZE), u64::from(BLOCK_SIZE)).unwrap();
     let spans = BlockSpans::new(range).unwrap().collect::<Vec<_>>();
     assert_eq!(spans.len(), 1);
     assert!(spans[0].is_full_block());

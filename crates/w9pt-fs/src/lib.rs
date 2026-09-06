@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod authorization;
+mod content_context;
 mod engine;
 mod error;
 mod execution;
@@ -24,6 +25,10 @@ pub use authorization::{
     AccessRequirements, AuthorizationError, CreationAttributes, check_directory_mutation,
     check_directory_search, check_inode_access, check_mutation_allowed, check_owner_or_privileged,
     check_ownership_change, check_sticky_directory, creation_attributes,
+};
+pub use content_context::{
+    ContentContextOrchestrationError, content_context_create_changes, generate_content_context,
+    load_committed_content_context, rewrap_content_context,
 };
 pub use engine::{
     LedgerProbeError, LedgerReplay, MutationRunnerError, PlannedCommitMismatch,

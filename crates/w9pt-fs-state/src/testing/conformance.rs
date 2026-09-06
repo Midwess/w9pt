@@ -4,18 +4,19 @@ use core::{fmt, future::Future};
 
 use crate::{
     AcquireLeaseOutcome, AcquireWriterLease, ChangeCursor, ChangePoll, ChangePollOutcome,
-    ClientIncarnationId, CommitOutcome, CommitRequest, DataGeneration, DirectoryCookie,
-    DirectoryEntryRecord, DirectoryGeneration, EntryName, FilesystemId, FilesystemRecord,
-    FilesystemStateStore, GroupId, InodeData, InodeGeneration, InodeId, InodeRecord, InodeTimes,
-    LeaseDuration, LeaseId, LeaseOperationId, LeaseRejection, LockGeneration, LockId, LockKind,
-    LockOwner, LockRange, LockRecord, MutationContext, MutationResult, MutationResultKind,
-    MutationRetention, OpenAccess, OpenId, OpenPinRecord, OpenRecord, OrphanRecord, Precondition,
-    PrincipalId, PublishContent, PublishXattrStaging, QidPath, ReadBatch, ReadConsistency,
-    ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision, RecordScan, ReleaseLeaseOutcome,
-    ReleaseWriterLease, RenewLeaseOutcome, RenewWriterLease, ResultFormatVersion, ScanBounds,
-    ScanResume, StateChange, StateLimitValues, StateLimits, StateRecord, StateRevision,
-    SymlinkTarget, UnixTimestamp, WriterFence, WriterIncarnationId, WriterScopeId, WriterTopology,
-    XattrName, XattrRecord, XattrStagingId, XattrStagingRecord, XattrValue,
+    ClientIncarnationId, CommitOutcome, CommitRequest, ContentMetadataRecord, DataGeneration,
+    DirectoryCookie, DirectoryEntryRecord, DirectoryGeneration, EntryName, FilesystemId,
+    FilesystemRecord, FilesystemStateStore, GroupId, InodeData, InodeGeneration, InodeId,
+    InodeRecord, InodeTimes, LeaseDuration, LeaseId, LeaseOperationId, LeaseRejection,
+    LockGeneration, LockId, LockKind, LockOwner, LockRange, LockRecord, MutationContext,
+    MutationResult, MutationResultKind, MutationRetention, OpenAccess, OpenId, OpenPinRecord,
+    OpenRecord, OrphanRecord, Precondition, PrincipalId, PublishContent, PublishXattrStaging,
+    QidPath, ReadBatch, ReadConsistency, ReadOutcome, ReadQuery, ReadResult, RecordKey,
+    RecordRevision, RecordScan, ReleaseLeaseOutcome, ReleaseWriterLease, RenewLeaseOutcome,
+    RenewWriterLease, ResultFormatVersion, RewrapContentMetadata, ScanBounds, ScanResume,
+    StateChange, StateLimitValues, StateLimits, StateRecord, StateRevision, SymlinkTarget,
+    UnixTimestamp, WriterFence, WriterIncarnationId, WriterScopeId, WriterTopology, XattrName,
+    XattrRecord, XattrStagingId, XattrStagingRecord, XattrValue,
 };
 
 /// Adapter-owned controls required for deterministic time and failure boundaries.
@@ -400,6 +401,17 @@ where
     }
 
     check_record_set_semantics(&writer, filesystem_id, root_id, grant.fence, times, limits).await?;
+    check_content_metadata_semantics(
+        harness,
+        &writer,
+        &observer,
+        filesystem_id,
+        root_id,
+        grant.fence,
+        times,
+        limits,
+    )
+    .await?;
     check_independent_client_commits(
         &writer,
         &observer,
@@ -815,6 +827,399 @@ where
     ) {
         return Err(StateStoreConformanceError::assertion(
             "compacted revision did not force authoritative cache reload",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_content_metadata_semantics<H: StateStoreConformanceHarness>(
+    harness: &H,
+    writer: &H::Store,
+    observer: &H::Store,
+    filesystem_id: FilesystemId,
+    root_id: InodeId,
+    fence: WriterFence,
+    times: InodeTimes,
+    limits: StateLimits,
+) -> Result<(), StateStoreConformanceError> {
+    let inode_id = InodeId::from_u128(30);
+    let file_id = w9pt_fs_storage::FileId::from_u128(31);
+    let context_id = w9pt_fs_storage::ContentContextId::from_u128(32);
+    let candidate_context_id = w9pt_fs_storage::ContentContextId::from_u128(33);
+    let context_key = RecordKey::ContentMetadata(filesystem_id, file_id);
+    let inode_key = RecordKey::Inode(filesystem_id, inode_id);
+    let entry_name = EntryName::new(b"context".to_vec(), limits)
+        .map_err(|error| StateStoreConformanceError::adapter("build context entry", error))?;
+    let entry_key = RecordKey::DirectoryEntry(filesystem_id, root_id, entry_name.clone());
+    let revision = RecordRevision::new(1).expect("one is a valid record revision");
+
+    let inode = conformance_file_at_qid(
+        inode_id,
+        file_id,
+        QidPath::new(3).expect("three is a valid QID path"),
+        context_id,
+        1,
+        1,
+        None,
+        times,
+        limits,
+    )?;
+    let metadata = ContentMetadataRecord::new(
+        inode_id,
+        file_id,
+        context_id,
+        1,
+        vec![1, 2, 3, 4],
+        Some([5; 32]),
+        Some(vec![6; 76]),
+        revision,
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build content metadata", error))?;
+    let mutation = MutationContext::new(
+        w9pt_fs_storage::MutationId::from_u128(130),
+        crate::RequestFingerprint::blake3(b"content-context-create"),
+        ClientIncarnationId::from_u128(131),
+        MutationRetention::new(100),
+    );
+    let create = CommitRequest::new(
+        filesystem_id,
+        mutation,
+        fence,
+        vec![
+            Precondition::RecordAbsent(inode_key.clone()),
+            Precondition::RecordAbsent(context_key.clone()),
+            Precondition::RecordAbsent(entry_key.clone()),
+        ],
+        vec![
+            StateChange::Insert {
+                key: inode_key.clone(),
+                record: StateRecord::Inode(inode),
+            },
+            StateChange::Insert {
+                key: context_key.clone(),
+                record: StateRecord::ContentMetadata(metadata),
+            },
+            StateChange::Insert {
+                key: entry_key.clone(),
+                record: StateRecord::DirectoryEntry(
+                    DirectoryEntryRecord::new(
+                        root_id,
+                        entry_name.clone(),
+                        DirectoryCookie::new(3),
+                        inode_id,
+                        revision,
+                    )
+                    .map_err(|error| {
+                        StateStoreConformanceError::adapter("build context directory entry", error)
+                    })?,
+                ),
+            },
+            StateChange::AdvanceQidPath {
+                count: core::num::NonZeroU64::new(1).expect("one is nonzero"),
+            },
+            StateChange::AdvanceDirectoryCookie {
+                count: core::num::NonZeroU64::new(1).expect("one is nonzero"),
+            },
+            StateChange::BumpDirectoryGeneration(root_id),
+        ],
+        terminal_result(context_id.as_bytes(), limits)?,
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build content context create", error))?;
+    harness
+        .inject_commit_failure(super::CommitFailureTiming::BeforePublication)
+        .await
+        .map_err(|error| {
+            StateStoreConformanceError::adapter("inject context before failure", error)
+        })?;
+    if writer.commit(create.clone()).await.is_ok() {
+        return Err(StateStoreConformanceError::assertion(
+            "before-publication context failure did not fail definitively",
+        ));
+    }
+    let absent_read = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![ReadQuery::InodeWithContentMetadata(inode_id)],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build absent context read", error))?;
+    if !matches!(
+        observer
+            .read(absent_read)
+            .await
+            .map_err(|error| StateStoreConformanceError::adapter("read absent context", error))?,
+        ReadOutcome::Snapshot(snapshot)
+            if matches!(
+                &snapshot.results()[0],
+                ReadResult::InodeWithContentMetadata {
+                    inode: None,
+                    metadata: None,
+                    ..
+                }
+            )
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "failed context creation exposed a partial inode or context",
+        ));
+    }
+    harness
+        .inject_commit_failure(super::CommitFailureTiming::AfterPublication)
+        .await
+        .map_err(|error| {
+            StateStoreConformanceError::adapter("inject context after failure", error)
+        })?;
+    if !matches!(
+        writer
+            .commit(create)
+            .await
+            .map_err(|error| StateStoreConformanceError::adapter(
+                "ambiguous context create",
+                error
+            ))?,
+        CommitOutcome::Ambiguous(_)
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "after-publication context failure was not ambiguous",
+        ));
+    }
+
+    let losing_inode = conformance_file_at_qid(
+        inode_id,
+        file_id,
+        QidPath::new(3).expect("three is a valid QID path"),
+        candidate_context_id,
+        1,
+        1,
+        None,
+        times,
+        limits,
+    )?;
+    let losing_metadata = ContentMetadataRecord::new(
+        inode_id,
+        file_id,
+        candidate_context_id,
+        1,
+        vec![1, 2, 3, 4],
+        Some([7; 32]),
+        Some(vec![8; 76]),
+        revision,
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build losing metadata", error))?;
+    let replay = CommitRequest::new(
+        filesystem_id,
+        mutation,
+        fence,
+        vec![
+            Precondition::RecordAbsent(inode_key.clone()),
+            Precondition::RecordAbsent(context_key.clone()),
+            Precondition::RecordAbsent(entry_key.clone()),
+        ],
+        vec![
+            StateChange::Insert {
+                key: inode_key.clone(),
+                record: StateRecord::Inode(losing_inode),
+            },
+            StateChange::Insert {
+                key: context_key.clone(),
+                record: StateRecord::ContentMetadata(losing_metadata),
+            },
+            StateChange::Insert {
+                key: entry_key.clone(),
+                record: StateRecord::DirectoryEntry(
+                    DirectoryEntryRecord::new(
+                        root_id,
+                        entry_name,
+                        DirectoryCookie::new(3),
+                        inode_id,
+                        revision,
+                    )
+                    .map_err(|error| {
+                        StateStoreConformanceError::adapter(
+                            "build losing context directory entry",
+                            error,
+                        )
+                    })?,
+                ),
+            },
+            StateChange::AdvanceQidPath {
+                count: core::num::NonZeroU64::new(1).expect("one is nonzero"),
+            },
+            StateChange::AdvanceDirectoryCookie {
+                count: core::num::NonZeroU64::new(1).expect("one is nonzero"),
+            },
+            StateChange::BumpDirectoryGeneration(root_id),
+        ],
+        terminal_result(context_id.as_bytes(), limits)?,
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build context replay", error))?;
+    let committed = match observer
+        .commit(replay)
+        .await
+        .map_err(|error| StateStoreConformanceError::adapter("replay context create", error))?
+    {
+        CommitOutcome::AlreadyCommitted(committed) => committed,
+        outcome => {
+            return Err(StateStoreConformanceError::unexpected(
+                "replay context create",
+                format!("{outcome:?}"),
+            ));
+        }
+    };
+    if committed.result.bytes() != context_id.as_bytes() {
+        return Err(StateStoreConformanceError::assertion(
+            "content context replay did not preserve the committed candidate",
+        ));
+    }
+
+    let read = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![
+            ReadQuery::InodeWithContentMetadata(inode_id),
+            ReadQuery::Scan(RecordScan::ContentMetadata {
+                after: None,
+                bounds: ScanBounds::new(8, 4_096, limits).map_err(|error| {
+                    StateStoreConformanceError::adapter("build content metadata scan", error)
+                })?,
+            }),
+        ],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build content context read", error))?;
+    let ReadOutcome::Snapshot(snapshot) = observer
+        .read(read)
+        .await
+        .map_err(|error| StateStoreConformanceError::adapter("read content context", error))?
+    else {
+        return Err(StateStoreConformanceError::assertion(
+            "content context read did not return a snapshot",
+        ));
+    };
+    let ReadResult::InodeWithContentMetadata {
+        inode: Some(inode),
+        metadata: Some(metadata),
+        ..
+    } = &snapshot.results()[0]
+    else {
+        return Err(StateStoreConformanceError::assertion(
+            "independent client did not load the complete content context",
+        ));
+    };
+    if inode.content_context_id() != Some(context_id)
+        || metadata.context_id() != context_id
+        || metadata.key_commitment() != Some(&[5; 32])
+    {
+        return Err(StateStoreConformanceError::assertion(
+            "content context binding changed across clients",
+        ));
+    }
+    if !matches!(
+        &snapshot.results()[1],
+        ReadResult::Scan(page)
+            if page.records().iter().any(|(key, record)|
+                key == &context_key
+                    && matches!(record, StateRecord::ContentMetadata(value)
+                        if value.context_id() == context_id))
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "bounded content metadata scan omitted the committed context",
+        ));
+    }
+    let context_revision = metadata.revision();
+
+    let stale_revision = RecordRevision::new(
+        context_revision
+            .get()
+            .checked_add(1)
+            .expect("test revision advances"),
+    )
+    .expect("advanced test revision is nonzero");
+    let stale = commit_changes(
+        writer,
+        filesystem_id,
+        132,
+        fence,
+        vec![StateChange::RewrapContentMetadata(RewrapContentMetadata {
+            content_file_id: file_id,
+            expected_context_id: context_id,
+            expected_revision: stale_revision,
+            wrapped_key_bytes: vec![9; 76],
+        })],
+        limits,
+    )
+    .await?;
+    if !matches!(stale, CommitOutcome::Conflict(_)) {
+        return Err(StateStoreConformanceError::unexpected(
+            "stale content rewrap",
+            format!("{stale:?}"),
+        ));
+    }
+
+    require_committed(
+        "rewrap content metadata",
+        commit_changes(
+            writer,
+            filesystem_id,
+            133,
+            fence,
+            vec![StateChange::RewrapContentMetadata(RewrapContentMetadata {
+                content_file_id: file_id,
+                expected_context_id: context_id,
+                expected_revision: context_revision,
+                wrapped_key_bytes: vec![10; 76],
+            })],
+            limits,
+        )
+        .await?,
+    )?;
+    require_committed(
+        "retire context owner",
+        commit_changes(
+            writer,
+            filesystem_id,
+            134,
+            fence,
+            vec![
+                StateChange::Delete(entry_key),
+                StateChange::Delete(inode_key),
+                StateChange::BumpDirectoryGeneration(root_id),
+            ],
+            limits,
+        )
+        .await?,
+    )?;
+    let retained = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![
+            ReadQuery::Inode(inode_id),
+            ReadQuery::ContentMetadata(file_id),
+        ],
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build retained context read", error))?;
+    if !matches!(
+        observer
+            .read(retained)
+            .await
+            .map_err(|error| StateStoreConformanceError::adapter("read retained context", error))?,
+        ReadOutcome::Snapshot(snapshot)
+            if matches!(&snapshot.results()[0], ReadResult::Point { record: None, .. })
+                && matches!(
+                    &snapshot.results()[1],
+                    ReadResult::Point { record: Some(record), .. }
+                        if matches!(record.as_ref(), StateRecord::ContentMetadata(metadata)
+                            if metadata.context_id() == context_id
+                                && metadata.wrapped_key_bytes() == Some(&[10; 76][..]))
+                )
+    ) {
+        return Err(StateStoreConformanceError::assertion(
+            "content metadata did not survive inode retirement",
         ));
     }
     Ok(())
@@ -2093,6 +2498,14 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
                 record: StateRecord::Inode(file),
             },
             StateChange::Insert {
+                key: RecordKey::ContentMetadata(filesystem_id, content_file_id),
+                record: StateRecord::ContentMetadata(conformance_content_metadata(
+                    file_id,
+                    content_file_id,
+                    limits,
+                )?),
+            },
+            StateChange::Insert {
                 key: RecordKey::DirectoryEntry(filesystem_id, root_id, entry_name.clone()),
                 record: StateRecord::DirectoryEntry(entry),
             },
@@ -2110,7 +2523,18 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
         limits,
     )
     .await?;
-    require_committed("create record set", create)?;
+    let create_revision = match create {
+        CommitOutcome::Committed(committed) => RecordRevision::new(committed.revision.get())
+            .map_err(|error| {
+                StateStoreConformanceError::adapter("content metadata revision", error)
+            })?,
+        outcome => {
+            return Err(StateStoreConformanceError::unexpected(
+                "create record set",
+                format!("{outcome:?}"),
+            ));
+        }
+    };
 
     let page_request = ReadBatch::new(
         filesystem_id,
@@ -2270,8 +2694,25 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
         w9pt_fs_storage::StorageLimits::default(),
     )
     .map_err(|error| StateStoreConformanceError::adapter("build content repository", error))?;
+    let policy =
+        w9pt_fs_storage::FileStoragePolicy::plain(w9pt_fs_storage::StorageMethod::BlockSplit);
+    let context = w9pt_fs_storage::open_committed_context(
+        w9pt_fs_storage::FileContextScope::new(
+            *filesystem_id.as_bytes(),
+            *file_id.as_bytes(),
+            content_file_id,
+            conformance_context_id(content_file_id),
+        ),
+        w9pt_fs_storage::FileStoragePolicy::FORMAT,
+        &policy.to_bytes(),
+        None,
+        None,
+        create_revision.get(),
+        None,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("open content context", error))?;
     let prepared = repository
-        .prepare_create(content_file_id, content_mutation, 0, b"d")
+        .prepare_create_with_context(&context, content_mutation, 0, b"d")
         .await
         .map_err(|error| StateStoreConformanceError::adapter("prepare content", error))?;
     let publish_request =
@@ -2356,7 +2797,7 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
         changed: changed_timestamp,
         created: times.created,
     };
-    let setattr = InodeRecord::new(
+    let setattr = InodeRecord::new_regular(
         file_id,
         QidPath::new(2).expect("two is a valid QID path"),
         RecordRevision::new(1).expect("one is nonzero"),
@@ -2369,6 +2810,7 @@ async fn check_record_set_semantics<S: FilesystemStateStore>(
         prepared.content().logical_size(),
         1,
         InodeGeneration::new(5).expect("five is nonzero"),
+        conformance_context_id(content_file_id),
         InodeData::RegularFile {
             content_file_id,
             content: Some(prepared.content().clone()),
@@ -2862,15 +3304,40 @@ fn conformance_file(
     times: InodeTimes,
     limits: StateLimits,
 ) -> Result<InodeRecord, StateStoreConformanceError> {
+    conformance_file_at_qid(
+        file_id,
+        content_file_id,
+        QidPath::new(2).expect("two is a valid QID path"),
+        conformance_context_id(content_file_id),
+        links,
+        inode_generation,
+        content,
+        times,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conformance_file_at_qid(
+    file_id: InodeId,
+    content_file_id: w9pt_fs_storage::FileId,
+    qid_path: QidPath,
+    context_id: w9pt_fs_storage::ContentContextId,
+    links: u64,
+    inode_generation: u64,
+    content: Option<w9pt_fs_storage::ContentRef>,
+    times: InodeTimes,
+    limits: StateLimits,
+) -> Result<InodeRecord, StateStoreConformanceError> {
     let logical_size = content
         .as_ref()
         .map_or(0, w9pt_fs_storage::ContentRef::logical_size);
     let data_generation = content
         .as_ref()
         .map_or(0, w9pt_fs_storage::ContentRef::generation);
-    InodeRecord::new(
+    InodeRecord::new_regular(
         file_id,
-        QidPath::new(2).expect("two is a valid QID path"),
+        qid_path,
         RecordRevision::new(1).expect("one is nonzero"),
         0o644,
         PrincipalId::new(b"p".to_vec(), limits)
@@ -2881,6 +3348,7 @@ fn conformance_file(
         logical_size,
         links,
         InodeGeneration::new(inode_generation).expect("test generation is nonzero"),
+        context_id,
         InodeData::RegularFile {
             content_file_id,
             content,
@@ -2888,6 +3356,31 @@ fn conformance_file(
         },
     )
     .map_err(|error| StateStoreConformanceError::adapter("build file inode", error))
+}
+
+fn conformance_context_id(file_id: w9pt_fs_storage::FileId) -> w9pt_fs_storage::ContentContextId {
+    w9pt_fs_storage::ContentContextId::new(*file_id.as_bytes())
+}
+
+fn conformance_content_metadata(
+    inode_id: InodeId,
+    file_id: w9pt_fs_storage::FileId,
+    limits: StateLimits,
+) -> Result<ContentMetadataRecord, StateStoreConformanceError> {
+    let policy =
+        w9pt_fs_storage::FileStoragePolicy::plain(w9pt_fs_storage::StorageMethod::BlockSplit);
+    ContentMetadataRecord::new(
+        inode_id,
+        file_id,
+        conformance_context_id(file_id),
+        w9pt_fs_storage::FileStoragePolicy::FORMAT,
+        policy.to_bytes().to_vec(),
+        None,
+        None,
+        RecordRevision::new(1).expect("one is nonzero"),
+        limits,
+    )
+    .map_err(|error| StateStoreConformanceError::adapter("build content metadata", error))
 }
 
 fn terminal_result(

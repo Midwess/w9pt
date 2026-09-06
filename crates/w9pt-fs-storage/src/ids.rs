@@ -159,7 +159,7 @@ impl Digest {
         &self.0
     }
 
-    /// Computes the version-1 BLAKE3-256 digest of canonical plaintext bytes.
+    /// Computes the current BLAKE3-256 digest of canonical plaintext bytes.
     pub fn blake3(bytes: &[u8]) -> Self {
         Self(*blake3::hash(bytes).as_bytes())
     }
@@ -493,6 +493,7 @@ pub struct PreparedContent {
     content_changed: bool,
     identity: PreparationIdentity,
     attempt: u32,
+    context_binding: crate::ContentContextBinding,
 }
 
 impl PreparedContent {
@@ -502,12 +503,14 @@ impl PreparedContent {
         content_changed: bool,
         identity: PreparationIdentity,
         attempt: u32,
+        context_binding: crate::ContentContextBinding,
     ) -> Self {
         Self {
             content,
             content_changed,
             identity,
             attempt,
+            context_binding,
         }
     }
 
@@ -534,6 +537,11 @@ impl PreparedContent {
     /// Returns the attempt component used in immutable keys.
     pub const fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// Returns the nonsecret committed file-context binding used for preparation.
+    pub const fn context_binding(&self) -> &crate::ContentContextBinding {
+        &self.context_binding
     }
 }
 
@@ -577,7 +585,7 @@ mod tests {
             ObjectKey::new("a\nb"),
             Err(InvalidObjectKey::ControlCharacter)
         );
-        assert_eq!(ObjectKey::new("v1/data").unwrap().as_str(), "v1/data");
+        assert_eq!(ObjectKey::new("v2/data").unwrap().as_str(), "v2/data");
     }
 
     #[test]

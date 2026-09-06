@@ -13,12 +13,12 @@ use w9pt_fs_state_postgres::{
 use common::{connect, live_dsn, native_code_and_constraint, statement};
 
 const MIGRATION_LOCK_KEY: i64 = 0x7739_7074_6673_7631;
-const DIRECT_CUT_V1_COLUMN_COUNT: i64 = 130;
-const DIRECT_CUT_V1_CONSTRAINT_COUNT: i64 = 172;
-const DIRECT_CUT_V1_INDEX_COUNT: i64 = 23;
-const DIRECT_CUT_V1_COLUMN_CATALOG_MD5: &str = "7f3d74bc3cd8d0767905fc84e79e048f";
-const DIRECT_CUT_V1_CONSTRAINT_CATALOG_MD5: &str = "a494e9a593ea21357ccb274387a60f84";
-const DIRECT_CUT_V1_INDEX_CATALOG_MD5: &str = "2d7113a6c7bf648a4c7d8ac0f69151e9";
+const DIRECT_CUT_V1_COLUMN_COUNT: i64 = 140;
+const DIRECT_CUT_V1_CONSTRAINT_COUNT: i64 = 188;
+const DIRECT_CUT_V1_INDEX_COUNT: i64 = 27;
+const DIRECT_CUT_V1_COLUMN_CATALOG_MD5: &str = "1c9ca130deec576eb1f49b28d4d220b6";
+const DIRECT_CUT_V1_CONSTRAINT_CATALOG_MD5: &str = "877df26811cee2df93975e7c13d10b45";
+const DIRECT_CUT_V1_INDEX_CATALOG_MD5: &str = "a0278ed649deb6575284456bd1aef9f8";
 const COLUMN_CATALOG_COUNT_SQL: &str = r#"
 SELECT pg_catalog.count(*)::bigint AS catalog_count
 FROM information_schema.columns
@@ -290,28 +290,22 @@ async fn explicit_migration_is_idempotent() -> Result<(), Box<dyn std::error::Er
     pool.execute_unprepared(RESET_PUBLIC_STATE_TABLES).await?;
     PostgresStateStore::migrate(&pool).await?;
     assert_eq!(
-        catalog_count(&pool, COLUMN_CATALOG_COUNT_SQL).await?,
-        DIRECT_CUT_V1_COLUMN_COUNT
-    );
-    assert_eq!(
-        catalog_count(&pool, CONSTRAINT_CATALOG_COUNT_SQL).await?,
-        DIRECT_CUT_V1_CONSTRAINT_COUNT
-    );
-    assert_eq!(
-        catalog_count(&pool, INDEX_CATALOG_COUNT_SQL).await?,
-        DIRECT_CUT_V1_INDEX_COUNT
-    );
-    assert_eq!(
-        catalog_md5(&pool, COLUMN_CATALOG_MD5_SQL).await?,
-        DIRECT_CUT_V1_COLUMN_CATALOG_MD5
-    );
-    assert_eq!(
-        catalog_md5(&pool, CONSTRAINT_CATALOG_MD5_SQL).await?,
-        DIRECT_CUT_V1_CONSTRAINT_CATALOG_MD5
-    );
-    assert_eq!(
-        catalog_md5(&pool, INDEX_CATALOG_MD5_SQL).await?,
-        DIRECT_CUT_V1_INDEX_CATALOG_MD5
+        (
+            catalog_count(&pool, COLUMN_CATALOG_COUNT_SQL).await?,
+            catalog_count(&pool, CONSTRAINT_CATALOG_COUNT_SQL).await?,
+            catalog_count(&pool, INDEX_CATALOG_COUNT_SQL).await?,
+            catalog_md5(&pool, COLUMN_CATALOG_MD5_SQL).await?,
+            catalog_md5(&pool, CONSTRAINT_CATALOG_MD5_SQL).await?,
+            catalog_md5(&pool, INDEX_CATALOG_MD5_SQL).await?,
+        ),
+        (
+            DIRECT_CUT_V1_COLUMN_COUNT,
+            DIRECT_CUT_V1_CONSTRAINT_COUNT,
+            DIRECT_CUT_V1_INDEX_COUNT,
+            DIRECT_CUT_V1_COLUMN_CATALOG_MD5.to_owned(),
+            DIRECT_CUT_V1_CONSTRAINT_CATALOG_MD5.to_owned(),
+            DIRECT_CUT_V1_INDEX_CATALOG_MD5.to_owned(),
+        )
     );
 
     let invalid = pool

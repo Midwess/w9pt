@@ -192,7 +192,7 @@ mod tests {
         let head = FileHead::new(
             FileId::from_u128(1),
             7,
-            ObjectKey::new("private/v1/manifest").unwrap(),
+            ObjectKey::new("private/v2/manifest").unwrap(),
             Digest::new([3; 32]),
             MutationId::from_u128(2),
         );

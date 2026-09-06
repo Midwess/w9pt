@@ -2,14 +2,18 @@
 
 use crate::{
     AmbiguityError, AmbiguousOperation, ContentRef, CorruptionError, CreationDefaults, Digest,
-    FileId, KeySpace, LimitError, LimitKind, MissingObjectKind, MutationId, ObjectKey,
+    FileId, FormatError, KeySpace, LimitError, LimitKind, MissingObjectKind, MutationId, ObjectKey,
     PreparedContent, PutIfAbsent, StorageError, StorageLimits, TargetError, TargetOperation,
     TargetStore,
     format::{
-        BlobRef, FileManifest, ManifestLayout, ObjectKind, decode_envelope, decode_manifest,
-        encode_envelope, encode_manifest,
+        BlobRef, BlockMapPage, FileManifest, ManifestLayout, ObjectKind, PageRef,
+        decode_block_map_page, decode_manifest, encode_block_map_page, encode_manifest,
+        validate_page_context,
     },
     keys::PreparationKey,
+    representation::{
+        DecodedObject, FileCryptoContext, ObjectProvenance, decode_object, encode_object,
+    },
 };
 
 /// Runtime-neutral repository for immutable logical file content.
@@ -69,20 +73,57 @@ impl<S: TargetStore> ContentRepository<S> {
         &self,
         content: &ContentRef,
     ) -> Result<FileManifest, StorageError<S::Error>> {
+        let context = FileCryptoContext::plain_for_file(content.file_id(), content.method());
+        self.load_manifest_with_context(content, &context).await
+    }
+
+    /// Loads an immutable manifest under its selected committed file context.
+    pub async fn load_manifest_with_context(
+        &self,
+        content: &ContentRef,
+        context: &FileCryptoContext,
+    ) -> Result<FileManifest, StorageError<S::Error>> {
+        self.validate_context(content.file_id(), content.method(), context)?;
         let key = content.manifest_key().clone();
-        let preparation = self.validate_manifest_key(content.file_id(), &key)?;
-        preparation.validate_result_generation(content.generation())?;
+        self.keys.ensure_owned(&key)?;
         let bytes = self
             .get_required(key.clone(), MissingObjectKind::Manifest)
             .await?;
         if Digest::blake3(&bytes) != content.manifest_digest() {
             return Err(CorruptionError::DigestMismatch.into());
         }
-        let manifest = decode_manifest(&bytes, self.limits).map_err(StorageError::from)?;
+        let DecodedObject {
+            canonical,
+            provenance,
+            ..
+        } = decode_object(
+            ObjectKind::Manifest,
+            &key,
+            &bytes,
+            context,
+            self.limits.max_manifest_bytes(),
+        )?;
+        let ObjectProvenance::Manifest {
+            identity,
+            attempt,
+            generation,
+        } = provenance
+        else {
+            return Err(crate::RepresentationError::ProvenanceMismatch.into());
+        };
+        if generation != content.generation() {
+            return Err(CorruptionError::IdentityMismatch {
+                field: "manifest generation",
+            }
+            .into());
+        }
+        PreparationKey { identity, attempt }.validate_result_generation(content.generation())?;
+        self.validate_object_key(context, content.file_id(), provenance, &key)?;
+        let manifest = decode_manifest(&canonical, self.limits).map_err(StorageError::from)?;
         manifest
             .validate_content_ref(content)
             .map_err(StorageError::from)?;
-        self.validate_manifest_payloads(&manifest)?;
+        self.validate_manifest_payloads(&manifest, context)?;
         Ok(manifest)
     }
 
@@ -94,14 +135,34 @@ impl<S: TargetStore> ContentRepository<S> {
         self.load_manifest(content).await.map(|_| ())
     }
 
-    /// Confirms the version-1 content-only durability barrier.
+    /// Validates a portable reference under its selected committed context.
+    pub async fn validate_content_with_context(
+        &self,
+        content: &ContentRef,
+        context: &FileCryptoContext,
+    ) -> Result<(), StorageError<S::Error>> {
+        self.load_manifest_with_context(content, context)
+            .await
+            .map(|_| ())
+    }
+
+    /// Confirms the current content-only durability barrier.
     ///
-    /// Version 1 has no write-back state: successful immutable puts and head CAS
+    /// The current format has no write-back state: successful immutable puts and head CAS
     /// operations are already durable by the target contract. This validates the
     /// referenced immutable manifest and does not claim inode, namespace, or other
     /// future filesystem metadata durability.
     pub async fn sync_content(&self, content: &ContentRef) -> Result<(), StorageError<S::Error>> {
         self.validate_content(content).await
+    }
+
+    /// Applies the content-only durability barrier under a committed context.
+    pub async fn sync_content_with_context(
+        &self,
+        content: &ContentRef,
+        context: &FileCryptoContext,
+    ) -> Result<(), StorageError<S::Error>> {
+        self.validate_content_with_context(content, context).await
     }
 
     /// Prepares initial immutable content using the configured default method.
@@ -115,12 +176,35 @@ impl<S: TargetStore> ContentRepository<S> {
         attempt: u32,
         bytes: &[u8],
     ) -> Result<PreparedContent, StorageError<S::Error>> {
-        match self.defaults.method() {
+        let context = FileCryptoContext::plain_for_file(file_id, self.defaults.method());
+        self.prepare_create_with_context(&context, mutation_id, attempt, bytes)
+            .await
+    }
+
+    /// Prepares initial content using an already selected committed file context.
+    pub async fn prepare_create_with_context(
+        &self,
+        context: &FileCryptoContext,
+        mutation_id: MutationId,
+        attempt: u32,
+        bytes: &[u8],
+    ) -> Result<PreparedContent, StorageError<S::Error>> {
+        crate::representation::require_writer_support(context.policy())?;
+        let file_id = context.binding().file_id();
+        match context.policy().method() {
             crate::StorageMethod::Raw => {
-                crate::layout::create_raw(self, file_id, mutation_id, attempt, bytes).await
+                crate::layout::create_raw(self, context, file_id, mutation_id, attempt, bytes).await
             }
             crate::StorageMethod::BlockSplit => {
-                crate::layout::create_block_split(self, file_id, mutation_id, attempt, bytes).await
+                crate::layout::create_block_split(
+                    self,
+                    context,
+                    file_id,
+                    mutation_id,
+                    attempt,
+                    bytes,
+                )
+                .await
             }
         }
     }
@@ -132,14 +216,27 @@ impl<S: TargetStore> ContentRepository<S> {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, StorageError<S::Error>> {
+        let context = FileCryptoContext::plain_for_file(content.file_id(), content.method());
+        self.read_with_context(content, &context, offset, length)
+            .await
+    }
+
+    /// Reads a positioned range under the selected committed file context.
+    pub async fn read_with_context(
+        &self,
+        content: &ContentRef,
+        context: &FileCryptoContext,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, StorageError<S::Error>> {
         check_input_limit(LimitKind::Read, length, self.limits.max_read_bytes())?;
-        let manifest = self.load_manifest(content).await?;
+        let manifest = self.load_manifest_with_context(content, context).await?;
         match manifest.method() {
             crate::StorageMethod::Raw => {
-                crate::layout::read_raw(self, &manifest, offset, length).await
+                crate::layout::read_raw(self, context, &manifest, offset, length).await
             }
             crate::StorageMethod::BlockSplit => {
-                crate::layout::read_block_split(self, &manifest, offset, length).await
+                crate::layout::read_block_split(self, context, &manifest, offset, length).await
             }
         }
     }
@@ -153,13 +250,31 @@ impl<S: TargetStore> ContentRepository<S> {
         offset: u64,
         data: &[u8],
     ) -> Result<PreparedContent, StorageError<S::Error>> {
+        let context = FileCryptoContext::plain_for_file(content.file_id(), content.method());
+        self.prepare_write_with_context(content, &context, mutation_id, attempt, offset, data)
+            .await
+    }
+
+    /// Prepares a positioned write under the selected committed file context.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_write_with_context(
+        &self,
+        content: &ContentRef,
+        context: &FileCryptoContext,
+        mutation_id: MutationId,
+        attempt: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<PreparedContent, StorageError<S::Error>> {
+        crate::representation::require_writer_support(context.policy())?;
         check_input_limit(LimitKind::Write, data.len(), self.limits.max_write_bytes())?;
         crate::layout::LogicalRange::from_usize(offset, data.len())?;
-        let manifest = self.load_manifest(content).await?;
+        let manifest = self.load_manifest_with_context(content, context).await?;
         match manifest.method() {
             crate::StorageMethod::Raw => {
                 crate::layout::write_raw(
                     self,
+                    context,
                     content,
                     &manifest,
                     mutation_id,
@@ -172,6 +287,7 @@ impl<S: TargetStore> ContentRepository<S> {
             crate::StorageMethod::BlockSplit => {
                 crate::layout::write_block_split(
                     self,
+                    context,
                     content,
                     &manifest,
                     mutation_id,
@@ -196,16 +312,41 @@ impl<S: TargetStore> ContentRepository<S> {
         offset: u64,
         data: &[u8],
     ) -> Result<PreparedContent, StorageError<S::Error>> {
+        let context = FileCryptoContext::plain_for_file(file_id, self.defaults.method());
+        self.prepare_write_from_new_with_context(&context, mutation_id, attempt, offset, data)
+            .await
+    }
+
+    /// Prepares a first positioned write using an already committed context.
+    pub async fn prepare_write_from_new_with_context(
+        &self,
+        context: &FileCryptoContext,
+        mutation_id: MutationId,
+        attempt: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<PreparedContent, StorageError<S::Error>> {
+        crate::representation::require_writer_support(context.policy())?;
+        let file_id = context.binding().file_id();
         check_input_limit(LimitKind::Write, data.len(), self.limits.max_write_bytes())?;
         crate::layout::LogicalRange::from_usize(offset, data.len())?;
-        match self.defaults.method() {
+        match context.policy().method() {
             crate::StorageMethod::Raw => {
-                crate::layout::write_raw_from_new(self, file_id, mutation_id, attempt, offset, data)
-                    .await
+                crate::layout::write_raw_from_new(
+                    self,
+                    context,
+                    file_id,
+                    mutation_id,
+                    attempt,
+                    offset,
+                    data,
+                )
+                .await
             }
             crate::StorageMethod::BlockSplit => {
                 crate::layout::write_block_split_from_new(
                     self,
+                    context,
                     file_id,
                     mutation_id,
                     attempt,
@@ -225,11 +366,27 @@ impl<S: TargetStore> ContentRepository<S> {
         attempt: u32,
         logical_size: u64,
     ) -> Result<PreparedContent, StorageError<S::Error>> {
-        let manifest = self.load_manifest(content).await?;
+        let context = FileCryptoContext::plain_for_file(content.file_id(), content.method());
+        self.prepare_truncate_with_context(content, &context, mutation_id, attempt, logical_size)
+            .await
+    }
+
+    /// Prepares a logical-size change under the selected committed context.
+    pub async fn prepare_truncate_with_context(
+        &self,
+        content: &ContentRef,
+        context: &FileCryptoContext,
+        mutation_id: MutationId,
+        attempt: u32,
+        logical_size: u64,
+    ) -> Result<PreparedContent, StorageError<S::Error>> {
+        crate::representation::require_writer_support(context.policy())?;
+        let manifest = self.load_manifest_with_context(content, context).await?;
         match manifest.method() {
             crate::StorageMethod::Raw => {
                 crate::layout::truncate_raw(
                     self,
+                    context,
                     content,
                     &manifest,
                     mutation_id,
@@ -241,6 +398,7 @@ impl<S: TargetStore> ContentRepository<S> {
             crate::StorageMethod::BlockSplit => {
                 crate::layout::truncate_block_split(
                     self,
+                    context,
                     content,
                     &manifest,
                     mutation_id,
@@ -263,10 +421,26 @@ impl<S: TargetStore> ContentRepository<S> {
         attempt: u32,
         logical_size: u64,
     ) -> Result<PreparedContent, StorageError<S::Error>> {
-        match self.defaults.method() {
+        let context = FileCryptoContext::plain_for_file(file_id, self.defaults.method());
+        self.prepare_truncate_from_new_with_context(&context, mutation_id, attempt, logical_size)
+            .await
+    }
+
+    /// Prepares an initial logical size using an already committed context.
+    pub async fn prepare_truncate_from_new_with_context(
+        &self,
+        context: &FileCryptoContext,
+        mutation_id: MutationId,
+        attempt: u32,
+        logical_size: u64,
+    ) -> Result<PreparedContent, StorageError<S::Error>> {
+        crate::representation::require_writer_support(context.policy())?;
+        let file_id = context.binding().file_id();
+        match context.policy().method() {
             crate::StorageMethod::Raw => {
                 crate::layout::truncate_raw_from_new(
                     self,
+                    context,
                     file_id,
                     mutation_id,
                     attempt,
@@ -277,6 +451,7 @@ impl<S: TargetStore> ContentRepository<S> {
             crate::StorageMethod::BlockSplit => {
                 crate::layout::truncate_block_split_from_new(
                     self,
+                    context,
                     file_id,
                     mutation_id,
                     attempt,
@@ -289,63 +464,243 @@ impl<S: TargetStore> ContentRepository<S> {
 
     pub(crate) async fn store_raw_payload(
         &self,
+        context: &FileCryptoContext,
         file_id: FileId,
         identity: crate::PreparationIdentity,
         attempt: u32,
         plaintext: &[u8],
     ) -> Result<BlobRef, StorageError<S::Error>> {
-        let key = self.keys.raw_payload(file_id, identity, attempt);
-        self.store_payload(key, plaintext).await
+        let provenance = ObjectProvenance::RawPayload { identity, attempt };
+        let key = self.object_key(context, file_id, provenance);
+        self.store_payload(context, key, provenance, plaintext)
+            .await
+    }
+
+    pub(crate) fn expected_raw_payload(
+        &self,
+        context: &FileCryptoContext,
+        file_id: FileId,
+        identity: crate::PreparationIdentity,
+        attempt: u32,
+        plaintext: &[u8],
+    ) -> Result<BlobRef, StorageError<S::Error>> {
+        let provenance = ObjectProvenance::RawPayload { identity, attempt };
+        let key = self.object_key(context, file_id, provenance);
+        self.expected_payload(context, key, provenance, plaintext)
     }
 
     pub(crate) async fn store_block_payload(
         &self,
+        context: &FileCryptoContext,
         file_id: FileId,
         identity: crate::PreparationIdentity,
         attempt: u32,
         block_index: u64,
         plaintext: &[u8],
     ) -> Result<BlobRef, StorageError<S::Error>> {
-        let key = self
-            .keys
-            .block_payload(file_id, identity, attempt, block_index);
-        self.store_payload(key, plaintext).await
+        let provenance = ObjectProvenance::BlockPayload {
+            identity,
+            attempt,
+            block_index,
+        };
+        let key = self.object_key(context, file_id, provenance);
+        self.store_payload(context, key, provenance, plaintext)
+            .await
+    }
+
+    pub(crate) fn expected_block_payload(
+        &self,
+        context: &FileCryptoContext,
+        file_id: FileId,
+        identity: crate::PreparationIdentity,
+        attempt: u32,
+        block_index: u64,
+        plaintext: &[u8],
+    ) -> Result<BlobRef, StorageError<S::Error>> {
+        let provenance = ObjectProvenance::BlockPayload {
+            identity,
+            attempt,
+            block_index,
+        };
+        let key = self.object_key(context, file_id, provenance);
+        self.expected_payload(context, key, provenance, plaintext)
     }
 
     pub(crate) async fn load_payload(
         &self,
+        context: &FileCryptoContext,
         blob: &BlobRef,
     ) -> Result<Vec<u8>, StorageError<S::Error>> {
+        self.keys.ensure_owned(blob.key())?;
+        let maximum =
+            usize::try_from(blob.plaintext_len()).map_err(|_| FormatError::ArithmeticOverflow {
+                field: "payload plaintext length",
+            })?;
+        self.check_representation_work(maximum)?;
+        let stored_len =
+            usize::try_from(blob.stored_len()).map_err(|_| FormatError::ArithmeticOverflow {
+                field: "payload stored length",
+            })?;
         let bytes = self
-            .get_required(blob.key().clone(), MissingObjectKind::Payload)
+            .get_required_bounded(blob.key().clone(), MissingObjectKind::Payload, stored_len)
             .await?;
-        let envelope = decode_envelope(ObjectKind::Payload, &bytes, self.limits.max_object_bytes())
-            .map_err(StorageError::from)?;
-        let payload = envelope.payload();
-        let actual = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        if actual != blob.stored_len() || actual != blob.plaintext_len() {
+        if bytes.len() != stored_len {
             return Err(CorruptionError::InvalidLength {
-                field: "identity payload",
-                expected: blob.plaintext_len(),
+                field: "stored payload",
+                expected: blob.stored_len(),
+                actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
+        let decoded = decode_object(ObjectKind::Payload, blob.key(), &bytes, context, maximum)?;
+        self.validate_object_key(
+            context,
+            context.binding().file_id(),
+            decoded.provenance,
+            blob.key(),
+        )?;
+        if decoded.canonical.len() != maximum || Digest::blake3(&decoded.canonical) != blob.digest()
+        {
+            return Err(CorruptionError::DigestMismatch.into());
+        }
+        Ok(decoded.canonical)
+    }
+
+    pub(crate) async fn load_map_page(
+        &self,
+        context: &FileCryptoContext,
+        file_id: FileId,
+        reference: &PageRef,
+    ) -> Result<BlockMapPage, StorageError<S::Error>> {
+        self.validate_context(file_id, context.policy().method(), context)?;
+        self.keys.ensure_owned(reference.key())?;
+        let expected_len = usize::try_from(reference.encoded_len()).map_err(|_| {
+            FormatError::ArithmeticOverflow {
+                field: "mapping page encoded length",
+            }
+        })?;
+        let bytes = self
+            .get_required_bounded(
+                reference.key().clone(),
+                MissingObjectKind::MappingPage,
+                expected_len,
+            )
+            .await?;
+        let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if actual != reference.encoded_len() {
+            return Err(CorruptionError::InvalidLength {
+                field: "mapping page",
+                expected: reference.encoded_len(),
                 actual,
             }
             .into());
         }
-        if Digest::blake3(payload) != blob.digest() {
+        if Digest::blake3(&bytes) != reference.digest() {
             return Err(CorruptionError::DigestMismatch.into());
         }
-        Ok(payload.to_vec())
+        let decoded = decode_object(
+            ObjectKind::if_map_level(reference.level()),
+            reference.key(),
+            &bytes,
+            context,
+            self.limits.max_map_page_bytes(),
+        )?;
+        let ObjectProvenance::MapPage {
+            level, first_block, ..
+        } = decoded.provenance
+        else {
+            return Err(crate::RepresentationError::ProvenanceMismatch.into());
+        };
+        if level != reference.level() || first_block != reference.first_block() {
+            return Err(crate::RepresentationError::ProvenanceMismatch.into());
+        }
+        self.validate_object_key(context, file_id, decoded.provenance, reference.key())?;
+        let page = decode_block_map_page(&decoded.canonical, reference.level(), self.limits)
+            .map_err(StorageError::from)?;
+        validate_page_context(&page, reference, file_id, self.limits)
+            .map_err(StorageError::from)?;
+        self.validate_page_children(&page, context)?;
+        Ok(page)
+    }
+
+    pub(crate) fn expected_map_page(
+        &self,
+        context: &FileCryptoContext,
+        page: &BlockMapPage,
+        identity: crate::PreparationIdentity,
+        attempt: u32,
+    ) -> Result<(PageRef, Vec<u8>), StorageError<S::Error>> {
+        let canonical = encode_block_map_page(page, self.limits).map_err(StorageError::from)?;
+        let (count, highest) = page.summary().map_err(StorageError::from)?;
+        let provenance = ObjectProvenance::MapPage {
+            identity,
+            attempt,
+            level: page.level(),
+            first_block: page.first_block(),
+        };
+        let key = self.object_key(context, page.file_id(), provenance);
+        let encoded = encode_object(
+            ObjectKind::if_map_level(page.level()),
+            &key,
+            &canonical,
+            provenance,
+            context,
+            false,
+            self.limits.max_map_page_bytes(),
+        )?;
+        let reference = PageRef::new(
+            key,
+            u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+            Digest::blake3(&encoded),
+            page.level(),
+            page.first_block(),
+            count,
+            highest,
+        );
+        Ok((reference, encoded))
+    }
+
+    pub(crate) async fn store_map_page(
+        &self,
+        context: &FileCryptoContext,
+        page: &BlockMapPage,
+        identity: crate::PreparationIdentity,
+        attempt: u32,
+    ) -> Result<PageRef, StorageError<S::Error>> {
+        let (reference, encoded) = self.expected_map_page(context, page, identity, attempt)?;
+        self.put_immutable(
+            reference.key().clone(),
+            encoded,
+            MissingObjectKind::MappingPage,
+        )
+        .await?;
+        Ok(reference)
     }
 
     pub(crate) async fn prepare_manifest(
         &self,
+        context: &FileCryptoContext,
         manifest: &FileManifest,
         identity: crate::PreparationIdentity,
         attempt: u32,
         content_changed: bool,
     ) -> Result<PreparedContent, StorageError<S::Error>> {
-        let key = self.keys.manifest(manifest.file_id(), identity, attempt);
-        let encoded = encode_manifest(manifest, self.limits).map_err(StorageError::from)?;
+        let provenance = ObjectProvenance::Manifest {
+            identity,
+            attempt,
+            generation: manifest.generation(),
+        };
+        let key = self.object_key(context, manifest.file_id(), provenance);
+        let canonical = encode_manifest(manifest, self.limits).map_err(StorageError::from)?;
+        let encoded = encode_object(
+            ObjectKind::Manifest,
+            &key,
+            &canonical,
+            provenance,
+            context,
+            false,
+            self.limits.max_manifest_bytes(),
+        )?;
         self.put_immutable(key.clone(), encoded.clone(), MissingObjectKind::Manifest)
             .await?;
         let reference = manifest.content_ref(key, Digest::blake3(&encoded));
@@ -354,6 +709,7 @@ impl<S: TargetStore> ContentRepository<S> {
             content_changed,
             identity,
             attempt,
+            context.binding().clone(),
         ))
     }
 
@@ -370,21 +726,74 @@ impl<S: TargetStore> ContentRepository<S> {
     pub(crate) fn validate_manifest_payloads(
         &self,
         manifest: &FileManifest,
+        context: &FileCryptoContext,
     ) -> Result<(), StorageError<S::Error>> {
         match manifest.layout() {
             ManifestLayout::Raw { blob } => {
-                if let Some(blob) = blob {
+                if let Some(blob) = blob
+                    && !context.policy().encryption().is_encrypted()
+                {
                     self.keys
                         .validate_raw_payload(manifest.file_id(), blob.key())?;
                 }
             }
-            ManifestLayout::BlockSplit { blocks, .. } => {
-                for entry in blocks {
-                    self.keys.validate_block_payload(
+            ManifestLayout::BlockSplit { root, .. } => {
+                if let Some(root) = root
+                    && !context.policy().encryption().is_encrypted()
+                {
+                    self.keys.validate_map_page(
                         manifest.file_id(),
-                        entry.index(),
-                        entry.blob().key(),
+                        root.level(),
+                        root.first_block(),
+                        root.key(),
                     )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_page_children(
+        &self,
+        page: &BlockMapPage,
+        context: &FileCryptoContext,
+    ) -> Result<(), StorageError<S::Error>> {
+        if let Some(entries) = page.leaf_entries() {
+            for entry in entries {
+                let index = page
+                    .first_block()
+                    .checked_add(u64::from(entry.slot()))
+                    .ok_or(crate::FormatError::ArithmeticOverflow {
+                        field: "leaf block index",
+                    })?;
+                if !context.policy().encryption().is_encrypted() {
+                    self.keys
+                        .validate_block_payload(page.file_id(), index, entry.blob().key())?;
+                } else if !entry
+                    .blob()
+                    .key()
+                    .as_str()
+                    .ends_with(&format!("/blocks/{index:016x}"))
+                {
+                    return Err(CorruptionError::InvalidKeySchema.into());
+                }
+            }
+        }
+        if let Some(entries) = page.branch_entries() {
+            for entry in entries {
+                if !context.policy().encryption().is_encrypted() {
+                    self.keys.validate_map_page(
+                        page.file_id(),
+                        entry.child().level(),
+                        entry.child().first_block(),
+                        entry.child().key(),
+                    )?;
+                } else if !entry.child().key().as_str().ends_with(&format!(
+                    "/maps/{:02x}/{:016x}",
+                    entry.child().level(),
+                    entry.child().first_block()
+                )) {
+                    return Err(CorruptionError::InvalidKeySchema.into());
                 }
             }
         }
@@ -393,7 +802,35 @@ impl<S: TargetStore> ContentRepository<S> {
 
     async fn store_payload(
         &self,
+        context: &FileCryptoContext,
         key: ObjectKey,
+        provenance: ObjectProvenance,
+        plaintext: &[u8],
+    ) -> Result<BlobRef, StorageError<S::Error>> {
+        let expected = self.expected_payload(context, key.clone(), provenance, plaintext)?;
+        let encoded = encode_object(
+            ObjectKind::Payload,
+            &key,
+            plaintext,
+            provenance,
+            context,
+            true,
+            self.limits.max_object_bytes(),
+        )?;
+        debug_assert_eq!(
+            u64::try_from(encoded.len()).ok(),
+            Some(expected.stored_len())
+        );
+        self.put_immutable(key, encoded, MissingObjectKind::Payload)
+            .await?;
+        Ok(expected)
+    }
+
+    fn expected_payload(
+        &self,
+        context: &FileCryptoContext,
+        key: ObjectKey,
+        provenance: ObjectProvenance,
         plaintext: &[u8],
     ) -> Result<BlobRef, StorageError<S::Error>> {
         let plaintext_len = u64::try_from(plaintext.len()).map_err(|_| {
@@ -403,20 +840,112 @@ impl<S: TargetStore> ContentRepository<S> {
                 u64::try_from(self.limits.max_object_bytes()).unwrap_or(u64::MAX),
             )
         })?;
-        let encoded = encode_envelope(
+        self.check_representation_work(plaintext.len())?;
+        let encoded = encode_object(
             ObjectKind::Payload,
+            &key,
             plaintext,
+            provenance,
+            context,
+            true,
             self.limits.max_object_bytes(),
-        )
-        .map_err(StorageError::from)?;
-        self.put_immutable(key.clone(), encoded, MissingObjectKind::Payload)
-            .await?;
+        )?;
+        let stored_len =
+            u64::try_from(encoded.len()).map_err(|_| FormatError::ArithmeticOverflow {
+                field: "stored payload length",
+            })?;
         Ok(BlobRef::new(
             key,
             plaintext_len,
-            plaintext_len,
+            stored_len,
             Digest::blake3(plaintext),
         ))
+    }
+
+    fn check_representation_work(
+        &self,
+        canonical_len: usize,
+    ) -> Result<(), StorageError<S::Error>> {
+        let actual = canonical_len
+            .checked_mul(4)
+            .ok_or(crate::RepresentationError::InvalidLength)?;
+        let limit = self.limits.max_representation_working_bytes();
+        if actual > limit {
+            return Err(LimitError::new(
+                LimitKind::RepresentationWorkingBytes,
+                u64::try_from(actual).unwrap_or(u64::MAX),
+                u64::try_from(limit).unwrap_or(u64::MAX),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_context(
+        &self,
+        file_id: FileId,
+        method: crate::StorageMethod,
+        context: &FileCryptoContext,
+    ) -> Result<(), StorageError<S::Error>> {
+        if context.binding().file_id() != file_id || context.policy().method() != method {
+            return Err(crate::RepresentationError::ContextMismatch.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn object_key(
+        &self,
+        context: &FileCryptoContext,
+        file_id: FileId,
+        provenance: ObjectProvenance,
+    ) -> ObjectKey {
+        let (identity, attempt) = provenance.identity_attempt();
+        if context.policy().encryption().is_encrypted() {
+            let token = context.preparation_token(identity, attempt);
+            match provenance {
+                ObjectProvenance::Manifest { .. } => self.keys.protected_manifest(file_id, token),
+                ObjectProvenance::RawPayload { .. } => {
+                    self.keys.protected_raw_payload(file_id, token)
+                }
+                ObjectProvenance::BlockPayload { block_index, .. } => self
+                    .keys
+                    .protected_block_payload(file_id, token, block_index),
+                ObjectProvenance::MapPage {
+                    level, first_block, ..
+                } => self
+                    .keys
+                    .protected_map_page(file_id, token, level, first_block),
+            }
+        } else {
+            match provenance {
+                ObjectProvenance::Manifest { .. } => self.keys.manifest(file_id, identity, attempt),
+                ObjectProvenance::RawPayload { .. } => {
+                    self.keys.raw_payload(file_id, identity, attempt)
+                }
+                ObjectProvenance::BlockPayload { block_index, .. } => {
+                    self.keys
+                        .block_payload(file_id, identity, attempt, block_index)
+                }
+                ObjectProvenance::MapPage {
+                    level, first_block, ..
+                } => self
+                    .keys
+                    .map_page(file_id, identity, attempt, level, first_block),
+            }
+        }
+    }
+
+    pub(crate) fn validate_object_key(
+        &self,
+        context: &FileCryptoContext,
+        file_id: FileId,
+        provenance: ObjectProvenance,
+        actual: &ObjectKey,
+    ) -> Result<(), StorageError<S::Error>> {
+        if self.object_key(context, file_id, provenance) != *actual {
+            return Err(CorruptionError::InvalidKeySchema.into());
+        }
+        Ok(())
     }
 
     async fn put_immutable(
@@ -439,7 +968,11 @@ impl<S: TargetStore> ContentRepository<S> {
         match outcome {
             PutIfAbsent::Created { .. } => Ok(()),
             PutIfAbsent::AlreadyExists { .. } => {
-                let existing = self.get_required(key, kind).await?;
+                let existing = if kind == MissingObjectKind::MappingPage {
+                    self.get_required_bounded(key, kind, bytes.len()).await?
+                } else {
+                    self.get_required(key, kind).await?
+                };
                 if existing == bytes {
                     Ok(())
                 } else {
@@ -458,6 +991,7 @@ impl<S: TargetStore> ContentRepository<S> {
     ) -> Result<(), StorageError<S::Error>> {
         let max_bytes = match kind {
             MissingObjectKind::Manifest => self.limits.max_manifest_bytes(),
+            MissingObjectKind::MappingPage => desired.len(),
             MissingObjectKind::Head | MissingObjectKind::Payload => self.limits.max_object_bytes(),
         };
         match self.target.get(key.clone(), max_bytes).await {
@@ -477,8 +1011,18 @@ impl<S: TargetStore> ContentRepository<S> {
     ) -> Result<Vec<u8>, StorageError<S::Error>> {
         let max_bytes = match kind {
             MissingObjectKind::Manifest => self.limits.max_manifest_bytes(),
+            MissingObjectKind::MappingPage => self.limits.max_map_page_bytes(),
             MissingObjectKind::Head | MissingObjectKind::Payload => self.limits.max_object_bytes(),
         };
+        self.get_required_bounded(key, kind, max_bytes).await
+    }
+
+    async fn get_required_bounded(
+        &self,
+        key: ObjectKey,
+        kind: MissingObjectKind,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, StorageError<S::Error>> {
         let object = self
             .target
             .get(key.clone(), max_bytes)
@@ -547,14 +1091,15 @@ mod tests {
         let mutation_id = MutationId::from_u128(2);
         let identity =
             PreparationIdentity::for_create(mutation_id, StorageMethod::Raw, b"abc").unwrap();
+        let context = FileCryptoContext::plain_for_file(file_id, StorageMethod::Raw);
         let prepared = block_on(async {
             let blob = repository
-                .store_raw_payload(file_id, identity, 0, b"abc")
+                .store_raw_payload(&context, file_id, identity, 0, b"abc")
                 .await
                 .unwrap();
             let manifest = FileManifest::raw(file_id, 1, 3, Some(blob));
             repository
-                .prepare_manifest(&manifest, identity, 0, true)
+                .prepare_manifest(&context, &manifest, identity, 0, true)
                 .await
                 .unwrap()
         });
@@ -639,7 +1184,7 @@ mod tests {
             StorageLimits::default(),
         )
         .unwrap();
-        let offset = u64::from(crate::BLOCK_SIZE_V1) * 10 + 5;
+        let offset = u64::from(crate::BLOCK_SIZE) * 10 + 5;
         let prepared = block_on(block.prepare_write_from_new(
             FileId::from_u128(22),
             MutationId::from_u128(23),
@@ -649,12 +1194,13 @@ mod tests {
         ))
         .unwrap();
         let manifest = block_on(block.load_manifest(prepared.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
+        let ManifestLayout::BlockSplit { root, .. } = manifest.layout() else {
             panic!("expected block-split manifest");
         };
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].index(), 10);
-        assert_eq!(block_target.object_count().unwrap(), 2);
+        let root = root.as_ref().expect("one materialized block");
+        assert_eq!(root.materialized_block_count(), 1);
+        assert_eq!(root.highest_materialized_block(), 10);
+        assert_eq!(block_target.object_count().unwrap(), 3);
         assert_eq!(
             block_on(block.read(prepared.content(), offset - 2, 3)).unwrap(),
             b"\0\0x"
@@ -677,10 +1223,10 @@ mod tests {
         ))
         .unwrap();
         let manifest = block_on(zero_block.load_manifest(zero.content())).unwrap();
-        let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() else {
+        let ManifestLayout::BlockSplit { root, .. } = manifest.layout() else {
             panic!("expected block-split manifest");
         };
-        assert!(blocks.is_empty());
+        assert!(root.is_none());
         assert_eq!(zero_target.object_count().unwrap(), 1);
     }
 
@@ -728,8 +1274,8 @@ mod tests {
                 [0; 9]
             );
             let manifest = block_on(repository.load_manifest(extended.content())).unwrap();
-            if let ManifestLayout::BlockSplit { blocks, .. } = manifest.layout() {
-                assert!(blocks.is_empty());
+            if let ManifestLayout::BlockSplit { root, .. } = manifest.layout() {
+                assert!(root.is_none());
             }
         }
     }
@@ -745,9 +1291,10 @@ mod tests {
             BaseContentIdentity::NEW_FILE,
             OperationFingerprint::new([7; 32]),
         );
-        block_on(repository.store_raw_payload(file_id, identity, 0, b"one")).unwrap();
-        let error =
-            block_on(repository.store_raw_payload(file_id, identity, 0, b"two")).unwrap_err();
+        let context = FileCryptoContext::plain_for_file(file_id, StorageMethod::Raw);
+        block_on(repository.store_raw_payload(&context, file_id, identity, 0, b"one")).unwrap();
+        let error = block_on(repository.store_raw_payload(&context, file_id, identity, 0, b"two"))
+            .unwrap_err();
         assert!(matches!(
             error,
             StorageError::Corruption(CorruptionError::ImmutableCollision)
@@ -788,7 +1335,8 @@ mod tests {
             BaseContentIdentity::NEW_FILE,
             OperationFingerprint::new([7; 32]),
         );
-        block_on(repository.store_raw_payload(file_id, identity, 0, b"one")).unwrap();
+        let context = FileCryptoContext::plain_for_file(file_id, StorageMethod::Raw);
+        block_on(repository.store_raw_payload(&context, file_id, identity, 0, b"one")).unwrap();
         let payload_key = repository.keys().raw_payload(file_id, identity, 0);
         target
             .inject_failure_for(
@@ -799,7 +1347,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            block_on(repository.store_raw_payload(file_id, identity, 0, b"two")),
+            block_on(repository.store_raw_payload(&context, file_id, identity, 0, b"two")),
             Err(StorageError::Corruption(
                 CorruptionError::ImmutableCollision
             ))

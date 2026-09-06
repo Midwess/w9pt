@@ -278,6 +278,19 @@ pub struct PublishContent {
     pub attributes: InodeAttributeUpdate,
 }
 
+/// Dedicated opaque wrapped-key replacement under an exact context revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewrapContentMetadata {
+    /// Storage file whose retained metadata is updated.
+    pub content_file_id: w9pt_fs_storage::FileId,
+    /// Exact immutable context identity.
+    pub expected_context_id: w9pt_fs_storage::ContentContextId,
+    /// Exact current metadata revision.
+    pub expected_revision: RecordRevision,
+    /// New bounded opaque wrapped-key envelope.
+    pub wrapped_key_bytes: Vec<u8>,
+}
+
 /// Dedicated atomic publication of one complete xattr staging record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishXattrStaging {
@@ -302,6 +315,8 @@ pub enum PublishContentError {
     AuthoritativeBaseMismatch,
     /// Prepared file identity differs from the inode's explicit content binding.
     ContentFileMismatch,
+    /// Prepared context/policy/key binding differs from authoritative metadata.
+    ContentContextMismatch,
     /// Requested inode logical size differs from the prepared content reference.
     LogicalSizeMismatch,
     /// Prepared content changed but did not advance exactly one data generation.
@@ -372,6 +387,29 @@ pub fn validate_publish_content(
     Ok(())
 }
 
+/// Validates content publication against its selected opaque context metadata.
+pub fn validate_publish_content_with_metadata(
+    publication: &PublishContent,
+    mutation: &MutationContext,
+    inode: &InodeRecord,
+    metadata: &crate::ContentMetadataRecord,
+) -> Result<(), PublishContentError> {
+    validate_publish_content(publication, mutation, inode)?;
+    let binding = publication.prepared.context_binding();
+    if inode.content_context_id() != Some(binding.context_id())
+        || metadata.owner_inode_id() != inode.inode_id()
+        || metadata.content_file_id() != binding.file_id()
+        || metadata.context_id() != binding.context_id()
+        || metadata.policy_format() != binding.policy_format()
+        || metadata.policy_bytes() != binding.policy_bytes()
+        || metadata.key_commitment() != binding.key_commitment()
+        || metadata.revision().get() != binding.context_revision()
+    {
+        return Err(PublishContentError::ContentContextMismatch);
+    }
+    Ok(())
+}
+
 /// Declarative checked state change applied only after complete preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateChange {
@@ -430,6 +468,8 @@ pub enum StateChange {
     },
     /// Publish already-prepared immutable content and all inode summaries together.
     PublishContent(PublishContent),
+    /// Replace only one opaque wrapped-key envelope under exact revision/context.
+    RewrapContentMetadata(RewrapContentMetadata),
     /// Atomically consume complete staging and publish its exact xattr bytes.
     PublishXattrStaging(PublishXattrStaging),
 }
@@ -453,6 +493,9 @@ impl StateChange {
             }
             Self::PublishContent(publication) => {
                 RecordKey::Inode(filesystem_id, publication.inode_id)
+            }
+            Self::RewrapContentMetadata(rewrap) => {
+                RecordKey::ContentMetadata(filesystem_id, rewrap.content_file_id)
             }
             Self::PublishXattrStaging(publication) => {
                 RecordKey::XattrStaging(filesystem_id, publication.staging_id)
@@ -674,6 +717,9 @@ impl CommitRequest {
                     ) {
                         return Err(MalformedCommit::StoreOwnedRecord(key.clone()));
                     }
+                    if key.family() == RecordFamily::ContentMetadata {
+                        return Err(MalformedCommit::ProtectedContentMetadata(key.clone()));
+                    }
                 }
                 StateChange::Delete(key)
                     if matches!(
@@ -683,9 +729,24 @@ impl CommitRequest {
                 {
                     return Err(MalformedCommit::StoreOwnedRecord(key.clone()));
                 }
+                StateChange::Delete(key) if key.family() == RecordFamily::ContentMetadata => {
+                    return Err(MalformedCommit::ProtectedContentMetadata(key.clone()));
+                }
                 StateChange::PublishContent(publication) => {
                     validate_publish_shape(publication, &self.mutation, limits)
                         .map_err(MalformedCommit::InvalidPublication)?;
+                }
+                StateChange::RewrapContentMetadata(rewrap) => {
+                    limits
+                        .require_bytes(
+                            StateLimitKind::WrappedContentKey,
+                            rewrap.wrapped_key_bytes.len(),
+                            limits.max_wrapped_content_key_bytes(),
+                        )
+                        .map_err(MalformedCommit::Limit)?;
+                    if rewrap.wrapped_key_bytes.is_empty() {
+                        return Err(MalformedCommit::InvalidContentMetadataRewrap);
+                    }
                 }
                 StateChange::PublishXattrStaging(publication) => {
                     limits
@@ -697,6 +758,61 @@ impl CommitRequest {
                         .map_err(MalformedCommit::Limit)?;
                 }
                 _ => {}
+            }
+        }
+        for change in &self.changes {
+            let StateChange::Insert {
+                key: RecordKey::ContentMetadata(filesystem_id, file_id),
+                record: StateRecord::ContentMetadata(metadata),
+            } = change
+            else {
+                continue;
+            };
+            let matching_inode = self.changes.iter().any(|candidate| {
+                matches!(
+                    candidate,
+                    StateChange::Insert {
+                        key: RecordKey::Inode(inode_fs, inode_id),
+                        record: StateRecord::Inode(inode),
+                    } if inode_fs == filesystem_id
+                        && *inode_id == metadata.owner_inode_id()
+                        && inode.content_file_id() == Some(*file_id)
+                        && inode.content_context_id() == Some(metadata.context_id())
+                        && inode.content().is_none()
+                )
+            });
+            if !matching_inode {
+                return Err(MalformedCommit::InvalidContentMetadataCreation);
+            }
+        }
+        for change in &self.changes {
+            let StateChange::Insert {
+                key: RecordKey::Inode(filesystem_id, inode_id),
+                record: StateRecord::Inode(inode),
+            } = change
+            else {
+                continue;
+            };
+            let Some(file_id) = inode.content_file_id() else {
+                continue;
+            };
+            let Some(context_id) = inode.content_context_id() else {
+                return Err(MalformedCommit::InvalidContentMetadataCreation);
+            };
+            let matching_metadata = self.changes.iter().any(|candidate| {
+                matches!(
+                    candidate,
+                    StateChange::Insert {
+                        key: RecordKey::ContentMetadata(metadata_fs, metadata_file),
+                        record: StateRecord::ContentMetadata(metadata),
+                    } if metadata_fs == filesystem_id
+                        && *metadata_file == file_id
+                        && metadata.owner_inode_id() == *inode_id
+                        && metadata.context_id() == context_id
+                )
+            });
+            if !matching_metadata {
+                return Err(MalformedCommit::InvalidContentMetadataCreation);
             }
         }
         limits
@@ -825,6 +941,9 @@ fn estimate_change(change: &StateChange) -> Option<usize> {
             }
             Some(bytes)
         }
+        StateChange::RewrapContentMetadata(rewrap) => {
+            192usize.checked_add(rewrap.wrapped_key_bytes.len())
+        }
         StateChange::PublishXattrStaging(publication) => {
             192usize.checked_add(publication.name.as_bytes().len())
         }
@@ -942,6 +1061,12 @@ pub enum MalformedCommit {
     ContentReplacementRequiresPreparedPublication,
     /// Caller attempted to directly alter a store-owned ledger or lease record.
     StoreOwnedRecord(RecordKey),
+    /// Generic replacement/deletion attempted to bypass retained context rules.
+    ProtectedContentMetadata(RecordKey),
+    /// Content metadata was not inserted atomically with its matching inode.
+    InvalidContentMetadataCreation,
+    /// Dedicated rewrap fields were empty or structurally invalid.
+    InvalidContentMetadataRewrap,
     /// No state transition was supplied.
     EmptyChanges,
     /// Directory cookie insertion was not tied to the pre-state allocation high-water mark.
@@ -982,6 +1107,17 @@ impl fmt::Display for MalformedCommit {
                     formatter,
                     "caller cannot directly change store-owned record: {key:?}"
                 )
+            }
+            Self::ProtectedContentMetadata(key) => {
+                write!(
+                    formatter,
+                    "content metadata requires a dedicated transition: {key:?}"
+                )
+            }
+            Self::InvalidContentMetadataCreation => formatter
+                .write_str("content metadata must be created atomically with its matching inode"),
+            Self::InvalidContentMetadataRewrap => {
+                formatter.write_str("content metadata rewrap is invalid")
             }
             Self::EmptyChanges => formatter.write_str("commit change set is empty"),
             Self::DirectoryCookieAllocation => formatter.write_str(
@@ -1132,7 +1268,7 @@ mod tests {
             changed: timestamp,
             created: timestamp,
         };
-        let inode = InodeRecord::new(
+        let inode = InodeRecord::new_regular(
             InodeId::from_u128(3),
             crate::QidPath::new(1).unwrap(),
             RecordRevision::new(1).unwrap(),
@@ -1143,6 +1279,7 @@ mod tests {
             0,
             1,
             InodeGeneration::new(1).unwrap(),
+            w9pt_fs_storage::ContentContextId::new(*file_id.as_bytes()),
             InodeData::RegularFile {
                 content_file_id: file_id,
                 content: None,

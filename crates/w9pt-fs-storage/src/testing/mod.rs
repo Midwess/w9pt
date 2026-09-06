@@ -15,7 +15,8 @@ pub use memory_store::{
     FailureTiming, MemoryTarget, MemoryTargetError, TargetTraceEvent, TracePhase,
 };
 pub use repository_conformance::{
-    RepositoryConformanceError, check_repository_conformance, check_repository_method_conformance,
+    RepositoryConformanceError, check_repository_conformance, check_repository_context_conformance,
+    check_repository_method_conformance,
 };
 
 /// Drives one future to completion without choosing an async runtime.

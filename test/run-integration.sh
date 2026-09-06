@@ -15,6 +15,7 @@ tcp_prefix=${W9PT_TEST_S3_PREFIX:-tcp/w9pt-s3-test-development}
 websocket_prefix=${W9PT_TEST_WEBSOCKET_S3_PREFIX:-websocket/w9pt-s3-test-development}
 compat_prefix=${W9PT_S3_COMPAT_TEST_PREFIX:-compat/target/w9pt-s3-test-0123456789abcdef}
 compat_repository_prefix=${W9PT_S3_COMPAT_REPOSITORY_TEST_PREFIX:-compat/repository/w9pt-s3-test-fedcba9876543210}
+content_context_prefix=${W9PT_CONTENT_CONTEXT_S3_PREFIX:-composition/w9pt-s3-test-c0dec0dec0dec0de}
 postgres_dsn=${W9PT_POSTGRES_TEST_DSN:-postgres://w9pt_test:w9pt_test@127.0.0.1:$postgres_port/w9pt_test}
 headers=$(mktemp)
 export POSTGRES_IMAGE="$postgres_image"
@@ -107,10 +108,19 @@ W9PT_S3_COMPAT_TEST_VERSION=4.42 \
 W9PT_S3_COMPAT_REPOSITORY_TEST_PREFIX="$compat_repository_prefix" \
 cargo test -p w9pt-fs-storage-s3 --test s3_conformance \
   live_pinned_compatible_provider_repository_matrix_remains_unqualified \
-  --locked -- --exact
+  --features representation-test --locked -- --exact
 
 W9PT_POSTGRES_TEST_DSN="$postgres_dsn" \
 cargo test -p w9pt-fs-state-postgres --all-features --locked -- --test-threads=1
+
+W9PT_CONTENT_CONTEXT_TEST_REQUIRED=1 \
+W9PT_TEST_S3_ENDPOINT="$endpoint" \
+W9PT_TEST_S3_BUCKET="$bucket" \
+W9PT_CONTENT_CONTEXT_S3_PREFIX="$content_context_prefix" \
+W9PT_POSTGRES_TEST_DSN="$postgres_dsn" \
+cargo test --manifest-path test/Cargo.toml --test content_context_composition \
+  postgres_winner_reopens_and_rewraps_encrypted_seaweedfs_content \
+  --locked -- --exact
 
 W9PT_TCP_SEAWEED_TEST_REQUIRED=1 \
 W9PT_TEST_S3_ENDPOINT="$endpoint" \

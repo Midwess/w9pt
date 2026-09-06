@@ -10,8 +10,16 @@ readme = "../../README.md"
 keywords = ["9p", "filesystem", "object-storage"]
 categories = ["filesystem"]
 
+[features]
+default = []
+compression-lz4 = ["dep:lz4_flex"]
+encryption-aes-siv = ["dep:aes-siv"]
+
 [dependencies]
+aes-siv = { version = "=0.8.0", default-features = false, features = ["alloc", "zeroize"], optional = true }
 blake3 = "1.8.2"
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"], optional = true }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
 
 [lints.rust]
 missing_docs = "warn"

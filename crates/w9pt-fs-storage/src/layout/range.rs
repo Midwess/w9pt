@@ -1,6 +1,6 @@
 //! Overflow-safe logical byte ranges and block spans.
 
-use crate::{BLOCK_SIZE_V1, RangeError};
+use crate::{BLOCK_SIZE, RangeError};
 
 /// Checked half-open logical byte range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +62,7 @@ impl LogicalRange {
     }
 }
 
-/// One requested span within a version-1 logical block.
+/// One requested span within a current-format logical block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockSpan {
     block_index: u64,
@@ -100,13 +100,13 @@ impl BlockSpan {
         false
     }
 
-    /// Reports whether this span covers an entire version-1 block.
+    /// Reports whether this span covers an entire current-format block.
     pub const fn is_full_block(self) -> bool {
-        self.within_block == 0 && self.len == BLOCK_SIZE_V1
+        self.within_block == 0 && self.len == BLOCK_SIZE
     }
 }
 
-/// Lazy iterator over version-1 block spans for one checked logical range.
+/// Lazy iterator over current-format block spans for one checked logical range.
 #[derive(Clone, Debug)]
 pub struct BlockSpans {
     absolute: u64,
@@ -133,7 +133,7 @@ impl Iterator for BlockSpans {
         if self.remaining == 0 {
             return None;
         }
-        let block_size = u64::from(BLOCK_SIZE_V1);
+        let block_size = u64::from(BLOCK_SIZE);
         let block_index = self.absolute / block_size;
         let within = self.absolute % block_size;
         let len = self.remaining.min(block_size - within);

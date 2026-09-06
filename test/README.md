@@ -41,7 +41,8 @@ proxy policy, authentication, reconnection, or session migration support.
 The runner uses Docker Compose to start digest-pinned SeaweedFS 4.42 and
 PostgreSQL 18.6. It verifies the SeaweedFS identity, provisions an ephemeral S3
 bucket, runs the S3-compatible target probes, then uses a private post-probe
-test wrapper to execute the complete Raw/BlockSplit repository and standalone
+test wrapper to execute the complete Raw/paged-BlockSplit repository, all four
+Identity/LZ4 and None/SIV representation combinations, and the standalone
 publication-boundary matrix. It then runs the PostgreSQL
 migration/adapter/conformance tests and the same 9P lifecycle through both the
 TCP stream and HTTP/WebSocket message profiles:
@@ -59,9 +60,18 @@ validation, lease, transaction, recovery, and state-store conformance tests. The
 minimal forwarding applications deliberately retain their namespace in memory;
 it does not claim that the unfinished semantic engine has integrated PostgreSQL.
 
+The bounded composition test uses its own private post-probe target wrapper in
+`tests/support/content_target.rs`. It atomically commits an encrypted file and
+generated wrapped DEK in PostgreSQL, discards a different retry candidate,
+prepares sparse branch-crossing content in SeaweedFS, reopens it from a separate
+database and S3 client with no key cache, and rewraps the same DEK under a new
+public test master. It compares every object key and byte before and after
+rewrap. Ordinary SeaweedFS targets remain unqualified throughout.
+
 The repository matrix uses two independently constructed S3 clients. It covers
-Raw overwrite/gap/truncate behavior, four-logical-block sparse BlockSplit
-boundaries, immutable reuse, independent reopen, abandoned preparation,
+Raw overwrite/gap/truncate behavior, sparse BlockSplit operations across the
+127/128 leaf and 16383/16384 branch boundaries, root growth/collapse,
+shrink/re-extension, immutable reuse, independent reopen, abandoned preparation,
 discarded publication results, and deterministic stale-CAS/reprepare ordering.
 The wrapper exists only in the external integration test. Ordinary SeaweedFS
 targets remain unqualified and the compatible profile remains unsupported.

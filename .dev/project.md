@@ -170,8 +170,8 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
 - Earlier development SQL layouts are unsupported and have no detection, import,
   relocation, upgrade, or dual-schema behavior.
 - Adapter conformance runs through independently constructed SeaORM connections and is required on PostgreSQL 15, 16, 17, and 18.
-- The current unreleased version-1 schema has 16 prefixed tables, 130 columns,
-  172 constraints, and 23 indexes. It may be replaced directly during
+- The current unreleased version-1 schema has 17 prefixed tables, 188 named
+  constraints, and 27 indexes. It may be replaced directly during
   development; checksum drift fails closed and requires an operator-driven reset,
   with no compatibility migration. Per-block PostgreSQL mappings, file payloads,
   session state, replica reads, synchronous-standby durability, and deployment
@@ -206,8 +206,8 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
 - The digest-pinned SeaweedFS 4.42 Compose job builds two independent S3
   clients, runs target behavior probes, then creates a private external-test
   guarantee wrapper solely for `ContentRepository` composition.
-- The live matrix covers Raw and bounded four-logical-block BlockSplit
-  lifecycles, sparse/zero blocks, boundary reads and writes, truncate/
+- The live matrix covers Raw and paged BlockSplit lifecycles across actual leaf
+  and branch boundaries, sparse/zero blocks, boundary reads and writes, truncate/
   re-extension, immutable reuse, independent reopen, abandoned preparations,
   discarded publication results, and stale-CAS/reprepare ordering.
 - Ordinary SeaweedFS targets remain unqualified with `TargetGuarantees::NONE`,
@@ -216,6 +216,32 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
   durability, restart, response-loss, multi-node, TLS/SigV4, lifecycle, or
   production-support claim; deterministic SDK replay remains authoritative for
   transport ambiguity.
+
+### Paged BlockSplit manifests (`add-paged-block-manifests`, 2026-09-06)
+
+- Storage format v2 introduced one compact
+  manifest root and immutable sparse 128-way mapping pages, up to seven levels.
+- Range reads retain a bounded active path and verify only accessed pages and
+  payloads; root validation and content sync do not perform a whole-tree scrub.
+- Create, write, and truncate use bounded read-only preflight followed by
+  child-before-parent immutable preparation, reusing untouched subtrees exactly.
+- Shrink prunes complete suffix subtrees by authenticated summaries and root
+  normalization; re-extension cannot resolve detached data through listing.
+- Limits separately cover compact roots, page bytes, materialized count, page
+  work, and operation-local mapping memory. They are not process RSS or global
+  admission guarantees. PostgreSQL continues to publish the same bounded
+  `ContentRef`; mapping rows are not added.
+- The paged tree remains the current layout inside v3 representation objects.
+
+### Content compression and encryption (`add-content-compression-encryption`, 2026-09-06)
+
+- Current storage format v3 separates Raw/BlockSplit layout from actual Identity/LZ4 payload encoding and None/AES-256-SIV object protection. LZ4 uses a fixed block profile and a deterministic 64-byte savings threshold.
+- Each managed file has one authoritative bounded context record containing owner/file/context identity, exact opaque policy, an optional DEK commitment, and an optional wrapped per-file DEK. State and PostgreSQL do not parse algorithms or retain plaintext keys.
+- Callers own secure entropy and one externally bootstrapped master KEK. Only the durable winning context is unwrapped for S3 preparation; changed defaults and losing create candidates cannot reinterpret or rekey an existing file.
+- Protected names use DEK-derived tokens. Payloads, mapping pages, and manifests authenticate exact keys, provenance, policy, context, lengths, and canonical digests. Rewrap changes only PostgreSQL envelope bytes and preserves the DEK, S3 objects, names, and `ContentRef`.
+- Context rows remain after inode retirement until a future reachability-aware key-GC contract exists. Operators must retain old masters until every referenced envelope is explicitly rewrapped; deletion does not imply cryptographic erasure from WAL, backups, process memory, or storage history.
+- The default representation scratch budget is 64 MiB per operation and combines with existing request, Raw, page, map-frontier, target-object, and retry limits. No global plaintext file-key cache is introduced.
+- V1/v2 data is incompatible. Operators recreate the development database and private object prefix; there is no legacy reader, schema upgrade, dual writer, or automatic re-encryption path.
 
 ### WebSocket 9P integration profile (`add-websocket-9p-integration-profile`, 2026-09-06)
 

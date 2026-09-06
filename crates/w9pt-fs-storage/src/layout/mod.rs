@@ -1,5 +1,6 @@
 //! Shared checked logical-range planning and built-in content layouts.
 
+mod block_map;
 mod block_split;
 mod range;
 mod raw;
@@ -11,7 +12,7 @@ pub(crate) use block_split::{
 };
 pub use range::{BlockSpan, BlockSpans, LogicalRange};
 pub(crate) use raw::{
-    create as create_raw, read as read_raw, truncate as truncate_raw,
-    truncate_from_new as truncate_raw_from_new, write as write_raw,
-    write_from_new as write_raw_from_new,
+    create_with_context as create_raw, read_with_context as read_raw,
+    truncate_from_new_with_context as truncate_raw_from_new, truncate_with_context as truncate_raw,
+    write_from_new_with_context as write_raw_from_new, write_with_context as write_raw,
 };

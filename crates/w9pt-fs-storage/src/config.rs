@@ -2,8 +2,14 @@
 
 use core::fmt;
 
-/// Canonical logical block size for block-split format version 1.
-pub const BLOCK_SIZE_V1: u32 = 32 * 1024;
+/// Canonical logical block size for the current block-split format.
+pub const BLOCK_SIZE: u32 = 32 * 1024;
+/// Number of slots in every current mapping page.
+pub const BLOCK_MAP_FANOUT: u16 = 128;
+/// Number of block-index bits selected by each mapping-page level.
+pub const BLOCK_MAP_INDEX_BITS: u8 = 7;
+/// Highest supported mapping-page level (leaf level is zero).
+pub const BLOCK_MAP_MAX_LEVEL: u8 = 6;
 
 /// Persisted layout used for one logical file version.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -24,21 +30,21 @@ impl StorageMethod {
     }
 }
 
-/// Version-1 plaintext digest algorithm.
+/// Current plaintext digest algorithm.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HashAlgorithm {
     /// BLAKE3 with a 256-bit output.
     Blake3_256,
 }
 
-/// Version-1 payload codec.
+/// Current payload codec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PayloadCodec {
     /// Stored bytes are the canonical plaintext bytes.
     Identity,
 }
 
-/// Version-1 payload encryption mode.
+/// Current payload encryption mode.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PayloadCipher {
     /// Stored bytes are not encrypted.
@@ -54,8 +60,8 @@ pub struct Representation {
 }
 
 impl Representation {
-    /// The only representation supported by format version 1.
-    pub const V1: Self = Self {
+    /// The only representation supported by the current format.
+    pub const CURRENT: Self = Self {
         hash: HashAlgorithm::Blake3_256,
         codec: PayloadCodec::Identity,
         cipher: PayloadCipher::None,
@@ -77,24 +83,44 @@ impl Representation {
     }
 }
 
-/// Persisted parameters for block-split format version 1.
+/// Persisted parameters for the current paged block-split format.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BlockSplitParameters {
     block_size: u32,
+    fanout: u16,
+    index_bits: u8,
+    max_level: u8,
 }
 
 impl BlockSplitParameters {
-    /// The canonical version-1 parameters.
-    pub const V1: Self = Self {
-        block_size: BLOCK_SIZE_V1,
+    /// The canonical current parameters.
+    pub const CURRENT: Self = Self {
+        block_size: BLOCK_SIZE,
+        fanout: BLOCK_MAP_FANOUT,
+        index_bits: BLOCK_MAP_INDEX_BITS,
+        max_level: BLOCK_MAP_MAX_LEVEL,
     };
 
-    /// Validates a block size decoded from persistent storage.
-    pub const fn from_persisted(block_size: u32) -> Result<Self, UnsupportedBlockSize> {
-        if block_size == BLOCK_SIZE_V1 {
-            Ok(Self::V1)
+    /// Validates geometry decoded from persistent storage.
+    pub const fn from_persisted(
+        block_size: u32,
+        fanout: u16,
+        index_bits: u8,
+        max_level: u8,
+    ) -> Result<Self, UnsupportedBlockProfile> {
+        if block_size == BLOCK_SIZE
+            && fanout == BLOCK_MAP_FANOUT
+            && index_bits == BLOCK_MAP_INDEX_BITS
+            && max_level == BLOCK_MAP_MAX_LEVEL
+        {
+            Ok(Self::CURRENT)
         } else {
-            Err(UnsupportedBlockSize { block_size })
+            Err(UnsupportedBlockProfile {
+                block_size,
+                fanout,
+                index_bits,
+                max_level,
+            })
         }
     }
 
@@ -102,32 +128,55 @@ impl BlockSplitParameters {
     pub const fn block_size(self) -> u32 {
         self.block_size
     }
+
+    /// Returns the slots available in every leaf or branch page.
+    pub const fn fanout(self) -> u16 {
+        self.fanout
+    }
+
+    /// Returns the block-index bits consumed by one page level.
+    pub const fn index_bits(self) -> u8 {
+        self.index_bits
+    }
+
+    /// Returns the highest supported branch-page level.
+    pub const fn max_level(self) -> u8 {
+        self.max_level
+    }
 }
 
-/// Unsupported persisted block-split parameter.
+/// Unsupported persisted block-split geometry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UnsupportedBlockSize {
+pub struct UnsupportedBlockProfile {
     block_size: u32,
+    fanout: u16,
+    index_bits: u8,
+    max_level: u8,
 }
 
-impl UnsupportedBlockSize {
+impl UnsupportedBlockProfile {
     /// Returns the rejected block size.
     pub const fn block_size(self) -> u32 {
         self.block_size
     }
+
+    /// Returns the rejected fanout.
+    pub const fn fanout(self) -> u16 {
+        self.fanout
+    }
 }
 
-impl fmt::Display for UnsupportedBlockSize {
+impl fmt::Display for UnsupportedBlockProfile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "unsupported block size {}; expected {BLOCK_SIZE_V1}",
-            self.block_size
+            "unsupported block profile ({}, {}, {}, {}); expected ({BLOCK_SIZE}, {BLOCK_MAP_FANOUT}, {BLOCK_MAP_INDEX_BITS}, {BLOCK_MAP_MAX_LEVEL})",
+            self.block_size, self.fanout, self.index_bits, self.max_level
         )
     }
 }
 
-impl std::error::Error for UnsupportedBlockSize {}
+impl std::error::Error for UnsupportedBlockProfile {}
 
 /// Validated defaults used only when creating a new file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,12 +187,12 @@ pub struct CreationDefaults {
 }
 
 impl CreationDefaults {
-    /// Creates supported version-1 defaults for newly created files.
+    /// Creates supported current-format defaults for newly created files.
     pub const fn new(method: StorageMethod) -> Self {
         Self {
             method,
-            representation: Representation::V1,
-            block_split: BlockSplitParameters::V1,
+            representation: Representation::CURRENT,
+            block_split: BlockSplitParameters::CURRENT,
         }
     }
 
@@ -174,16 +223,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_block_size_is_fixed_for_v1() {
+    fn persisted_block_profile_is_fixed() {
         assert_eq!(
-            BlockSplitParameters::from_persisted(BLOCK_SIZE_V1),
-            Ok(BlockSplitParameters::V1)
+            BlockSplitParameters::from_persisted(
+                BLOCK_SIZE,
+                BLOCK_MAP_FANOUT,
+                BLOCK_MAP_INDEX_BITS,
+                BLOCK_MAP_MAX_LEVEL,
+            ),
+            Ok(BlockSplitParameters::CURRENT)
         );
         assert_eq!(
-            BlockSplitParameters::from_persisted(BLOCK_SIZE_V1 / 2)
-                .unwrap_err()
-                .block_size(),
-            BLOCK_SIZE_V1 / 2
+            BlockSplitParameters::from_persisted(
+                BLOCK_SIZE / 2,
+                BLOCK_MAP_FANOUT,
+                BLOCK_MAP_INDEX_BITS,
+                BLOCK_MAP_MAX_LEVEL,
+            )
+            .unwrap_err()
+            .block_size(),
+            BLOCK_SIZE / 2
         );
     }
 
@@ -191,8 +250,8 @@ mod tests {
     fn creation_defaults_are_supported_and_explicit() {
         let defaults = CreationDefaults::default();
         assert_eq!(defaults.method(), StorageMethod::BlockSplit);
-        assert_eq!(defaults.representation(), Representation::V1);
-        assert_eq!(defaults.block_split().block_size(), BLOCK_SIZE_V1);
+        assert_eq!(defaults.representation(), Representation::CURRENT);
+        assert_eq!(defaults.block_split().block_size(), BLOCK_SIZE);
         assert_eq!(StorageMethod::Raw.config_name(), "raw");
     }
 }

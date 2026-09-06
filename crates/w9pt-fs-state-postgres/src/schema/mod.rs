@@ -22,6 +22,7 @@ pub(crate) const INITIAL_MIGRATION_SOURCES: &[&str] = &[
     include_str!("entities/w9pt_fs_state_authority_heads.rs"),
     include_str!("entities/w9pt_fs_state_change_commits.rs"),
     include_str!("entities/w9pt_fs_state_change_keys.rs"),
+    include_str!("entities/w9pt_fs_state_content_metadata.rs"),
     include_str!("entities/w9pt_fs_state_directory_entries.rs"),
     include_str!("entities/w9pt_fs_state_filesystem_records.rs"),
     include_str!("entities/w9pt_fs_state_inodes.rs"),
@@ -70,9 +71,9 @@ mod tests {
 
     #[test]
     fn generated_catalog_names_are_complete_unique_and_postgres_bounded() {
-        assert_eq!(TABLE_NAMES.len(), 16);
-        assert_eq!(INDEX_NAMES.len(), 23);
-        assert_eq!(CONSTRAINT_NAMES.len(), 172);
+        assert_eq!(TABLE_NAMES.len(), 17);
+        assert_eq!(INDEX_NAMES.len(), 27);
+        assert_eq!(CONSTRAINT_NAMES.len(), 188);
         for names in [TABLE_NAMES, INDEX_NAMES, CONSTRAINT_NAMES] {
             assert!(names.iter().all(|name| name.starts_with("w9pt_fs_state_")));
             assert!(names.iter().all(|name| name.len() <= 63));
@@ -83,13 +84,29 @@ mod tests {
         }
         assert_eq!(
             INITIAL_MIGRATION_SOURCE.matches("ADD CONSTRAINT").count(),
-            153
+            165
         );
         assert_eq!(
             INITIAL_MIGRATION_SOURCE
                 .matches("DEFERRABLE INITIALLY DEFERRED")
                 .count(),
-            13
+            14
+        );
+    }
+
+    #[test]
+    fn inode_context_shape_is_mandatory_only_for_regular_files() {
+        assert!(INITIAL_MIGRATION_SOURCE.contains(
+            r#""kind" = 1
+                AND "content_file_id" IS NOT NULL
+                AND "content_context_id" IS NOT NULL
+                AND octet_length("content_context_id") = 16"#
+        ));
+        assert!(
+            INITIAL_MIGRATION_SOURCE
+                .matches("AND \"content_context_id\" IS NULL")
+                .count()
+                >= 4
         );
     }
 }

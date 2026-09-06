@@ -269,6 +269,11 @@ impl MemoryTarget {
         Ok(true)
     }
 
+    /// Removes an exact object outside the target contract to simulate lost referenced data.
+    pub fn remove(&self, key: &ObjectKey) -> Result<bool, MemoryTargetError> {
+        Ok(self.lock()?.objects.remove(key).is_some())
+    }
+
     /// Returns the number of stored keys.
     pub fn object_count(&self) -> Result<usize, MemoryTargetError> {
         Ok(self.lock()?.objects.len())
