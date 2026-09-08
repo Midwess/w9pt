@@ -12,7 +12,8 @@ use crate::{
     },
     keys::PreparationKey,
     representation::{
-        DecodedObject, FileCryptoContext, ObjectProvenance, decode_object, encode_object,
+        DecodedObject, FileCryptoContext, ObjectProvenance, decode_object, decode_working_bytes,
+        encode_object, encode_working_bytes,
     },
 };
 
@@ -86,6 +87,12 @@ impl<S: TargetStore> ContentRepository<S> {
         self.validate_context(content.file_id(), content.method(), context)?;
         let key = content.manifest_key().clone();
         self.keys.ensure_owned(&key)?;
+        self.check_decode_representation_work(
+            self.limits.max_manifest_bytes(),
+            self.limits.max_manifest_bytes(),
+            &key,
+            context,
+        )?;
         let bytes = self
             .get_required(key.clone(), MissingObjectKind::Manifest)
             .await?;
@@ -536,11 +543,11 @@ impl<S: TargetStore> ContentRepository<S> {
             usize::try_from(blob.plaintext_len()).map_err(|_| FormatError::ArithmeticOverflow {
                 field: "payload plaintext length",
             })?;
-        self.check_representation_work(maximum)?;
         let stored_len =
             usize::try_from(blob.stored_len()).map_err(|_| FormatError::ArithmeticOverflow {
                 field: "payload stored length",
             })?;
+        self.check_decode_representation_work(maximum, stored_len, blob.key(), context)?;
         let bytes = self
             .get_required_bounded(blob.key().clone(), MissingObjectKind::Payload, stored_len)
             .await?;
@@ -579,6 +586,12 @@ impl<S: TargetStore> ContentRepository<S> {
                 field: "mapping page encoded length",
             }
         })?;
+        self.check_decode_representation_work(
+            self.limits.max_map_page_bytes(),
+            expected_len,
+            reference.key(),
+            context,
+        )?;
         let bytes = self
             .get_required_bounded(
                 reference.key().clone(),
@@ -639,6 +652,7 @@ impl<S: TargetStore> ContentRepository<S> {
             first_block: page.first_block(),
         };
         let key = self.object_key(context, page.file_id(), provenance);
+        self.check_encode_representation_work(canonical.len(), &key, provenance, context, false)?;
         let encoded = encode_object(
             ObjectKind::if_map_level(page.level()),
             &key,
@@ -692,6 +706,7 @@ impl<S: TargetStore> ContentRepository<S> {
         };
         let key = self.object_key(context, manifest.file_id(), provenance);
         let canonical = encode_manifest(manifest, self.limits).map_err(StorageError::from)?;
+        self.check_encode_representation_work(canonical.len(), &key, provenance, context, false)?;
         let encoded = encode_object(
             ObjectKind::Manifest,
             &key,
@@ -840,7 +855,7 @@ impl<S: TargetStore> ContentRepository<S> {
                 u64::try_from(self.limits.max_object_bytes()).unwrap_or(u64::MAX),
             )
         })?;
-        self.check_representation_work(plaintext.len())?;
+        self.check_encode_representation_work(plaintext.len(), &key, provenance, context, true)?;
         let encoded = encode_object(
             ObjectKind::Payload,
             &key,
@@ -862,13 +877,31 @@ impl<S: TargetStore> ContentRepository<S> {
         ))
     }
 
-    fn check_representation_work(
+    fn check_encode_representation_work(
         &self,
         canonical_len: usize,
+        key: &ObjectKey,
+        provenance: ObjectProvenance,
+        context: &FileCryptoContext,
+        payload_compression: bool,
     ) -> Result<(), StorageError<S::Error>> {
-        let actual = canonical_len
-            .checked_mul(4)
-            .ok_or(crate::RepresentationError::InvalidLength)?;
+        let actual =
+            encode_working_bytes(canonical_len, key, provenance, context, payload_compression)?;
+        self.check_representation_work(actual)
+    }
+
+    pub(crate) fn check_decode_representation_work(
+        &self,
+        canonical_len: usize,
+        stored_len: usize,
+        key: &ObjectKey,
+        context: &FileCryptoContext,
+    ) -> Result<(), StorageError<S::Error>> {
+        let actual = decode_working_bytes(canonical_len, stored_len, key, context)?;
+        self.check_representation_work(actual)
+    }
+
+    fn check_representation_work(&self, actual: usize) -> Result<(), StorageError<S::Error>> {
         let limit = self.limits.max_representation_working_bytes();
         if actual > limit {
             return Err(LimitError::new(

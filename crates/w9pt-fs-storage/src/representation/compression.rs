@@ -15,6 +15,26 @@ pub(super) fn encode(
     }
 }
 
+pub(super) fn maximum_encode_capacity(
+    policy: CompressionPolicy,
+    plaintext_len: usize,
+) -> Result<usize, RepresentationError> {
+    match policy {
+        CompressionPolicy::Identity => Ok(plaintext_len),
+        CompressionPolicy::Lz4BlockV1 => maximum_lz4_capacity(plaintext_len),
+    }
+}
+
+#[cfg(feature = "compression-lz4")]
+fn maximum_lz4_capacity(plaintext_len: usize) -> Result<usize, RepresentationError> {
+    Ok(lz4_flex::block::get_maximum_output_size(plaintext_len))
+}
+
+#[cfg(not(feature = "compression-lz4"))]
+fn maximum_lz4_capacity(_plaintext_len: usize) -> Result<usize, RepresentationError> {
+    Err(RepresentationError::UnsupportedCompression)
+}
+
 #[cfg(feature = "compression-lz4")]
 fn encode_lz4(plaintext: &[u8]) -> Result<(ActualCodec, Vec<u8>), RepresentationError> {
     let maximum = lz4_flex::block::get_maximum_output_size(plaintext.len());

@@ -10,7 +10,10 @@ use w9pt_fs_storage::{
     testing::{MemoryTarget, block_on},
 };
 use w9pt_fs_storage::{
-    ContentContextId, FileContextScope, FileId, FileStoragePolicy, SecureEntropy, StorageMethod,
+    ContentContextId, Digest, FileContextScope, FileId, FileStoragePolicy, ObjectProvenance,
+    PreparationIdentity, RepresentationError, SecureEntropy, StorageError, StorageMethod,
+    TargetStore, encode_object,
+    format::{FileHead, FileManifest, ObjectKind, encode_head, encode_manifest},
     generate_content_metadata, open_committed_context,
 };
 #[cfg(feature = "encryption-aes-siv")]
@@ -20,8 +23,6 @@ use w9pt_fs_storage::{
 };
 #[cfg(all(feature = "compression-lz4", feature = "encryption-aes-siv"))]
 use w9pt_fs_storage::{LimitKind, StorageLimitValues, testing::FailureTiming};
-#[cfg(any(feature = "encryption-aes-siv", not(feature = "compression-lz4")))]
-use w9pt_fs_storage::{RepresentationError, StorageError};
 
 #[derive(Debug)]
 struct EntropyError;
@@ -90,6 +91,85 @@ fn plain_candidate_pins_policy_without_entropy_or_master() {
     .unwrap();
     assert_eq!(context.policy(), policy);
     assert!(format!("{context:?}").contains("None"));
+}
+
+#[test]
+fn standalone_publisher_rejects_authenticated_manifest_method_mismatch() {
+    let (scope, policy) = scope(StorageMethod::Raw, 36);
+    let mut entropy = FixedEntropy {
+        byte: 0,
+        calls: 0,
+        fail: true,
+    };
+    let candidate = generate_content_metadata(scope, policy, None, &mut entropy).unwrap();
+    let context = open_committed_context(
+        scope,
+        candidate.policy_format(),
+        candidate.policy_bytes(),
+        None,
+        None,
+        1,
+        None,
+    )
+    .unwrap();
+    let target = MemoryTarget::new();
+    let repository = ContentRepository::new(
+        target.clone(),
+        "standalone-method-mismatch",
+        CreationDefaults::new(StorageMethod::Raw),
+        StorageLimits::default(),
+    )
+    .unwrap();
+    let mutation = MutationId::from_u128(3_600);
+    let identity = PreparationIdentity::for_create(mutation, StorageMethod::Raw, b"").unwrap();
+    let provenance = ObjectProvenance::Manifest {
+        identity,
+        attempt: 0,
+        generation: 1,
+    };
+    let manifest_key = repository.keys().manifest(scope.file_id(), identity, 0);
+    let canonical = encode_manifest(
+        &FileManifest::block_split(scope.file_id(), 1, 0, None),
+        StorageLimits::default(),
+    )
+    .unwrap();
+    let stored = encode_object(
+        ObjectKind::Manifest,
+        &manifest_key,
+        &canonical,
+        provenance,
+        &context,
+        false,
+        StorageLimits::default().max_manifest_bytes(),
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(target.put_if_absent(manifest_key.clone(), stored.clone())).unwrap(),
+        w9pt_fs_storage::PutIfAbsent::Created { .. }
+    ));
+    let head = FileHead::new(
+        scope.file_id(),
+        1,
+        manifest_key,
+        Digest::blake3(&stored),
+        mutation,
+    );
+    let head_key = repository.keys().head(scope.file_id());
+    let head_bytes = encode_head(&head, StorageLimits::default()).unwrap();
+    assert!(matches!(
+        block_on(target.compare_exchange(head_key, None, head_bytes)).unwrap(),
+        w9pt_fs_storage::CompareExchange::Replaced { .. }
+    ));
+    assert!(matches!(
+        block_on(
+            repository
+                .publisher()
+                .load_with_context(scope.file_id(), &context)
+        ),
+        Err(StorageError::Representation(
+            RepresentationError::ContextMismatch
+        ))
+    ));
 }
 
 #[cfg(feature = "encryption-aes-siv")]
@@ -503,6 +583,42 @@ fn representation_work_limit_fails_before_target_mutation() {
     ));
     assert!(target.trace().unwrap().is_empty());
 
+    let small_target = MemoryTarget::new();
+    let small_limits = StorageLimits::new(StorageLimitValues {
+        max_representation_working_bytes: 500,
+        ..StorageLimitValues::default()
+    })
+    .unwrap();
+    let small_repository = ContentRepository::new(
+        small_target.clone(),
+        "representation-small-limit",
+        CreationDefaults::new(StorageMethod::Raw),
+        small_limits,
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(small_repository.prepare_create_with_context(
+            &context,
+            MutationId::from_u128(3_202),
+            0,
+            &[1],
+        )),
+        Err(StorageError::Limit(error))
+            if error.kind == LimitKind::RepresentationWorkingBytes
+    ));
+    assert!(small_target.trace().unwrap().is_empty());
+    assert!(matches!(
+        block_on(small_repository.prepare_create_with_context(
+            &context,
+            MutationId::from_u128(3_203),
+            0,
+            b"",
+        )),
+        Err(StorageError::Limit(error))
+            if error.kind == LimitKind::RepresentationWorkingBytes
+    ));
+    assert!(small_target.trace().unwrap().is_empty());
+
     let source_target = MemoryTarget::new();
     let source = ContentRepository::new(
         source_target.clone(),
@@ -511,11 +627,20 @@ fn representation_work_limit_fails_before_target_mutation() {
         StorageLimits::default(),
     )
     .unwrap();
+    let mut state = 0x9e37_79b9_u32;
+    let noisy = (0..10_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect::<Vec<_>>();
     let prepared = block_on(source.prepare_create_with_context(
         &context,
         MutationId::from_u128(3_201),
         0,
-        &[0x65; 1_025],
+        &noisy,
     ))
     .unwrap();
     let manifest =
@@ -524,11 +649,16 @@ fn representation_work_limit_fails_before_target_mutation() {
         panic!("expected bounded raw payload");
     };
     source_target.clear_trace().unwrap();
+    let read_limits = StorageLimits::new(StorageLimitValues {
+        max_representation_working_bytes: 20_000,
+        ..StorageLimitValues::default()
+    })
+    .unwrap();
     let limited_reader = ContentRepository::new(
         source_target.clone(),
         "representation-read-limit",
         CreationDefaults::new(StorageMethod::BlockSplit),
-        limits,
+        read_limits,
     )
     .unwrap();
     assert!(matches!(
@@ -536,7 +666,7 @@ fn representation_work_limit_fails_before_target_mutation() {
             prepared.content(),
             &context,
             0,
-            1_025,
+            noisy.len(),
         )),
         Err(StorageError::Limit(error))
             if error.kind == LimitKind::RepresentationWorkingBytes

@@ -577,6 +577,14 @@ impl<'a, S: TargetStore> ObjectHeadPublisher<'a, S> {
         let key_preparation = self
             .repository
             .validate_manifest_key(head.file_id(), &key)?;
+        let work_context =
+            FileCryptoContext::plain_for_file(head.file_id(), crate::StorageMethod::Raw);
+        self.repository.check_decode_representation_work(
+            self.repository.limits().max_manifest_bytes(),
+            self.repository.limits().max_manifest_bytes(),
+            &key,
+            &work_context,
+        )?;
         let object = self
             .repository
             .target()
@@ -624,6 +632,9 @@ impl<'a, S: TargetStore> ObjectHeadPublisher<'a, S> {
         }
         let manifest = decode_manifest(&decoded.canonical, self.repository.limits())
             .map_err(StorageError::from)?;
+        if manifest.method() != context.policy().method() {
+            return Err(crate::RepresentationError::ContextMismatch.into());
+        }
         if manifest.file_id() != head.file_id() {
             return Err(CorruptionError::IdentityMismatch { field: "file" }.into());
         }
@@ -650,6 +661,12 @@ impl<'a, S: TargetStore> ObjectHeadPublisher<'a, S> {
             .validate_context(head.file_id(), context.policy().method(), context)?;
         let key = head.manifest_key().clone();
         self.repository.keys().ensure_owned(&key)?;
+        self.repository.check_decode_representation_work(
+            self.repository.limits().max_manifest_bytes(),
+            self.repository.limits().max_manifest_bytes(),
+            &key,
+            context,
+        )?;
         let object = self
             .repository
             .target()
@@ -687,6 +704,9 @@ impl<'a, S: TargetStore> ObjectHeadPublisher<'a, S> {
         }
         let manifest = decode_manifest(&decoded.canonical, self.repository.limits())
             .map_err(StorageError::from)?;
+        if manifest.method() != context.policy().method() {
+            return Err(crate::RepresentationError::ContextMismatch.into());
+        }
         if manifest.file_id() != head.file_id() {
             return Err(CorruptionError::IdentityMismatch { field: "file" }.into());
         }

@@ -23,6 +23,9 @@ const FORMAT_MINOR: u16 = 0;
 const OUTER_HEADER_BYTES: usize = 8 + 1 + 2 + 2 + 1 + 16 + 8;
 const PLAIN_CHECKSUM_BYTES: usize = 32;
 const SIV_TAG_BYTES: usize = 16;
+const BODY_FIXED_BYTES: usize = 83;
+const AAD_FIXED_BYTES: usize = OUTER_HEADER_BYTES + 8 + 2 + 2 + 4;
+const OBJECT_KEY_BYTES: usize = 64;
 pub(crate) const RAW_PAYLOAD_MAX_OVERHEAD: u64 = 246;
 pub(crate) const BLOCK_PAYLOAD_MAX_OVERHEAD: u64 = 254;
 pub(crate) const PAYLOAD_MIN_STORED_BYTES: u64 = 231;
@@ -412,6 +415,87 @@ impl ObjectProvenance {
             } => (identity, attempt),
         }
     }
+
+    const fn encoded_len(self) -> usize {
+        let suffix = match self {
+            Self::Manifest { .. } | Self::BlockPayload { .. } => 8,
+            Self::RawPayload { .. } => 0,
+            Self::MapPage { .. } => 9,
+        };
+        1 + 16 + 8 + 32 + 32 + 4 + suffix
+    }
+}
+
+pub(crate) fn encode_working_bytes(
+    canonical_len: usize,
+    key: &ObjectKey,
+    provenance: ObjectProvenance,
+    context: &FileCryptoContext,
+    payload_compression: bool,
+) -> Result<usize, RepresentationError> {
+    let codec_capacity = if payload_compression {
+        compression::maximum_encode_capacity(context.policy.compression(), canonical_len)?
+    } else {
+        canonical_len
+    };
+    let provenance_len = provenance.encoded_len();
+    let body_len = BODY_FIXED_BYTES
+        .checked_add(provenance_len)
+        .and_then(|size| size.checked_add(canonical_len))
+        .ok_or(RepresentationError::InvalidLength)?;
+    let protection_bytes = if context.policy.encryption().is_encrypted() {
+        SIV_TAG_BYTES
+    } else {
+        PLAIN_CHECKSUM_BYTES
+    };
+    let protected_len = protection_bytes
+        .checked_add(body_len)
+        .ok_or(RepresentationError::InvalidLength)?;
+    let final_len = OUTER_HEADER_BYTES
+        .checked_add(protected_len)
+        .ok_or(RepresentationError::InvalidLength)?;
+    let aad_len = AAD_FIXED_BYTES
+        .checked_add(key.as_str().len())
+        .ok_or(RepresentationError::InvalidLength)?;
+    let key_bytes = if context.policy.encryption().is_encrypted() {
+        OBJECT_KEY_BYTES
+    } else {
+        0
+    };
+    checked_sum(&[
+        codec_capacity,
+        provenance_len,
+        body_len,
+        aad_len,
+        protected_len,
+        final_len,
+        key_bytes,
+    ])
+}
+
+pub(crate) fn decode_working_bytes(
+    canonical_len: usize,
+    stored_len: usize,
+    key: &ObjectKey,
+    context: &FileCryptoContext,
+) -> Result<usize, RepresentationError> {
+    let aad_len = AAD_FIXED_BYTES
+        .checked_add(key.as_str().len())
+        .ok_or(RepresentationError::InvalidLength)?;
+    let key_bytes = if context.policy.encryption().is_encrypted() {
+        OBJECT_KEY_BYTES
+    } else {
+        0
+    };
+    checked_sum(&[stored_len, stored_len, canonical_len, aad_len, key_bytes])
+}
+
+fn checked_sum(values: &[usize]) -> Result<usize, RepresentationError> {
+    values.iter().try_fold(0usize, |total, value| {
+        total
+            .checked_add(*value)
+            .ok_or(RepresentationError::InvalidLength)
+    })
 }
 
 /// Successfully decoded canonical object bytes and authenticated provenance.

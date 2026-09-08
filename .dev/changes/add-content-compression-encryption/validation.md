@@ -59,3 +59,33 @@ network, and volumes.
 - This validation is not an independent cryptographic audit, production
   SeaweedFS qualification, restart/durability proof, multi-node fault test or
   capacity benchmark.
+
+## Post-review remediation
+
+The 2026-09-07 four-agent code review reported eight findings. All were fixed
+and the complete offline and live validation above was rerun:
+
+- regular inodes now use `InodeRecord::new_regular` with a mandatory context;
+  commit graph validation, PostgreSQL decoding/schema checks and publication no
+  longer accept a contextless fallback;
+- receiver validation and dedicated rewrap enforce the aggregate metadata cap;
+- standalone heads have context-aware load/create/replace/rebase operations for
+  compressed and protected roots;
+- derived wrapping keys and encrypted representation scratch use drop-safe
+  zeroization, including authentication-error paths;
+- reads reserve representation work before fetching or decoding payloads;
+- non-regular PostgreSQL inode shapes require a null context while regular
+  shapes require a non-null 16-byte context;
+- payload/page references reject lengths below the complete v3 object minimum;
+- PostgreSQL content-metadata scan accounting matches the generic retained-byte
+  formula.
+
+The follow-up four-agent review found two additional gaps. Representation work
+now uses checked per-buffer bounds for codec capacity, provenance, body framing,
+AAD, protection, final stored bytes and derived object-key material on payload,
+page and manifest encode/decode paths. Standalone publication also rejects an
+authenticated manifest whose embedded storage method differs from the selected
+file context. Small-object, empty-manifest, read-side and adversarial standalone
+fixtures cover these corrections. The full workspace, feature matrix, Clippy
+and required PostgreSQL 18.6 plus SeaweedFS 4.42 integration workflow passed
+again with verified teardown.
