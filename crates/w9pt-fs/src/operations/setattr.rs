@@ -78,7 +78,6 @@ where
         execution.retention,
     );
     let filesystem_id = initial_grant.filesystem_id();
-    let root_inode_id = initial_grant.root_inode_id();
     let context = request.context.clone();
     run_mutation(
         state,
@@ -89,13 +88,13 @@ where
         limits,
         |attempt| {
             let context = context.clone();
+            let expected_grant = initial_grant.clone();
             async move {
                 let grant = policy
                     .resolve(ExportPolicyRequest::new(context))
                     .await
                     .map_err(MutationPlanError::Policy)?;
-                if grant.filesystem_id() != filesystem_id || grant.root_inode_id() != root_inode_id
-                {
+                if grant != expected_grant {
                     return Err(client(LinuxErrno::EAGAIN));
                 }
                 let owner =
@@ -195,10 +194,18 @@ where
     .await?;
     let inode = point_inode(&first.results()[1])?.ok_or_else(|| client(LinuxErrno::EBADF))?;
     authorize(grant, &inode, attributes, owner.as_ref(), group.as_ref())?;
-    let update = selected_update(grant, &inode, attributes, owner, group, now)?;
     let result = encode_mutation_result(&FilesystemResult::AttributesSet, limits, state_limits)
         .map_err(MutationPlanError::ResultCodec)?;
     let fs = grant.filesystem_id();
+
+    if attributes.valid.contains(SetattrMask::SIZE) && inode.kind() != InodeKind::RegularFile {
+        return Err(client(if inode.kind() == InodeKind::Directory {
+            LinuxErrno::EISDIR
+        } else {
+            LinuxErrno::EINVAL
+        }));
+    }
+    let update = selected_update(grant, &inode, attributes, owner.clone(), group.clone(), now)?;
 
     if !attributes.valid.contains(SetattrMask::SIZE)
         || inode.content().is_none() && attributes.size == 0
@@ -230,13 +237,6 @@ where
         )
         .map_err(MutationPlanError::MalformedCommit);
     }
-    if inode.kind() != InodeKind::RegularFile {
-        return Err(client(if inode.kind() == InodeKind::Directory {
-            LinuxErrno::EISDIR
-        } else {
-            LinuxErrno::EINVAL
-        }));
-    }
     let selected = read_snapshot::<S, T::Error, P, I>(
         state,
         grant,
@@ -254,13 +254,8 @@ where
     else {
         return Err(MutationPlanError::MalformedState);
     };
-    authorize(
-        grant,
-        inode,
-        attributes,
-        update.owner.as_ref(),
-        update.group.as_ref(),
-    )?;
+    authorize(grant, inode, attributes, owner.as_ref(), group.as_ref())?;
+    let update = selected_update(grant, inode, attributes, owner, group, now)?;
     let context = open_committed_context(
         FileContextScope::new(
             *fs.as_bytes(),
@@ -401,6 +396,15 @@ fn selected_update<S, T, P, I>(
     {
         mode = mode.map(|value| value & !0o2000);
     }
+    let mut modified = selected_time(
+        attributes.valid.contains(SetattrMask::MTIME),
+        attributes.valid.contains(SetattrMask::MTIME_SET),
+        attributes.modified,
+        now,
+    )?;
+    if attributes.valid.contains(SetattrMask::SIZE) && modified.is_none() {
+        modified = Some(now);
+    }
     Ok(InodeAttributeUpdate {
         mode,
         owner,
@@ -411,12 +415,7 @@ fn selected_update<S, T, P, I>(
             attributes.accessed,
             now,
         )?,
-        modified: selected_time(
-            attributes.valid.contains(SetattrMask::MTIME),
-            attributes.valid.contains(SetattrMask::MTIME_SET),
-            attributes.modified,
-            now,
-        )?,
+        modified,
         changed: Some(now),
         created: None,
     })
@@ -648,7 +647,8 @@ mod tests {
         block_on(async {
             let environment = TestEnvironment::new(false, StorageMethod::BlockSplit).await;
             let created = environment.create_file("sized", 200).await;
-            for (mutation, size, mode) in [(201, 9, 0o640), (202, 2, 0o600)] {
+            let mut final_timestamp = environment.now;
+            for (mutation, size, mode, seconds) in [(201, 9, 0o640, 20), (202, 2, 0o600, 30)] {
                 let request = FilesystemRequest::new(
                     environment.context(),
                     FilesystemOperation::Setattr {
@@ -661,6 +661,9 @@ mod tests {
                         },
                     },
                 );
+                let mut execution = environment.execution(mutation);
+                final_timestamp = UnixTimestamp::new(seconds, 0).unwrap();
+                execution.timestamp = Some(final_timestamp);
                 assert_eq!(
                     execute_setattr(
                         &environment.state,
@@ -669,7 +672,7 @@ mod tests {
                         &environment.identities,
                         environment.engine_limits,
                         request,
-                        environment.execution(mutation),
+                        execution,
                     )
                     .await
                     .unwrap(),
@@ -708,7 +711,79 @@ mod tests {
                 &snapshot.results()[0],
                 ReadResult::Point { record: Some(record), .. }
                     if matches!(record.as_ref(), StateRecord::Inode(inode)
-                        if inode.logical_size() == 2 && inode.mode() == 0o600)
+                        if inode.logical_size() == 2
+                            && inode.mode() == 0o600
+                            && inode.times().modified == final_timestamp)
+            ));
+        });
+    }
+
+    #[test]
+    fn zero_size_is_rejected_for_directories_and_symlinks() {
+        use crate::operations::execute_symlink;
+
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let size_zero = |object| {
+                FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Setattr {
+                        object,
+                        attributes: SetAttributes {
+                            valid: SetattrMask::SIZE,
+                            size: 0,
+                            ..SetAttributes::default()
+                        },
+                    },
+                )
+            };
+            assert!(matches!(
+                execute_setattr(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    size_zero(crate::object_handle(environment.root_id)),
+                    environment.execution(300),
+                )
+                .await,
+                Err(MutationOperationError::Client(error)) if error.errno == LinuxErrno::EISDIR
+            ));
+            let FilesystemResult::SymlinkCreated(symlink) =
+                execute_symlink::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                    &environment.state,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    FilesystemRequest::new(
+                        environment.context(),
+                        FilesystemOperation::Symlink {
+                            directory: crate::object_handle(environment.root_id),
+                            name: "link".into(),
+                            target: "target".into(),
+                            gid: 1,
+                        },
+                    ),
+                    environment.execution(301),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("unexpected symlink result")
+            };
+            assert!(matches!(
+                execute_setattr(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    size_zero(symlink.object),
+                    environment.execution(302),
+                )
+                .await,
+                Err(MutationOperationError::Client(error)) if error.errno == LinuxErrno::EINVAL
             ));
         });
     }

@@ -1854,7 +1854,9 @@ pub fn validate_record_set_with_limits(
                         relation: "duplicate inode QID path",
                     });
                 }
-                if let Some(parent_inode_id) = inode.directory_parent() {
+                if let Some(parent_inode_id) = inode.directory_parent()
+                    && inode.link_count() != 0
+                {
                     let parent = require_inode(
                         records,
                         filesystem_id,
@@ -1958,12 +1960,31 @@ pub fn validate_record_set_with_limits(
                         relation: "filesystem root directory has a namespace hard link",
                     });
                 }
-            } else if namespace_entries.len() != 1
-                || namespace_entries[0].parent_inode_id() != inode.directory_parent().unwrap()
-            {
-                return Err(RecordValidationError::InvalidRelatedRecord {
-                    relation: "directory must have exactly one entry in its authoritative parent",
-                });
+            } else if inode.link_count() == 0 {
+                if !namespace_entries.is_empty() {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "orphan directory still has a namespace entry",
+                    });
+                }
+                if records.keys().any(|key| {
+                    matches!(
+                        key,
+                        RecordKey::DirectoryEntry(entry_fs, parent, _)
+                            if entry_fs == filesystem_id && parent == inode_id
+                    )
+                }) {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "orphan directory is not empty",
+                    });
+                }
+            } else {
+                if namespace_entries.len() != 1
+                    || namespace_entries[0].parent_inode_id() != inode.directory_parent().unwrap()
+                {
+                    return Err(RecordValidationError::InvalidRelatedRecord {
+                        relation: "directory must have exactly one entry in its authoritative parent",
+                    });
+                }
             }
         }
         if inode.link_count() != 0 {
@@ -2378,6 +2399,99 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn open_unlinked_directory_needs_pins_but_not_a_namespace_parent() {
+        let filesystem_id = FilesystemId::from_u128(10);
+        let root_id = InodeId::from_u128(11);
+        let directory_id = InodeId::from_u128(12);
+        let open_id = OpenId::from_u128(13);
+        let revision = RecordRevision::new(1).unwrap();
+        let (owner, group) = identity();
+        let root = InodeRecord::new(
+            root_id,
+            QidPath::new(1).unwrap(),
+            revision,
+            0o755,
+            owner.clone(),
+            group.clone(),
+            times(),
+            0,
+            1,
+            InodeGeneration::new(1).unwrap(),
+            InodeData::Directory {
+                generation: DirectoryGeneration::new(1).unwrap(),
+                parent_inode_id: root_id,
+            },
+        )
+        .unwrap();
+        let directory = InodeRecord::new(
+            directory_id,
+            QidPath::new(2).unwrap(),
+            revision,
+            0o755,
+            owner,
+            group,
+            times(),
+            0,
+            0,
+            InodeGeneration::new(2).unwrap(),
+            InodeData::Directory {
+                generation: DirectoryGeneration::new(2).unwrap(),
+                parent_inode_id: InodeId::from_u128(99),
+            },
+        )
+        .unwrap();
+        let filesystem = FilesystemRecord::new(
+            filesystem_id,
+            StateRevision::new(1).unwrap(),
+            revision,
+            root_id,
+            QidPath::new(3).unwrap(),
+            DirectoryCookie::new(2),
+            1,
+        )
+        .unwrap();
+        let open = OpenRecord::new(
+            open_id,
+            directory_id,
+            ClientIncarnationId::from_u128(14),
+            OpenAccess::DirectoryRead,
+            false,
+            directory.inode_generation(),
+            revision,
+        );
+        let pin = OpenPinRecord::new(directory_id, open_id, revision);
+        let orphan =
+            OrphanRecord::new(directory_id, 1, StateRevision::new(2).unwrap(), revision).unwrap();
+        let records = BTreeMap::from([
+            (
+                RecordKey::Filesystem(filesystem_id),
+                StateRecord::Filesystem(filesystem),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, root_id),
+                StateRecord::Inode(root),
+            ),
+            (
+                RecordKey::Inode(filesystem_id, directory_id),
+                StateRecord::Inode(directory),
+            ),
+            (
+                RecordKey::Open(filesystem_id, open_id),
+                StateRecord::Open(open),
+            ),
+            (
+                RecordKey::OpenPin(filesystem_id, directory_id, open_id),
+                StateRecord::OpenPin(pin),
+            ),
+            (
+                RecordKey::Orphan(filesystem_id, directory_id),
+                StateRecord::Orphan(orphan),
+            ),
+        ]);
+        validate_record_set(&records).unwrap();
     }
 
     #[test]

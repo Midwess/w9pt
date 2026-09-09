@@ -195,11 +195,14 @@ according to normal path-walk semantics.
 
 Open flag parsing determines read/write access, append, directory-read behavior,
 and truncate intent. Unsupported or contradictory flags fail before mutation.
+`O_DSYNC` and `O_SYNC` remain unsupported until their guarantees can be retained
+in portable open state and enforced by every write.
 
 An open operation inserts an `OpenRecord` and matching `OpenPinRecord` in one
 transaction, bound to the client incarnation. It records the stable open result
 in the mutation ledger. `O_TRUNC` prepares new immutable content first and
-publishes it atomically with the open/pin and inode changes.
+publishes it atomically with the open/pin and inode changes. Writable or
+truncating opens fail with `EROFS` before target access on a read-only export.
 
 `Create` allocates inode, content-file, open, QID-path, and cookie identities. It
 inserts an explicit empty unpublished regular inode together with its dentry,
@@ -209,7 +212,9 @@ empty S3 payload or manifest is required before the file contains data.
 Release validates ownership of the open, deletes the open and pin, and updates
 the orphan count when present. When the last pin of a zero-link orphan is
 released, orphan and inode retirement happen atomically. Immutable content is
-not synchronously deleted; later GC uses durable reachability.
+not synchronously deleted; later GC uses durable reachability. Empty open
+directories use the same orphan lifetime and cannot receive new namespace
+entries after their last name is removed.
 
 ## 9. Immutable File I/O
 
@@ -234,6 +239,9 @@ If the inode has no published content, the engine uses
 `prepare_write_from_new`; block-split preserves a sparse gap and raw enforces its
 materialization bound. Existing content uses `prepare_write`.
 
+Zero-length writes still consume and retain their stable mutation identity as a
+validated semantic no-op, so reuse for different bytes is a hard mismatch.
+
 The commit publishes `ContentRef`, size, data/inode generation, modification and
 change times, and the exact written-count result together. A base conflict
 causes complete reread, permission validation, append-offset recomputation, and
@@ -245,7 +253,9 @@ new preparation. It never blindly applies prepared partial data to a new base.
 change it publishes one complete checked inode replacement. With a size change,
 it uses `prepare_truncate` or `prepare_truncate_from_new` and one dedicated
 content-plus-attributes transition. Mode, owner/group, times, content, size, and
-generations cannot become visible separately.
+generations cannot become visible separately. Any selected size is rejected for
+non-regular inodes, and a size change advances modification time unless the
+request supplies an explicit selected value.
 
 ## 10. Namespace Transactions
 
@@ -283,6 +293,9 @@ is reconstructible before identity generation and before reading QID/cookie
 high-water marks. Deterministic identity outputs and state-allocated QID paths or
 cookies are not request identity; a separate versioned result encoding retains
 those exact values for every successful mutating result in the first slice.
+Every policy resolution performed while planning must equal the grant captured
+by that fingerprint; a changed grant stops the attempt rather than committing
+under a different authorization context.
 
 The result codec validates result kind, version, lengths, counts, handle/QID
 fields, and trailing data. Replayed `Create` and `Open` return the same handles

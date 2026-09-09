@@ -166,6 +166,11 @@ The system SHALL create, resolve, and release authoritative portable open record
 - THEN the engine atomically inserts the deterministic open record and pin
 - AND returns the stable QID, portable `OpenHandle`, and bounded I/O unit
 
+#### Scenario: Open requests unavailable write guarantees
+- WHEN a writable or truncating open targets a read-only export, or requests unsupported `O_DSYNC` or `O_SYNC` semantics
+- THEN the engine returns `EROFS` or `EOPNOTSUPP` before target or state mutation
+- AND no accepted open silently loses a requested durability guarantee
+
 #### Scenario: Truncate-on-open is requested
 - WHEN an existing writable regular file is opened with truncation
 - THEN immutable truncated content is prepared before the metadata transaction
@@ -253,6 +258,11 @@ The system SHALL validate and apply every selected `Setattr` field as one author
 - THEN the engine prepares generation-one content against the new-file base
 - AND every newly visible byte reads as zero
 
+#### Scenario: Size is selected
+- WHEN `Setattr` selects size for a non-regular inode
+- THEN the engine rejects the request without mutation
+- AND a successful regular-file size change advances modification time unless an explicit selected value replaces it
+
 ### Requirement: Atomic Namespace Operations
 The system SHALL execute `Mkdir`, `Symlink`, `Link`, `UnlinkAt`, and `RenameAt` as serializable multi-record namespace mutations with stable cookies/QIDs, link counts, generations, timestamps, ancestry, and retained results.
 
@@ -289,6 +299,11 @@ The system SHALL retain a zero-link inode while authoritative open pins exist an
 - THEN open, pin, orphan, and inode retirement commit atomically
 - AND immutable content becomes unreachable for later GC rather than being deleted on the request path
 
+#### Scenario: Empty open directory is unlinked
+- WHEN an empty directory loses its last name while a directory open pin exists
+- THEN the directory and pin remain in the orphan set until release
+- AND namespace mutation through the zero-link directory is rejected
+
 ### Requirement: Durable Exact Mutation Replay
 The system SHALL construct a complete stable-intent fingerprint and probe the mutation ledger before allocation or content preparation, returning a retained result only for an identical semantic request and client incarnation.
 
@@ -301,6 +316,11 @@ The system SHALL construct a complete stable-intent fingerprint and probe the mu
 - WHEN the same mutation ID carries different stable context, operands, timestamp-dependent choices, fingerprint, client incarnation, or retention
 - THEN the engine returns a hard mismatch
 - AND performs no state or target mutation
+
+#### Scenario: Zero-length write is replayed
+- WHEN a validated zero-length write is repeated with the same mutation identity and fingerprint
+- THEN the exact zero-count result is replayed from the ledger
+- AND reuse of that identity for nonempty bytes is a hard mismatch
 
 #### Scenario: Ledger probe is reconstructed after restart
 - WHEN an engine with empty local state retries a mutation whose state allocation high-water marks have advanced

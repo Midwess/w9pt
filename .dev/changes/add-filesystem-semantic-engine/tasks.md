@@ -103,3 +103,9 @@ and migration/open never detect, import, upgrade, or perform that reset.
   RustSec passed under the repository policy after the all-feature/all-target
   reachability guard proved the locked `rkyv 0.7.46` and `rsa 0.9.10` advisory
   packages unreachable; only the existing CI-enforced exceptions were used.
+- Review regression coverage now drives create/write/setattr/link/rename/unlink/
+  read/release frames across two independently constructed engines, retries the
+  same committed write after completion-handoff, response-delivery, and bounded
+  response-enqueue failure, exercises stale-fence and policy-generation races,
+  and injects payload, manifest, and metadata publication failures before and
+  after their boundaries.

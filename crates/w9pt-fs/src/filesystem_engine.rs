@@ -694,12 +694,12 @@ mod tests {
     };
     use w9pt_fs_state::{
         AcquireLeaseOutcome, AcquireWriterLease, ClientIncarnationId, CommitOutcome, CommitRequest,
-        DirectoryCookie, DirectoryGeneration, FilesystemId, FilesystemRecord, GroupId, InodeData,
-        InodeGeneration, InodeId, InodeRecord, InodeTimes, LeaseDuration, LeaseId,
-        LeaseOperationId, ManualLeaseClock, MutationContext, MutationRetention, Precondition,
-        PrincipalId as StatePrincipalId, QidPath, RecordKey, RecordRevision, RequestFingerprint,
-        StateChange, StateLimits, StateRecord, StateRevision, WriterIncarnationId, WriterScopeId,
-        WriterTopology, testing::MemoryAuthority,
+        DirectoryCookie, DirectoryGeneration, FencingToken, FilesystemId, FilesystemRecord,
+        GroupId, InodeData, InodeGeneration, InodeId, InodeRecord, InodeTimes, LeaseDuration,
+        LeaseId, LeaseOperationId, ManualLeaseClock, MutationContext, MutationRetention,
+        Precondition, PrincipalId as StatePrincipalId, QidPath, RecordKey, RecordRevision,
+        RequestFingerprint, StateChange, StateLimits, StateRecord, StateRevision, WriterFence,
+        WriterIncarnationId, WriterScopeId, WriterTopology, testing::MemoryAuthority,
     };
     use w9pt_fs_storage::{
         ContentRepository, CreationDefaults, MutationId, StorageLimits, StorageMethod,
@@ -707,7 +707,7 @@ mod tests {
     };
 
     use crate::{
-        CanonicalIdentity, ExportGrant, IdentityMappingRequest, NumericIdentity,
+        CanonicalIdentity, ExecutionContext, ExportGrant, IdentityMappingRequest, NumericIdentity,
         ReverseIdentityMappingRequest,
     };
 
@@ -1007,6 +1007,403 @@ mod tests {
         });
     }
 
+    #[test]
+    fn real_session_mutations_replay_across_engines_after_handoff_and_response_loss() {
+        use crate::testing::TestEnvironment;
+        use w9pt::protocol::{MessageType, OpenFlags, SetattrMask};
+        use w9pt::{Completion, PolicyResult, Session, SessionConfig, SessionContext};
+
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let first_engine = environment.engine();
+            let second_engine = FilesystemEngine::new(
+                environment.authority.open_client(),
+                ContentRepository::new(
+                    environment.target.clone(),
+                    "semantic-engine-tests",
+                    CreationDefaults::new(StorageMethod::BlockSplit),
+                    StorageLimits::default(),
+                )
+                .unwrap(),
+                environment.policy.clone(),
+                environment.identities,
+                environment.engine_limits,
+            );
+            let mut session = Session::new(
+                SessionConfig::default(),
+                SessionContext::new(SessionId::new(10)),
+            )
+            .unwrap();
+            negotiate(&mut session);
+            let attach_operation = emit_attach(&mut session);
+            let attach = first_engine
+                .resolve_attach(environment.context())
+                .await
+                .unwrap();
+            session
+                .complete(Completion::Policy {
+                    operation_id: attach_operation,
+                    result: Ok(PolicyResult::Attached(attach)),
+                })
+                .unwrap();
+            expect_response(&mut session, MessageType::Rattach);
+
+            let mut clone_root = Vec::new();
+            clone_root.extend_from_slice(&1u32.to_le_bytes());
+            clone_root.extend_from_slice(&2u32.to_le_bytes());
+            clone_root.extend_from_slice(&0u16.to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Twalk, 3, &clone_root))
+                .unwrap();
+            expect_response(&mut session, MessageType::Rwalk);
+
+            let mut create = Vec::new();
+            create.extend_from_slice(&2u32.to_le_bytes());
+            create.extend_from_slice(&wire_string("file"));
+            create.extend_from_slice(&OpenFlags::RDWR.bits().to_le_bytes());
+            create.extend_from_slice(&0o660u32.to_le_bytes());
+            create.extend_from_slice(&1u32.to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Tlcreate, 4, &create))
+                .unwrap();
+            complete_session_effect(
+                &first_engine,
+                &mut session,
+                environment.execution(900),
+                MessageType::Rlcreate,
+            )
+            .await;
+
+            let mut write = Vec::new();
+            write.extend_from_slice(&2u32.to_le_bytes());
+            write.extend_from_slice(&0u64.to_le_bytes());
+            write.extend_from_slice(&7u32.to_le_bytes());
+            write.extend_from_slice(b"payload");
+            session
+                .receive_frame(frame(MessageType::Twrite, 5, &write))
+                .unwrap();
+            let request = take_engine_request(&mut session, environment.execution(901));
+            let first_terminal = terminal(second_engine.execute(request.clone()).await);
+            drop(first_terminal);
+            let recovered = terminal(first_engine.execute(request).await);
+            session.complete(recovered.into_completion()).unwrap();
+            let lost_response = take_response(&mut session);
+            assert_eq!(lost_response[4], MessageType::Rwrite.to_u8());
+
+            session
+                .receive_frame(frame(MessageType::Twrite, 6, &write))
+                .unwrap();
+            complete_session_effect(
+                &second_engine,
+                &mut session,
+                environment.execution(901),
+                MessageType::Rwrite,
+            )
+            .await;
+
+            let mut setattr = Vec::new();
+            setattr.extend_from_slice(&2u32.to_le_bytes());
+            setattr.extend_from_slice(&SetattrMask::MODE.bits().to_le_bytes());
+            setattr.extend_from_slice(&0o600u32.to_le_bytes());
+            setattr.extend_from_slice(&0u32.to_le_bytes());
+            setattr.extend_from_slice(&0u32.to_le_bytes());
+            setattr.extend_from_slice(&0u64.to_le_bytes());
+            for _ in 0..4 {
+                setattr.extend_from_slice(&0u64.to_le_bytes());
+            }
+            session
+                .receive_frame(frame(MessageType::Tsetattr, 7, &setattr))
+                .unwrap();
+            let mut stale_execution = environment.execution(902);
+            stale_execution.fence = Some(WriterFence::new(
+                environment.fence.scope,
+                environment.fence.holder,
+                environment.fence.lease_id,
+                FencingToken::new(
+                    environment
+                        .fence
+                        .fencing_token
+                        .get()
+                        .checked_add(1)
+                        .unwrap(),
+                )
+                .unwrap(),
+            ));
+            let stale_request = take_engine_request(&mut session, stale_execution);
+            assert!(matches!(
+                second_engine.execute(stale_request.clone()).await,
+                EngineOutcome::Unresolved(UnresolvedEngineFailure {
+                    failure: crate::ExecutionFailure::Authority(
+                        crate::AuthorityFailure::StaleFence
+                    ),
+                    ..
+                })
+            ));
+            let recovered_request = EngineRequest::new(
+                stale_request.operation_id,
+                stale_request.request,
+                environment.execution(902),
+            );
+            let recovered = terminal(first_engine.execute(recovered_request).await);
+            session.complete(recovered.into_completion()).unwrap();
+            expect_response(&mut session, MessageType::Rsetattr);
+
+            let mut link = Vec::new();
+            link.extend_from_slice(&1u32.to_le_bytes());
+            link.extend_from_slice(&2u32.to_le_bytes());
+            link.extend_from_slice(&wire_string("alias"));
+            session
+                .receive_frame(frame(MessageType::Tlink, 8, &link))
+                .unwrap();
+            complete_session_effect(
+                &second_engine,
+                &mut session,
+                environment.execution(903),
+                MessageType::Rlink,
+            )
+            .await;
+
+            let mut rename = Vec::new();
+            rename.extend_from_slice(&1u32.to_le_bytes());
+            rename.extend_from_slice(&wire_string("file"));
+            rename.extend_from_slice(&1u32.to_le_bytes());
+            rename.extend_from_slice(&wire_string("renamed"));
+            session
+                .receive_frame(frame(MessageType::Trenameat, 9, &rename))
+                .unwrap();
+            complete_session_effect(
+                &first_engine,
+                &mut session,
+                environment.execution(904),
+                MessageType::Rrenameat,
+            )
+            .await;
+
+            for (tag, name, mutation) in [(10, "renamed", 905), (11, "alias", 906)] {
+                let mut unlink = Vec::new();
+                unlink.extend_from_slice(&1u32.to_le_bytes());
+                unlink.extend_from_slice(&wire_string(name));
+                unlink.extend_from_slice(&0u32.to_le_bytes());
+                session
+                    .receive_frame(frame(MessageType::Tunlinkat, tag, &unlink))
+                    .unwrap();
+                complete_session_effect(
+                    &second_engine,
+                    &mut session,
+                    environment.execution(mutation),
+                    MessageType::Runlinkat,
+                )
+                .await;
+            }
+
+            let mut read = Vec::new();
+            read.extend_from_slice(&2u32.to_le_bytes());
+            read.extend_from_slice(&0u64.to_le_bytes());
+            read.extend_from_slice(&32u32.to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Tread, 12, &read))
+                .unwrap();
+            let read_request = take_engine_request(
+                &mut session,
+                ExecutionContext::read_only(environment.client, MutationRetention::new(1_000)),
+            );
+            let read_terminal = terminal(first_engine.execute(read_request).await);
+            session.complete(read_terminal.into_completion()).unwrap();
+            let read_response = take_response(&mut session);
+            assert_eq!(read_response[4], MessageType::Rread.to_u8());
+            assert_eq!(
+                u32::from_le_bytes(read_response[7..11].try_into().unwrap()),
+                7
+            );
+            assert_eq!(&read_response[11..], b"payload");
+            let mut clunk = Vec::new();
+            clunk.extend_from_slice(&2u32.to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Tclunk, 13, &clunk))
+                .unwrap();
+            complete_session_effect(
+                &second_engine,
+                &mut session,
+                environment.execution(907),
+                MessageType::Rclunk,
+            )
+            .await;
+
+            let policy_bump = CommitRequest::new(
+                environment.filesystem_id,
+                MutationContext::new(
+                    MutationId::from_u128(950),
+                    RequestFingerprint::blake3(b"session policy bump"),
+                    environment.client,
+                    MutationRetention::new(1_000),
+                ),
+                environment.fence,
+                vec![Precondition::FilesystemPolicyGeneration { expected: 1 }],
+                vec![StateChange::BumpFilesystemPolicyGeneration],
+                crate::encode_mutation_result(
+                    &FilesystemResult::Released,
+                    environment.engine_limits,
+                    environment.state_limits,
+                )
+                .unwrap(),
+                environment.state_limits,
+            )
+            .unwrap();
+            assert!(matches!(
+                second_engine.state().commit(policy_bump).await.unwrap(),
+                CommitOutcome::Committed(_)
+            ));
+            let mut getattr = Vec::new();
+            getattr.extend_from_slice(&1u32.to_le_bytes());
+            getattr.extend_from_slice(&w9pt::protocol::GetattrMask::ALL.bits().to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Tgetattr, 14, &getattr))
+                .unwrap();
+            let request = take_engine_request(
+                &mut session,
+                ExecutionContext::read_only(environment.client, MutationRetention::new(1_000)),
+            );
+            let terminal = terminal(first_engine.execute(request).await);
+            assert!(matches!(
+                terminal.result,
+                Err(ref error) if error.errno == LinuxErrno::EAGAIN
+            ));
+            session.complete(terminal.into_completion()).unwrap();
+            expect_response(&mut session, MessageType::Rlerror);
+        });
+    }
+
+    #[test]
+    fn committed_write_replays_after_session_response_enqueue_failure() {
+        use crate::testing::TestEnvironment;
+        use w9pt::protocol::{MessageType, OpenFlags};
+        use w9pt::{Completion, Effect, PolicyResult, Session, SessionConfig, SessionContext};
+
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            environment.create_file("queue-file", 1_000).await;
+            let engine = environment.engine();
+            let mut config = SessionConfig::default();
+            config.limits.max_queued_effects = 1;
+            let mut session =
+                Session::new(config, SessionContext::new(SessionId::new(10))).unwrap();
+            negotiate(&mut session);
+            let attach_operation = emit_attach(&mut session);
+            let attach = engine.resolve_attach(environment.context()).await.unwrap();
+            session
+                .complete(Completion::Policy {
+                    operation_id: attach_operation,
+                    result: Ok(PolicyResult::Attached(attach)),
+                })
+                .unwrap();
+            expect_response(&mut session, MessageType::Rattach);
+
+            let mut walk = Vec::new();
+            walk.extend_from_slice(&1u32.to_le_bytes());
+            walk.extend_from_slice(&2u32.to_le_bytes());
+            walk.extend_from_slice(&1u16.to_le_bytes());
+            walk.extend_from_slice(&wire_string("queue-file"));
+            session
+                .receive_frame(frame(MessageType::Twalk, 3, &walk))
+                .unwrap();
+            complete_session_effect(
+                &engine,
+                &mut session,
+                ExecutionContext::read_only(environment.client, MutationRetention::new(1_000)),
+                MessageType::Rwalk,
+            )
+            .await;
+
+            let mut open = Vec::new();
+            open.extend_from_slice(&2u32.to_le_bytes());
+            open.extend_from_slice(&OpenFlags::RDWR.bits().to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Tlopen, 4, &open))
+                .unwrap();
+            complete_session_effect(
+                &engine,
+                &mut session,
+                environment.execution(1_001),
+                MessageType::Rlopen,
+            )
+            .await;
+
+            let mut write = Vec::new();
+            write.extend_from_slice(&2u32.to_le_bytes());
+            write.extend_from_slice(&0u64.to_le_bytes());
+            write.extend_from_slice(&1u32.to_le_bytes());
+            write.push(b'x');
+            session
+                .receive_frame(frame(MessageType::Twrite, 5, &write))
+                .unwrap();
+            let request = take_engine_request(&mut session, environment.execution(1_002));
+            let committed = terminal(engine.execute(request.clone()).await);
+
+            let mut invalid_getattr = Vec::new();
+            invalid_getattr.extend_from_slice(&99u32.to_le_bytes());
+            invalid_getattr
+                .extend_from_slice(&w9pt::protocol::GetattrMask::ALL.bits().to_le_bytes());
+            session
+                .receive_frame(frame(MessageType::Tgetattr, 6, &invalid_getattr))
+                .unwrap();
+            session.complete(committed.into_completion()).unwrap();
+            expect_response(&mut session, MessageType::Rlerror);
+
+            let replayed = terminal(engine.execute(request).await);
+            assert_eq!(replayed.result, Ok(FilesystemResult::Written(1)));
+            let mut closed = false;
+            for _ in 0..8 {
+                match session.poll_effect() {
+                    Some(Effect::CloseSession { .. }) => {
+                        closed = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            assert!(closed, "response enqueue failure must close the session");
+        });
+    }
+
+    fn take_engine_request(
+        session: &mut w9pt::Session,
+        execution: ExecutionContext,
+    ) -> EngineRequest {
+        let w9pt::Effect::Filesystem {
+            operation_id,
+            request,
+        } = session.poll_effect().unwrap()
+        else {
+            panic!("expected filesystem effect")
+        };
+        EngineRequest::new(operation_id, request, execution)
+    }
+
+    fn terminal<S, T, P>(outcome: EngineOutcome<S, T, P>) -> EngineTerminal {
+        let EngineOutcome::Terminal(terminal) = outcome else {
+            panic!("expected terminal engine outcome")
+        };
+        terminal
+    }
+
+    async fn complete_session_effect(
+        engine: &FilesystemEngine<
+            w9pt_fs_state::testing::MemoryStateStore,
+            MemoryTarget,
+            crate::testing::TestPolicy,
+            crate::testing::TestIdentities,
+        >,
+        session: &mut w9pt::Session,
+        execution: ExecutionContext,
+        expected: w9pt::protocol::MessageType,
+    ) {
+        let request = take_engine_request(session, execution);
+        let terminal = terminal(engine.execute(request).await);
+        session.complete(terminal.into_completion()).unwrap();
+        expect_response(session, expected);
+    }
+
     fn negotiate(session: &mut w9pt::Session) {
         let mut payload = Vec::new();
         payload.extend_from_slice(&8_192u32.to_le_bytes());
@@ -1038,10 +1435,15 @@ mod tests {
     }
 
     fn expect_response(session: &mut w9pt::Session, expected: w9pt::protocol::MessageType) {
+        let bytes = take_response(session);
+        assert_eq!(bytes[4], expected.to_u8());
+    }
+
+    fn take_response(session: &mut w9pt::Session) -> Vec<u8> {
         let w9pt::Effect::SendFrame { bytes } = session.poll_effect().unwrap() else {
             panic!("expected response frame")
         };
-        assert_eq!(bytes[4], expected.to_u8());
+        bytes
     }
 
     fn frame(message_type: w9pt::protocol::MessageType, tag: u16, payload: &[u8]) -> Vec<u8> {

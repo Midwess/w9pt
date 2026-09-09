@@ -74,7 +74,6 @@ where
         execution.retention,
     );
     let filesystem_id = initial_grant.filesystem_id();
-    let root_inode_id = initial_grant.root_inode_id();
     let context = request.context.clone();
     run_mutation(
         state,
@@ -86,13 +85,13 @@ where
         |_| {
             let context = context.clone();
             let name = name.clone();
+            let expected_grant = initial_grant.clone();
             async move {
                 let grant = policy
                     .resolve(ExportPolicyRequest::new(context))
                     .await
                     .map_err(MutationPlanError::Policy)?;
-                if grant.filesystem_id() != filesystem_id || grant.root_inode_id() != root_inode_id
-                {
+                if grant != expected_grant {
                     return Err(client(LinuxErrno::EAGAIN));
                 }
                 plan_unlink::<S, T::Error, P::Error, I::Error>(
@@ -220,9 +219,6 @@ where
         };
         if !page.entries().is_empty() {
             return Err(client(LinuxErrno::ENOTEMPTY));
-        }
-        if *count != 0 {
-            return Err(client(LinuxErrno::EBUSY));
         }
     }
     let fs = grant.filesystem_id();
@@ -454,9 +450,10 @@ fn rebuild<S, T, P, I>(
 mod tests {
     use super::*;
     use crate::{
-        operations::{execute_link, execute_release},
+        operations::{execute_link, execute_mkdir, execute_open, execute_release},
         testing::TestEnvironment,
     };
+    use w9pt::protocol::OpenFlags;
     use w9pt_fs_storage::{StorageMethod, testing::block_on};
 
     #[test]
@@ -556,6 +553,148 @@ mod tests {
             let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
             else {
                 panic!("retirement unavailable")
+            };
+            assert!(matches!(
+                &snapshot.results()[0],
+                ReadResult::Point { record: None, .. }
+            ));
+
+            let FilesystemResult::DirectoryCreated(directory) =
+                execute_mkdir::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                    &environment.state,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    FilesystemRequest::new(
+                        environment.context(),
+                        FilesystemOperation::Mkdir {
+                            directory: crate::object_handle(environment.root_id),
+                            name: "open-directory".into(),
+                            mode: 0o770,
+                            gid: 1,
+                        },
+                    ),
+                    environment.execution(200),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("unexpected mkdir result")
+            };
+            let FilesystemResult::Opened(directory_open) = execute_open(
+                &environment.state,
+                &environment.repository,
+                &environment.policy,
+                &environment.identities,
+                environment.engine_limits,
+                FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Open {
+                        object: directory.object,
+                        flags: OpenFlags::RDONLY | OpenFlags::DIRECTORY,
+                    },
+                ),
+                environment.execution(201),
+            )
+            .await
+            .unwrap() else {
+                panic!("unexpected directory open result")
+            };
+            assert_eq!(
+                execute_unlink::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                    &environment.state,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    FilesystemRequest::new(
+                        environment.context(),
+                        FilesystemOperation::UnlinkAt {
+                            directory: crate::object_handle(environment.root_id),
+                            name: "open-directory".into(),
+                            flags: UnlinkFlags::REMOVE_DIR,
+                        },
+                    ),
+                    environment.execution(202),
+                )
+                .await
+                .unwrap(),
+                FilesystemResult::Unlinked
+            );
+            let directory_id = inode_id_from_handle(directory.object);
+            let read = ReadBatch::new(
+                environment.filesystem_id,
+                ReadConsistency::LatestLinearizable,
+                vec![
+                    ReadQuery::Inode(directory_id),
+                    ReadQuery::Orphan(directory_id),
+                ],
+                environment.state_limits,
+            )
+            .unwrap();
+            let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
+            else {
+                panic!("directory orphan unavailable")
+            };
+            assert!(matches!(
+                &snapshot.results()[0],
+                ReadResult::Point { record: Some(record), .. }
+                    if matches!(record.as_ref(), StateRecord::Inode(inode)
+                        if inode.kind() == InodeKind::Directory && inode.link_count() == 0)
+            ));
+            assert!(matches!(
+                &snapshot.results()[1],
+                ReadResult::Point {
+                    record: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                execute_mkdir::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                    &environment.state,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    FilesystemRequest::new(
+                        environment.context(),
+                        FilesystemOperation::Mkdir {
+                            directory: directory.object,
+                            name: "forbidden-child".into(),
+                            mode: 0o770,
+                            gid: 1,
+                        },
+                    ),
+                    environment.execution(203),
+                )
+                .await,
+                Err(MutationOperationError::Client(error)) if error.errno == LinuxErrno::EPERM
+            ));
+            execute_release::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                &environment.state,
+                &environment.policy,
+                &environment.identities,
+                environment.engine_limits,
+                FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Release {
+                        object: directory.object,
+                        open: Some(directory_open.open),
+                        xattr: None,
+                    },
+                ),
+                environment.execution(204),
+            )
+            .await
+            .unwrap();
+            let read = ReadBatch::new(
+                environment.filesystem_id,
+                ReadConsistency::LatestLinearizable,
+                vec![ReadQuery::Inode(directory_id)],
+                environment.state_limits,
+            )
+            .unwrap();
+            let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
+            else {
+                panic!("directory retirement unavailable")
             };
             assert!(matches!(
                 &snapshot.results()[0],

@@ -1793,6 +1793,27 @@ async fn validate_targeted_invariants(
                         "filesystem root directory has a namespace hard link",
                     )));
                 }
+            } else if link_count == 0 {
+                if namespace_links != 0 {
+                    return Ok(Some(invalid_relation(
+                        "orphan directory still has a namespace entry",
+                    )));
+                }
+                let child_count: String = query_scalar(
+                    r#"SELECT pg_catalog.count(*)::numeric(20, 0)::text
+                       FROM "public"."w9pt_fs_state_directory_entries"
+                       WHERE "filesystem_id" = $1 AND "parent_inode_id" = $2"#,
+                )
+                .bind(filesystem.clone())
+                .bind(inode_id.as_bytes().to_vec())
+                .fetch_one(transaction)
+                .await
+                .map_err(state_statement)?;
+                let child_count = decode_u64("directory_child_count", &child_count)
+                    .map_err(|error| CommitAttemptError::State(corruption(error.to_string())))?;
+                if child_count != 0 {
+                    return Ok(Some(invalid_relation("orphan directory is not empty")));
+                }
             } else {
                 let parent_kind: Option<i16> = query_scalar(
                     r#"SELECT "kind" FROM "public"."w9pt_fs_state_inodes"
@@ -1832,14 +1853,15 @@ async fn validate_targeted_invariants(
                     )));
                 }
             }
-            if let Some(error) = validate_directory_ancestry(
-                transaction,
-                request.filesystem_id(),
-                inode_id,
-                root_inode_id,
-                limits.max_directory_ancestor_depth(),
-            )
-            .await?
+            if link_count != 0
+                && let Some(error) = validate_directory_ancestry(
+                    transaction,
+                    request.filesystem_id(),
+                    inode_id,
+                    root_inode_id,
+                    limits.max_directory_ancestor_depth(),
+                )
+                .await?
             {
                 return Ok(Some(error));
             }

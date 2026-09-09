@@ -135,6 +135,9 @@ pub fn check_directory_mutation(
 ) -> Result<(), AuthorizationError> {
     check_mutation_allowed(grant)?;
     require_directory(directory)?;
+    if directory.link_count() == 0 {
+        return Err(AuthorizationError::OperationNotPermitted);
+    }
     check_inode_access(grant, directory, AccessRequirements::DIRECTORY_MUTATION)
 }
 

@@ -74,7 +74,6 @@ where
         execution.retention,
     );
     let filesystem_id = initial_grant.filesystem_id();
-    let root_inode_id = initial_grant.root_inode_id();
     let context = request.context.clone();
     run_mutation(
         state,
@@ -87,13 +86,13 @@ where
             let context = context.clone();
             let old_name = old_name.clone();
             let new_name = new_name.clone();
+            let expected_grant = initial_grant.clone();
             async move {
                 let grant = policy
                     .resolve(ExportPolicyRequest::new(context))
                     .await
                     .map_err(MutationPlanError::Policy)?;
-                if grant.filesystem_id() != filesystem_id || grant.root_inode_id() != root_inode_id
-                {
+                if grant != expected_grant {
                     return Err(client(LinuxErrno::EAGAIN));
                 }
                 plan_rename::<S, T::Error, P::Error, I::Error>(
@@ -236,19 +235,60 @@ where
     let terminal = encode_mutation_result(&FilesystemResult::RenamedAt, limits, state_limits)
         .map_err(MutationPlanError::ResultCodec)?;
     if old_parent_id == new_parent_id && old_name == new_name || destination_id == Some(source_id) {
+        check_sticky_directory(grant, &new_parent, &source)
+            .map_err(authorization_client_error)
+            .map_err(MutationPlanError::Client)?;
+        let mut preconditions = vec![
+            Precondition::FilesystemPolicyGeneration {
+                expected: grant.policy_generation(),
+            },
+            Precondition::RecordRevision {
+                key: RecordKey::Inode(fs, old_parent_id),
+                expected: old_parent.revision(),
+            },
+            Precondition::DirectoryGeneration {
+                inode_id: old_parent_id,
+                expected: old_parent
+                    .directory_generation()
+                    .ok_or(MutationPlanError::MalformedState)?,
+            },
+            Precondition::RecordRevision {
+                key: RecordKey::DirectoryEntry(fs, old_parent_id, old_name.clone()),
+                expected: source_entry.revision(),
+            },
+            Precondition::RecordRevision {
+                key: RecordKey::Inode(fs, source_id),
+                expected: source.revision(),
+            },
+        ];
+        if old_parent_id != new_parent_id {
+            preconditions.extend([
+                Precondition::RecordRevision {
+                    key: RecordKey::Inode(fs, new_parent_id),
+                    expected: new_parent.revision(),
+                },
+                Precondition::DirectoryGeneration {
+                    inode_id: new_parent_id,
+                    expected: new_parent
+                        .directory_generation()
+                        .ok_or(MutationPlanError::MalformedState)?,
+                },
+            ]);
+        }
+        if old_parent_id != new_parent_id || old_name != new_name {
+            let destination = current_destination
+                .as_ref()
+                .ok_or(MutationPlanError::MalformedState)?;
+            preconditions.push(Precondition::RecordRevision {
+                key: RecordKey::DirectoryEntry(fs, new_parent_id, new_name),
+                expected: destination.revision(),
+            });
+        }
         return CommitRequest::new(
             fs,
             mutation,
             fence,
-            vec![
-                Precondition::FilesystemPolicyGeneration {
-                    expected: grant.policy_generation(),
-                },
-                Precondition::RecordRevision {
-                    key: RecordKey::DirectoryEntry(fs, old_parent_id, old_name),
-                    expected: source_entry.revision(),
-                },
-            ],
+            preconditions,
             vec![StateChange::RetainResult],
             terminal,
             state_limits,
@@ -287,9 +327,6 @@ where
             .map_err(authorization_client_error)
             .map_err(MutationPlanError::Client)?;
         if destination.kind() == InodeKind::Directory {
-            if pin_count != 0 {
-                return Err(client(LinuxErrno::EBUSY));
-            }
             let page = ReadBatch::new(
                 fs,
                 ReadConsistency::LatestLinearizable,
@@ -677,8 +714,13 @@ fn rebuild<S, T, P, I>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{operations::execute_mkdir, testing::TestEnvironment};
+    use crate::{
+        operations::{execute_link, execute_mkdir, execute_open, execute_release},
+        testing::TestEnvironment,
+    };
     use core::convert::Infallible;
+    use w9pt::protocol::OpenFlags;
+    use w9pt_fs_storage::MutationId;
     use w9pt_fs_storage::{StorageMethod, testing::block_on};
     #[test]
     fn replacement_preserves_source_cookie_and_orphans_open_destination() {
@@ -778,6 +820,229 @@ mod tests {
                     record: Some(_),
                     ..
                 }
+            ));
+        });
+    }
+
+    #[test]
+    fn same_inode_noop_fences_both_names_parent_and_source_inode() {
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let source = environment.create_file("source", 150).await;
+            execute_link::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                &environment.state,
+                &environment.policy,
+                &environment.identities,
+                environment.engine_limits,
+                FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Link {
+                        directory: crate::object_handle(environment.root_id),
+                        target: source.object,
+                        name: "alias".into(),
+                    },
+                ),
+                environment.execution(151),
+            )
+            .await
+            .unwrap();
+            let mutation = MutationContext::new(
+                MutationId::from_u128(152),
+                w9pt_fs_state::RequestFingerprint::blake3(b"same-inode rename"),
+                environment.client,
+                environment.execution(152).retention,
+            );
+            let request = plan_rename::<_, Infallible, Infallible, Infallible>(
+                &environment.state,
+                &environment.policy.0,
+                mutation,
+                environment.fence,
+                environment.now,
+                crate::object_handle(environment.root_id),
+                "source".into(),
+                crate::object_handle(environment.root_id),
+                "alias".into(),
+                environment.engine_limits,
+            )
+            .await
+            .unwrap();
+            let source_id = inode_id_from_handle(source.object);
+            let source_name = EntryName::new(b"source".to_vec(), environment.state_limits).unwrap();
+            let alias_name = EntryName::new(b"alias".to_vec(), environment.state_limits).unwrap();
+            assert!(request.preconditions().iter().any(|condition| matches!(
+                condition,
+                Precondition::RecordRevision { key: RecordKey::Inode(_, inode_id), .. }
+                    if *inode_id == environment.root_id
+            )));
+            assert!(request.preconditions().iter().any(|condition| matches!(
+                condition,
+                Precondition::DirectoryGeneration { inode_id, .. }
+                    if *inode_id == environment.root_id
+            )));
+            assert!(request.preconditions().iter().any(|condition| matches!(
+                condition,
+                Precondition::RecordRevision { key: RecordKey::Inode(_, inode_id), .. }
+                    if *inode_id == source_id
+            )));
+            for expected in [source_name, alias_name] {
+                assert!(request.preconditions().iter().any(|condition| matches!(
+                    condition,
+                    Precondition::RecordRevision {
+                        key: RecordKey::DirectoryEntry(_, parent, name),
+                        ..
+                    } if *parent == environment.root_id && name == &expected
+                )));
+            }
+            assert_eq!(request.changes(), &[StateChange::RetainResult]);
+        });
+    }
+
+    #[test]
+    fn replacing_an_open_directory_orphans_it_until_release() {
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let mkdir = |name: &'static str, mutation| {
+                let environment = &environment;
+                async move {
+                    let FilesystemResult::DirectoryCreated(directory) =
+                        execute_mkdir::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                            &environment.state,
+                            &environment.policy,
+                            &environment.identities,
+                            environment.engine_limits,
+                            FilesystemRequest::new(
+                                environment.context(),
+                                FilesystemOperation::Mkdir {
+                                    directory: crate::object_handle(environment.root_id),
+                                    name: name.into(),
+                                    mode: 0o770,
+                                    gid: 1,
+                                },
+                            ),
+                            environment.execution(mutation),
+                        )
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("unexpected mkdir result")
+                    };
+                    directory
+                }
+            };
+            let source = mkdir("source-directory", 300).await;
+            let destination = mkdir("destination-directory", 301).await;
+            let FilesystemResult::Opened(destination_open) = execute_open(
+                &environment.state,
+                &environment.repository,
+                &environment.policy,
+                &environment.identities,
+                environment.engine_limits,
+                FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Open {
+                        object: destination.object,
+                        flags: OpenFlags::RDONLY | OpenFlags::DIRECTORY,
+                    },
+                ),
+                environment.execution(302),
+            )
+            .await
+            .unwrap() else {
+                panic!("unexpected open result")
+            };
+            assert_eq!(
+                execute_rename::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                    &environment.state,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    FilesystemRequest::new(
+                        environment.context(),
+                        FilesystemOperation::RenameAt {
+                            old_directory: crate::object_handle(environment.root_id),
+                            old_name: "source-directory".into(),
+                            new_directory: crate::object_handle(environment.root_id),
+                            new_name: "destination-directory".into(),
+                        },
+                    ),
+                    environment.execution(303),
+                )
+                .await
+                .unwrap(),
+                FilesystemResult::RenamedAt
+            );
+            let destination_id = inode_id_from_handle(destination.object);
+            let read = ReadBatch::new(
+                environment.filesystem_id,
+                ReadConsistency::LatestLinearizable,
+                vec![
+                    ReadQuery::Inode(destination_id),
+                    ReadQuery::Orphan(destination_id),
+                ],
+                environment.state_limits,
+            )
+            .unwrap();
+            let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
+            else {
+                panic!("replaced directory unavailable")
+            };
+            assert!(matches!(
+                &snapshot.results()[0],
+                ReadResult::Point { record: Some(record), .. }
+                    if matches!(record.as_ref(), StateRecord::Inode(inode)
+                        if inode.kind() == InodeKind::Directory && inode.link_count() == 0)
+            ));
+            assert!(matches!(
+                &snapshot.results()[1],
+                ReadResult::Point {
+                    record: Some(_),
+                    ..
+                }
+            ));
+            execute_release::<_, w9pt_fs_storage::testing::MemoryTarget, _, _>(
+                &environment.state,
+                &environment.policy,
+                &environment.identities,
+                environment.engine_limits,
+                FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Release {
+                        object: destination.object,
+                        open: Some(destination_open.open),
+                        xattr: None,
+                    },
+                ),
+                environment.execution(304),
+            )
+            .await
+            .unwrap();
+            let read = ReadBatch::new(
+                environment.filesystem_id,
+                ReadConsistency::LatestLinearizable,
+                vec![ReadQuery::Inode(destination_id)],
+                environment.state_limits,
+            )
+            .unwrap();
+            let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
+            else {
+                panic!("retired directory unavailable")
+            };
+            assert!(matches!(
+                &snapshot.results()[0],
+                ReadResult::Point { record: None, .. }
+            ));
+            let source_id = inode_id_from_handle(source.object);
+            let read = ReadBatch::new(
+                environment.filesystem_id,
+                ReadConsistency::LatestLinearizable,
+                vec![ReadQuery::Inode(source_id)],
+                environment.state_limits,
+            )
+            .unwrap();
+            assert!(matches!(
+                environment.state.read(read).await.unwrap(),
+                ReadOutcome::Snapshot(snapshot)
+                    if matches!(&snapshot.results()[0], ReadResult::Point { record: Some(_), .. })
             ));
         });
     }

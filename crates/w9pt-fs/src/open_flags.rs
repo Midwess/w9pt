@@ -8,12 +8,10 @@ use w9pt_fs_state::OpenAccess;
 const COMMON_FLAGS: u32 = OpenFlags::ACCESS_MASK.bits()
     | OpenFlags::TRUNC.bits()
     | OpenFlags::APPEND.bits()
-    | OpenFlags::DSYNC.bits()
     | OpenFlags::LARGEFILE.bits()
     | OpenFlags::DIRECTORY.bits()
     | OpenFlags::NOATIME.bits()
-    | OpenFlags::CLOEXEC.bits()
-    | OpenFlags::SYNC.bits();
+    | OpenFlags::CLOEXEC.bits();
 const CREATE_FLAGS: u32 = OpenFlags::CREATE.bits() | OpenFlags::EXCL.bits();
 
 /// Operation family in which open flags are interpreted.
@@ -32,8 +30,6 @@ pub struct OpenOptions {
     append: bool,
     truncate: bool,
     directory: bool,
-    data_sync: bool,
-    full_sync: bool,
 }
 
 impl OpenOptions {
@@ -55,16 +51,6 @@ impl OpenOptions {
     /// Reports whether the caller requires a directory.
     pub const fn directory(self) -> bool {
         self.directory
-    }
-
-    /// Reports whether write-through data synchronization was requested.
-    pub const fn data_sync(self) -> bool {
-        self.data_sync
-    }
-
-    /// Reports whether write-through full synchronization was requested.
-    pub const fn full_sync(self) -> bool {
-        self.full_sync
     }
 
     /// Converts a checked read-only directory open into its retained state value.
@@ -134,8 +120,6 @@ pub fn validate_open_flags(
         append,
         truncate,
         directory,
-        data_sync: flags.contains(OpenFlags::DSYNC),
-        full_sync: flags.contains(OpenFlags::SYNC),
     })
 }
 
@@ -173,6 +157,12 @@ mod tests {
             validate_open_flags(OpenFlags::CREATE, OpenPurpose::Existing),
             Err(OpenFlagError::UnsupportedFlags { .. })
         ));
+        for flag in [OpenFlags::DSYNC, OpenFlags::SYNC] {
+            assert!(matches!(
+                validate_open_flags(OpenFlags::WRONLY | flag, OpenPurpose::Existing),
+                Err(OpenFlagError::UnsupportedFlags { bits }) if bits == flag.bits()
+            ));
+        }
         assert!(
             validate_open_flags(
                 OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::WRONLY,

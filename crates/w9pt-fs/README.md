@@ -42,6 +42,11 @@ manifest, then one authoritative metadata/result commit. The engine never calls
 the standalone object-head publisher. New empty files remain explicitly
 unpublished until their first nonempty write or extension. Reads use one
 immutable `ContentRef` and the first slice deliberately leaves atime unchanged.
+Writable or truncating opens are rejected on read-only exports. `O_DSYNC` and
+`O_SYNC` are rejected until their write-through requirements can be retained in
+portable open state and enforced by every write. Zero-length writes are retained
+as exact mutation-ledger no-ops, and open empty directories remain orphaned until
+their final portable pin is released.
 
 `w9pt::Session` remains connection-affine process memory. Losing the node that
 owns it ends the stock 9P connection even though committed filesystem state and

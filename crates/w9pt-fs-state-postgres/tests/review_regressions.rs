@@ -11,11 +11,11 @@ use w9pt_fs_state::{
     FilesystemStateStore, GroupId, InodeData, InodeGeneration, InodeId, InodeRecord, InodeTimes,
     LeaseDuration, LeaseId, LeaseOperationId, LockGeneration, LockId, LockKind, LockOwner,
     LockRange, LockRecord, MalformedCommit, MutationContext, MutationResult, MutationResultKind,
-    MutationRetention, OpenAccess, OpenId, OpenRecord, PrincipalId, QidPath, ReadBatch,
-    ReadConsistency, ReadOutcome, ReadQuery, ReadResult, RecordKey, RecordRevision,
-    RecordValidationError, RequestFingerprint, ResultFormatVersion, StateChange, StateLimitValues,
-    StateLimits, StateRecord, StateRevision, UnixTimestamp, WriterFence, WriterIncarnationId,
-    WriterScopeId,
+    MutationRetention, OpenAccess, OpenId, OpenPinRecord, OpenRecord, OrphanRecord, PrincipalId,
+    QidPath, ReadBatch, ReadConsistency, ReadOutcome, ReadQuery, ReadResult, RecordKey,
+    RecordRevision, RecordValidationError, RequestFingerprint, ResultFormatVersion, StateChange,
+    StateLimitValues, StateLimits, StateRecord, StateRevision, UnixTimestamp, WriterFence,
+    WriterIncarnationId, WriterScopeId,
 };
 use w9pt_fs_state_postgres::{PostgresStateConfig, PostgresStateStore};
 use w9pt_fs_storage::MutationId;
@@ -606,6 +606,166 @@ async fn postgres_ancestry_accepts_exact_bound_and_rejects_one_edge_beyond()
         CommitOutcome::MalformedRequest(MalformedCommit::InvalidRecord(
             RecordValidationError::DirectoryAncestorLimit { maximum: 2 }
         ))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_open_unlinked_directory_survives_until_final_pin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(dsn) = live_dsn() else {
+        return Ok(());
+    };
+    let pool = connect(dsn, 4).await?;
+    PostgresStateStore::migrate(&pool).await?;
+    let filesystem_id = FilesystemId::from_u128(u128::MAX - 525);
+    cleanup_filesystems(&pool, &[filesystem_id]).await?;
+    let config = PostgresStateConfig::default();
+    let limits = config.limits();
+    let store = PostgresStateStore::open(pool, config).await?;
+    let root_id = InodeId::from_u128(30_000);
+    let directory_id = InodeId::from_u128(30_001);
+    let open_id = OpenId::from_u128(30_002);
+    let client = ClientIncarnationId::from_u128(30_003);
+    let fence = acquire(&store, filesystem_id, 30_010, limits).await?;
+    bootstrap(&store, filesystem_id, root_id, fence, 30_020, limits).await?;
+    let name = EntryName::new(b"open-directory".to_vec(), limits)?;
+    let revision = RecordRevision::new(1)?;
+    let directory = inode(
+        directory_id,
+        QidPath::new(2)?,
+        InodeData::Directory {
+            generation: DirectoryGeneration::new(1)?,
+            parent_inode_id: root_id,
+        },
+        1,
+        limits,
+    );
+    let create = request(
+        filesystem_id,
+        30_030,
+        fence,
+        vec![
+            StateChange::Insert {
+                key: RecordKey::Inode(filesystem_id, directory_id),
+                record: directory,
+            },
+            StateChange::Insert {
+                key: RecordKey::DirectoryEntry(filesystem_id, root_id, name.clone()),
+                record: StateRecord::DirectoryEntry(DirectoryEntryRecord::new(
+                    root_id,
+                    name.clone(),
+                    DirectoryCookie::new(1),
+                    directory_id,
+                    revision,
+                )?),
+            },
+            StateChange::Insert {
+                key: RecordKey::Open(filesystem_id, open_id),
+                record: StateRecord::Open(OpenRecord::new(
+                    open_id,
+                    directory_id,
+                    client,
+                    OpenAccess::DirectoryRead,
+                    false,
+                    InodeGeneration::new(1)?,
+                    revision,
+                )),
+            },
+            StateChange::Insert {
+                key: RecordKey::OpenPin(filesystem_id, directory_id, open_id),
+                record: StateRecord::OpenPin(OpenPinRecord::new(directory_id, open_id, revision)),
+            },
+            StateChange::BumpDirectoryGeneration(root_id),
+            StateChange::AdvanceDirectoryCookie {
+                count: NonZeroU64::new(1).expect("one is nonzero"),
+            },
+            StateChange::AdvanceQidPath {
+                count: NonZeroU64::new(1).expect("one is nonzero"),
+            },
+        ],
+        limits,
+    );
+    assert!(matches!(
+        store.commit(create).await?,
+        CommitOutcome::Committed(_)
+    ));
+    let orphan_directory = StateRecord::Inode(InodeRecord::new(
+        directory_id,
+        QidPath::new(2)?,
+        revision,
+        0o755,
+        PrincipalId::new(b"owner".to_vec(), limits)?,
+        GroupId::new(b"group".to_vec(), limits)?,
+        times(),
+        0,
+        0,
+        InodeGeneration::new(2)?,
+        InodeData::Directory {
+            generation: DirectoryGeneration::new(1)?,
+            parent_inode_id: root_id,
+        },
+    )?);
+    let unlink = request(
+        filesystem_id,
+        30_040,
+        fence,
+        vec![
+            StateChange::Delete(RecordKey::DirectoryEntry(filesystem_id, root_id, name)),
+            StateChange::Replace {
+                key: RecordKey::Inode(filesystem_id, directory_id),
+                record: orphan_directory,
+            },
+            StateChange::Insert {
+                key: RecordKey::Orphan(filesystem_id, directory_id),
+                record: StateRecord::Orphan(OrphanRecord::new(
+                    directory_id,
+                    1,
+                    StateRevision::new(1)?,
+                    revision,
+                )?),
+            },
+            StateChange::BumpDirectoryGeneration(root_id),
+        ],
+        limits,
+    );
+    assert!(matches!(
+        store.commit(unlink).await?,
+        CommitOutcome::Committed(_)
+    ));
+    let read = ReadBatch::new(
+        filesystem_id,
+        ReadConsistency::LatestLinearizable,
+        vec![
+            ReadQuery::Inode(directory_id),
+            ReadQuery::Orphan(directory_id),
+        ],
+        limits,
+    )?;
+    assert!(matches!(
+        store.read(read).await?,
+        ReadOutcome::Snapshot(snapshot)
+            if matches!(&snapshot.results()[0], ReadResult::Point { record: Some(record), .. }
+                if matches!(record.as_ref(), StateRecord::Inode(inode)
+                    if inode.kind() == w9pt_fs_state::InodeKind::Directory
+                        && inode.link_count() == 0))
+            && matches!(&snapshot.results()[1], ReadResult::Point { record: Some(_), .. })
+    ));
+    let retire = request(
+        filesystem_id,
+        30_050,
+        fence,
+        vec![
+            StateChange::Delete(RecordKey::Open(filesystem_id, open_id)),
+            StateChange::Delete(RecordKey::OpenPin(filesystem_id, directory_id, open_id)),
+            StateChange::Delete(RecordKey::Orphan(filesystem_id, directory_id)),
+            StateChange::Delete(RecordKey::Inode(filesystem_id, directory_id)),
+        ],
+        limits,
+    );
+    assert!(matches!(
+        store.commit(retire).await?,
+        CommitOutcome::Committed(_)
     ));
     Ok(())
 }

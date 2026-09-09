@@ -72,7 +72,6 @@ where
         execution.retention,
     );
     let filesystem_id = initial_grant.filesystem_id();
-    let root_inode_id = initial_grant.root_inode_id();
     let context = request.context.clone();
     run_mutation(
         state,
@@ -83,13 +82,13 @@ where
         limits,
         |_| {
             let context = context.clone();
+            let expected_grant = initial_grant.clone();
             async move {
                 let grant = policy
                     .resolve(ExportPolicyRequest::new(context))
                     .await
                     .map_err(MutationPlanError::Policy)?;
-                if grant.filesystem_id() != filesystem_id || grant.root_inode_id() != root_inode_id
-                {
+                if grant != expected_grant {
                     return Err(client(LinuxErrno::EAGAIN));
                 }
                 plan_release::<S, T::Error, P::Error, I::Error>(

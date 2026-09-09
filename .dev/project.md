@@ -177,6 +177,11 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
   authoritative plain content context. The first write/extension prepares from
   `BaseContentIdentity::NEW_FILE`; later reads and mutations reopen the committed
   context and publish only through the inode transaction.
+- Writable/truncating opens fail before target access on read-only exports;
+  `O_DSYNC`/`O_SYNC` remain rejected until portable open state and every write
+  can enforce them. Zero-length writes retain exact mutation replay identity.
+- Open empty directories may become zero-link orphans until their final pin is
+  released; zero-link directories cannot accept new namespace mutations.
 - Capabilities are derived from the complete implemented slice, export ceiling
   and read-only policy, state contract, and target guarantees. Fid-based
   rename/remove, mknod, statfs, xattrs, locks, cancellation, and session

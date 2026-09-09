@@ -17,9 +17,9 @@ use w9pt_fs_storage::{
 use crate::{
     AccessRequirements, EngineLimits, ExecutionContext, ExportGrant, ExportPolicy,
     ExportPolicyRequest, IdentityScope, IdentitySource, OpenFlagError, OpenPurpose,
-    authorization_client_error, check_directory_search, check_inode_access, encode_mutation_result,
-    inode_id_from_handle, mutation_fingerprint, open_handle, qid_from_inode, run_mutation,
-    validate_open_flags,
+    authorization_client_error, check_directory_search, check_inode_access, check_mutation_allowed,
+    encode_mutation_result, inode_id_from_handle, mutation_fingerprint, open_handle,
+    qid_from_inode, run_mutation, validate_open_flags,
 };
 
 use super::mutation::{
@@ -72,7 +72,6 @@ where
         execution.retention,
     );
     let filesystem_id = initial_grant.filesystem_id();
-    let root_inode_id = initial_grant.root_inode_id();
     let context = request.context.clone();
     run_mutation(
         state,
@@ -83,13 +82,13 @@ where
         limits,
         |attempt| {
             let context = context.clone();
+            let expected_grant = initial_grant.clone();
             async move {
                 let grant = policy
                     .resolve(ExportPolicyRequest::new(context))
                     .await
                     .map_err(MutationPlanError::Policy)?;
-                if grant.filesystem_id() != filesystem_id || grant.root_inode_id() != root_inode_id
-                {
+                if grant != expected_grant {
                     return Err(client(LinuxErrno::EAGAIN));
                 }
                 plan_open(
@@ -389,6 +388,14 @@ fn authorize_open<S, T, P, I>(
         InodeKind::RegularFile => {
             if options.directory() {
                 return Err(client(LinuxErrno::ENOTDIR));
+            }
+            if matches!(
+                options.access(),
+                OpenAccess::WriteOnly | OpenAccess::ReadWrite
+            ) {
+                check_mutation_allowed(grant)
+                    .map_err(authorization_client_error)
+                    .map_err(MutationPlanError::Client)?;
             }
             let required = match options.access() {
                 OpenAccess::ReadOnly => AccessRequirements::READ,
@@ -860,6 +867,77 @@ mod tests {
             assert!(matches!(
                 &snapshot.results()[1],
                 ReadResult::OpenPinCount { count: 2, .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn read_only_export_rejects_writable_truncate_before_target_access() {
+        use crate::testing::{TestEnvironment, TestPolicy};
+
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let created = environment.create_file("read-only", 400).await;
+            environment
+                .publish_new_content(created.object, b"preserve", 401)
+                .await;
+            let grant = &environment.policy.0;
+            let read_only = TestPolicy(
+                ExportGrant::new(
+                    grant.filesystem_id(),
+                    grant.root_inode_id(),
+                    grant.principal().clone(),
+                    grant.primary_group().clone(),
+                    grant.supplementary_groups().to_vec(),
+                    grant.numeric_uid(),
+                    grant.numeric_gid(),
+                    grant.privileged(),
+                    true,
+                    grant.policy_generation(),
+                    grant.capability_ceiling(),
+                    environment.engine_limits,
+                )
+                .unwrap(),
+            );
+            environment.target.clear_trace().unwrap();
+            let request = FilesystemRequest::new(
+                environment.context(),
+                FilesystemOperation::Open {
+                    object: created.object,
+                    flags: OpenFlags::WRONLY | OpenFlags::TRUNC,
+                },
+            );
+            assert!(matches!(
+                execute_open(
+                    &environment.state,
+                    &environment.repository,
+                    &read_only,
+                    &environment.identities,
+                    environment.engine_limits,
+                    request,
+                    environment.execution(402),
+                )
+                .await,
+                Err(MutationOperationError::Client(error)) if error.errno == LinuxErrno::EROFS
+            ));
+            assert!(environment.target.trace().unwrap().is_empty());
+            let inode_id = inode_id_from_handle(created.object);
+            let read = ReadBatch::new(
+                environment.filesystem_id,
+                ReadConsistency::LatestLinearizable,
+                vec![ReadQuery::Inode(inode_id)],
+                environment.state_limits,
+            )
+            .unwrap();
+            let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
+            else {
+                panic!("file state unavailable")
+            };
+            assert!(matches!(
+                &snapshot.results()[0],
+                ReadResult::Point { record: Some(record), .. }
+                    if matches!(record.as_ref(), StateRecord::Inode(inode)
+                        if inode.logical_size() == 8)
             ));
         });
     }

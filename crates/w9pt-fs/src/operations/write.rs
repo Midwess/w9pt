@@ -50,10 +50,6 @@ where
         .resolve(ExportPolicyRequest::new(request.context.clone()))
         .await
         .map_err(MutationOperationError::Policy)?;
-    if data.is_empty() {
-        validate_zero_write(state, &initial_grant, execution.client_incarnation, open).await?;
-        return Ok(FilesystemResult::Written(0));
-    }
     let fingerprint = mutation_fingerprint(&request, &execution, &initial_grant, limits)
         .map_err(fingerprint_error)?;
     let mutation_id = execution
@@ -74,7 +70,6 @@ where
         execution.retention,
     );
     let filesystem_id = initial_grant.filesystem_id();
-    let root_inode_id = initial_grant.root_inode_id();
     let context = request.context.clone();
     run_mutation(
         state,
@@ -86,13 +81,13 @@ where
         |attempt| {
             let context = context.clone();
             let data = data.clone();
+            let expected_grant = initial_grant.clone();
             async move {
                 let grant = policy
                     .resolve(ExportPolicyRequest::new(context))
                     .await
                     .map_err(MutationPlanError::Policy)?;
-                if grant.filesystem_id() != filesystem_id || grant.root_inode_id() != root_inode_id
-                {
+                if grant != expected_grant {
                     return Err(client(LinuxErrno::EAGAIN));
                 }
                 plan_write::<S, T, P::Error, I::Error>(
@@ -209,6 +204,37 @@ where
         .and_then(|()| check_inode_access(grant, inode, AccessRequirements::WRITE))
         .map_err(authorization_client_error)
         .map_err(MutationPlanError::Client)?;
+    if data.is_empty() {
+        let result = encode_mutation_result(&FilesystemResult::Written(0), limits, state_limits)
+            .map_err(MutationPlanError::ResultCodec)?;
+        let fs = grant.filesystem_id();
+        return CommitRequest::new(
+            fs,
+            mutation,
+            fence,
+            vec![
+                Precondition::FilesystemPolicyGeneration {
+                    expected: grant.policy_generation(),
+                },
+                Precondition::RecordRevision {
+                    key: RecordKey::Open(fs, open_id),
+                    expected: selected_open.revision(),
+                },
+                Precondition::RecordRevision {
+                    key: RecordKey::Inode(fs, inode_id),
+                    expected: inode.revision(),
+                },
+                Precondition::InodeGeneration {
+                    inode_id,
+                    expected: inode.inode_generation(),
+                },
+            ],
+            vec![StateChange::RetainResult],
+            result,
+            state_limits,
+        )
+        .map_err(MutationPlanError::MalformedCommit);
+    }
     let offset = if selected_open.append() {
         inode.logical_size()
     } else {
@@ -318,70 +344,6 @@ where
     .map_err(MutationPlanError::MalformedCommit)
 }
 
-async fn validate_zero_write<S, T, P, I>(
-    state: &S,
-    grant: &ExportGrant,
-    client_incarnation: w9pt_fs_state::ClientIncarnationId,
-    open: w9pt::filesystem::OpenHandle,
-) -> Result<(), MutationOperationError<S::Error, T, P, I>>
-where
-    S: FilesystemStateStore,
-{
-    let open_id = open_id_from_handle(open);
-    let snapshot = read_snapshot::<S, T, P, I>(
-        state,
-        grant,
-        ReadConsistency::LatestLinearizable,
-        vec![ReadQuery::Filesystem, ReadQuery::Open(open_id)],
-    )
-    .await
-    .map_err(MutationOperationError::from)?;
-    let open =
-        writable_open::<S::Error, T, P, I>(&snapshot.results()[1], open_id, client_incarnation)
-            .map_err(MutationOperationError::from)?;
-    check_mutation_allowed(grant)
-        .map_err(authorization_client_error)
-        .map_err(MutationOperationError::Client)?;
-    let inode_snapshot = read_snapshot::<S, T, P, I>(
-        state,
-        grant,
-        ReadConsistency::AtLeast(snapshot.revision()),
-        vec![
-            ReadQuery::Filesystem,
-            ReadQuery::Open(open_id),
-            ReadQuery::Inode(open.inode_id()),
-        ],
-    )
-    .await
-    .map_err(MutationOperationError::from)?;
-    let checked_open = writable_open::<S::Error, T, P, I>(
-        &inode_snapshot.results()[1],
-        open_id,
-        client_incarnation,
-    )
-    .map_err(MutationOperationError::from)?;
-    if checked_open.inode_id() != open.inode_id() {
-        return Err(MutationOperationError::Internal);
-    }
-    let inode = point_inode::<S::Error, T, P, I>(&inode_snapshot.results()[2])
-        .map_err(MutationOperationError::from)?
-        .ok_or_else(|| {
-            MutationOperationError::Client(w9pt::FilesystemError::new(LinuxErrno::EBADF))
-        })?;
-    if inode.kind() != InodeKind::RegularFile {
-        return Err(MutationOperationError::Client(w9pt::FilesystemError::new(
-            if inode.kind() == InodeKind::Directory {
-                LinuxErrno::EISDIR
-            } else {
-                LinuxErrno::EOPNOTSUPP
-            },
-        )));
-    }
-    check_inode_access(grant, &inode, AccessRequirements::WRITE)
-        .map_err(authorization_client_error)
-        .map_err(MutationOperationError::Client)
-}
-
 async fn read_snapshot<S, T, P, I>(
     state: &S,
     grant: &ExportGrant,
@@ -478,9 +440,63 @@ fn point_inode<S, T, P, I>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::{convert::Infallible, future::Future};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use w9pt_fs_storage::{BLOCK_SIZE, StorageMethod, testing::block_on};
 
-    use crate::{operations::execute_read, testing::TestEnvironment};
+    use crate::{
+        CanonicalIdentity, IdentityMappingRequest, NumericIdentity, ReverseIdentityMappingRequest,
+        inode_id_from_handle, operations::execute_read, testing::TestEnvironment,
+    };
+
+    #[derive(Clone)]
+    struct ChangingPolicy {
+        first: ExportGrant,
+        second: ExportGrant,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ExportPolicy for ChangingPolicy {
+        type Error = Infallible;
+
+        fn resolve(
+            &self,
+            _request: ExportPolicyRequest,
+        ) -> impl Future<Output = Result<ExportGrant, Self::Error>> + Send {
+            let grant = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            };
+            core::future::ready(Ok(grant))
+        }
+
+        fn map_numeric_identity(
+            &self,
+            request: IdentityMappingRequest,
+        ) -> impl Future<Output = Result<NumericIdentity, Self::Error>> + Send {
+            core::future::ready(Ok(match request.identity {
+                CanonicalIdentity::Principal(_) => NumericIdentity::User(1),
+                CanonicalIdentity::Group(_) => NumericIdentity::Group(1),
+            }))
+        }
+
+        fn map_canonical_identity(
+            &self,
+            request: ReverseIdentityMappingRequest,
+        ) -> impl Future<Output = Result<CanonicalIdentity, Self::Error>> + Send {
+            let grant = self.second.clone();
+            core::future::ready(Ok(match request.identity {
+                NumericIdentity::User(_) => CanonicalIdentity::Principal(grant.principal().clone()),
+                NumericIdentity::Group(_) => {
+                    CanonicalIdentity::Group(grant.primary_group().clone())
+                }
+            }))
+        }
+    }
 
     #[test]
     fn sparse_new_and_published_positioned_writes_replay_exact_counts() {
@@ -558,6 +574,123 @@ mod tests {
                 .unwrap(),
                 FilesystemResult::Written(3)
             );
+        });
+    }
+
+    #[test]
+    fn zero_write_is_retained_and_reused_identity_mismatches() {
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let created = environment.create_file("zero", 150).await;
+            let execution = environment.execution(151);
+            let zero = FilesystemRequest::new(
+                environment.context(),
+                FilesystemOperation::Write {
+                    open: created.open,
+                    offset: 9,
+                    data: Vec::new(),
+                },
+            );
+            assert_eq!(
+                execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    zero.clone(),
+                    execution,
+                )
+                .await
+                .unwrap(),
+                FilesystemResult::Written(0)
+            );
+            assert_eq!(
+                execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    zero,
+                    execution,
+                )
+                .await
+                .unwrap(),
+                FilesystemResult::Written(0)
+            );
+            let mismatched = FilesystemRequest::new(
+                environment.context(),
+                FilesystemOperation::Write {
+                    open: created.open,
+                    offset: 9,
+                    data: b"x".to_vec(),
+                },
+            );
+            assert!(matches!(
+                execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    mismatched,
+                    execution,
+                )
+                .await,
+                Err(MutationOperationError::Internal)
+            ));
+        });
+    }
+
+    #[test]
+    fn replanning_rejects_a_grant_different_from_the_fingerprint() {
+        block_on(async {
+            let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let created = environment.create_file("policy-race", 160).await;
+            let first = environment.policy.0.clone();
+            let second = ExportGrant::new(
+                first.filesystem_id(),
+                first.root_inode_id(),
+                first.principal().clone(),
+                first.primary_group().clone(),
+                first.supplementary_groups().to_vec(),
+                first.numeric_uid() + 1,
+                first.numeric_gid(),
+                first.privileged(),
+                first.read_only(),
+                first.policy_generation(),
+                first.capability_ceiling(),
+                environment.engine_limits,
+            )
+            .unwrap();
+            let policy = ChangingPolicy {
+                first,
+                second,
+                calls: Arc::new(AtomicUsize::new(0)),
+            };
+            environment.target.clear_trace().unwrap();
+            assert!(matches!(
+                execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    FilesystemRequest::new(
+                        environment.context(),
+                        FilesystemOperation::Write {
+                            open: created.open,
+                            offset: 0,
+                            data: b"blocked".to_vec(),
+                        },
+                    ),
+                    environment.execution(161),
+                )
+                .await,
+                Err(MutationOperationError::Client(error)) if error.errno == LinuxErrno::EAGAIN
+            ));
+            assert!(environment.target.trace().unwrap().is_empty());
         });
     }
 
@@ -942,15 +1075,72 @@ mod tests {
                 FilesystemResult::Written(3)
             );
 
+            let before_commit_request = FilesystemRequest::new(
+                environment.context(),
+                FilesystemOperation::Write {
+                    open: created.open,
+                    offset: 0,
+                    data: b"middle".to_vec(),
+                },
+            );
+            let before_commit_execution = environment.execution(702);
+            environment
+                .authority
+                .inject_commit_failure(CommitFailureTiming::BeforePublication)
+                .unwrap();
+            assert!(matches!(
+                execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    before_commit_request.clone(),
+                    before_commit_execution,
+                )
+                .await,
+                Err(MutationOperationError::State(_))
+            ));
+            assert_eq!(
+                execute_read(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    environment.engine_limits,
+                    environment.context(),
+                    environment.client,
+                    created.open,
+                    0,
+                    8,
+                )
+                .await
+                .unwrap(),
+                b"old"
+            );
+            assert_eq!(
+                execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    before_commit_request,
+                    before_commit_execution,
+                )
+                .await
+                .unwrap(),
+                FilesystemResult::Written(6)
+            );
+
             let second_request = FilesystemRequest::new(
                 environment.context(),
                 FilesystemOperation::Write {
                     open: created.open,
                     offset: 0,
-                    data: b"new".to_vec(),
+                    data: b"newest".to_vec(),
                 },
             );
-            let second_execution = environment.execution(702);
+            let second_execution = environment.execution(703);
             environment
                 .authority
                 .inject_commit_failure(CommitFailureTiming::AfterPublication)
@@ -967,7 +1157,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                FilesystemResult::Written(3)
+                FilesystemResult::Written(6)
             );
 
             let reopened_state = environment.authority.open_client();
@@ -991,7 +1181,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                FilesystemResult::Written(3)
+                FilesystemResult::Written(6)
             );
             assert!(environment.target.trace().unwrap().is_empty());
             assert_eq!(
@@ -1008,8 +1198,148 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-                b"new"
+                b"newest"
             );
+        });
+    }
+
+    #[test]
+    fn payload_and_manifest_response_failures_preserve_exact_recovery() {
+        use w9pt_fs_storage::{
+            FileContextScope, MutationId, TargetOperation, open_committed_context,
+            testing::FailureTiming,
+        };
+
+        block_on(async {
+            let payload_environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+            let payload_file = payload_environment
+                .create_file("payload-failure", 800)
+                .await;
+            payload_environment
+                .target
+                .inject_failure(TargetOperation::PutIfAbsent, FailureTiming::After)
+                .unwrap();
+            assert_eq!(
+                execute_write(
+                    &payload_environment.state,
+                    &payload_environment.repository,
+                    &payload_environment.policy,
+                    &payload_environment.identities,
+                    payload_environment.engine_limits,
+                    FilesystemRequest::new(
+                        payload_environment.context(),
+                        FilesystemOperation::Write {
+                            open: payload_file.open,
+                            offset: 0,
+                            data: b"payload".to_vec(),
+                        },
+                    ),
+                    payload_environment.execution(801),
+                )
+                .await
+                .unwrap(),
+                FilesystemResult::Written(7)
+            );
+
+            for (ordinal, timing) in [FailureTiming::Before, FailureTiming::After]
+                .into_iter()
+                .enumerate()
+            {
+                let environment = TestEnvironment::new(false, StorageMethod::Raw).await;
+                let created = environment
+                    .create_file("manifest-failure", 900 + ordinal as u128 * 10)
+                    .await;
+                let inode_id = inode_id_from_handle(created.object);
+                let read = ReadBatch::new(
+                    environment.filesystem_id,
+                    ReadConsistency::LatestLinearizable,
+                    vec![ReadQuery::InodeWithContentMetadata(inode_id)],
+                    environment.state_limits,
+                )
+                .unwrap();
+                let ReadOutcome::Snapshot(snapshot) = environment.state.read(read).await.unwrap()
+                else {
+                    panic!("content metadata unavailable")
+                };
+                let ReadResult::InodeWithContentMetadata {
+                    metadata: Some(metadata),
+                    ..
+                } = &snapshot.results()[0]
+                else {
+                    panic!("content metadata missing")
+                };
+                let context = open_committed_context(
+                    FileContextScope::new(
+                        *environment.filesystem_id.as_bytes(),
+                        *inode_id.as_bytes(),
+                        metadata.content_file_id(),
+                        metadata.context_id(),
+                    ),
+                    metadata.policy_format(),
+                    metadata.policy_bytes(),
+                    metadata.key_commitment().copied(),
+                    metadata.wrapped_key_bytes(),
+                    metadata.revision().get(),
+                    None,
+                )
+                .unwrap();
+                let mutation_value = 901 + ordinal as u128 * 10;
+                let mutation_id = MutationId::from_u128(mutation_value);
+                let prepared = environment
+                    .repository
+                    .prepare_write_from_new_with_context(&context, mutation_id, 0, 0, b"manifest")
+                    .await
+                    .unwrap();
+                let manifest = prepared.content().manifest_key().clone();
+                assert!(environment.target.remove(&manifest).unwrap());
+                environment
+                    .target
+                    .inject_failure_for(TargetOperation::PutIfAbsent, timing, manifest)
+                    .unwrap();
+                let request = FilesystemRequest::new(
+                    environment.context(),
+                    FilesystemOperation::Write {
+                        open: created.open,
+                        offset: 0,
+                        data: b"manifest".to_vec(),
+                    },
+                );
+                let execution = environment.execution(mutation_value);
+                let result = execute_write(
+                    &environment.state,
+                    &environment.repository,
+                    &environment.policy,
+                    &environment.identities,
+                    environment.engine_limits,
+                    request.clone(),
+                    execution,
+                )
+                .await;
+                if timing == FailureTiming::Before {
+                    assert!(matches!(
+                        result,
+                        Err(MutationOperationError::Target(
+                            w9pt_fs_storage::StorageError::Target(_)
+                        ))
+                    ));
+                    assert_eq!(
+                        execute_write(
+                            &environment.state,
+                            &environment.repository,
+                            &environment.policy,
+                            &environment.identities,
+                            environment.engine_limits,
+                            request,
+                            execution,
+                        )
+                        .await
+                        .unwrap(),
+                        FilesystemResult::Written(8)
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), FilesystemResult::Written(8));
+                }
+            }
         });
     }
 }
