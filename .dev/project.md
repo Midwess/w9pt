@@ -152,7 +152,39 @@ Research notes under `.dev/research/` are exploratory evidence, not product requ
 - Mutation replay checks the durable result ledger before adapter-limit/current-fence validation and uses the finalized mutation ID, fingerprint, client incarnation, and retention identity to return the exact recorded result.
 - Writer topology is explicit: future PostgreSQL-style adapters may support serializable multi-writer commits, while SQLite- or SlateDB-style adapters may use one fenced writer without weakening atomicity or durability semantics.
 - Clocks, IDs, runtimes, clients, and adapter schemas remain explicit caller/adapter dependencies. No SDK, executor, SQL schema, or target layout belongs in the contract crate.
-- The first implementation includes a deterministic memory authority and reusable conformance suite; the PostgreSQL adapter is implemented separately, while SQLite, etcd, SlateDB, the filesystem engine, and durable session state remain future proposals.
+- The first implementation includes a deterministic memory authority and reusable conformance suite; the PostgreSQL adapter and filesystem semantic engine are implemented separately, while SQLite, etcd, SlateDB, and durable session state remain future proposals.
+
+### Filesystem semantic engine (`add-filesystem-semantic-engine`, 2026-09-09)
+
+- `w9pt-fs` is the runtime-neutral semantic coordinator between `w9pt`,
+  `w9pt-fs-state`, and `w9pt-fs-storage`; it owns no transport, database driver,
+  target SDK, clock, random source, executor, or mutable object-store head.
+- Hosts pass owned filesystem effects with caller-supplied client/mutation
+  identity, frozen time, retention, and exact writer fence. Terminal outcomes
+  may complete the Session exactly once; unresolved state, target, policy,
+  identity, or commit-authority failures remain outside the client boundary.
+- The implemented slice covers walk, portable open/create/release, regular-file
+  read/write/append, readdir, getattr/setattr, readlink, fsync, mkdir, symlink,
+  link, unlinkat, and renameat. Reads use explicit no-atime behavior.
+- Mutations probe the durable ledger before allocation or upload, prepare
+  immutable dependencies before metadata publication, retry an ambiguous commit
+  unchanged, and fully reread/reauthorize/reprepare after a definitive conflict.
+- Stable object/open handles preserve full 128-bit identities. QID paths and
+  directory cookies are separately persisted, monotonically allocated, and
+  transferred explicitly during rename. Directory ancestry is authoritative and
+  bounded cycle checks are revision-preconditioned.
+- New regular files contain an explicit unpublished empty state plus an
+  authoritative plain content context. The first write/extension prepares from
+  `BaseContentIdentity::NEW_FILE`; later reads and mutations reopen the committed
+  context and publish only through the inode transaction.
+- Capabilities are derived from the complete implemented slice, export ceiling
+  and read-only policy, state contract, and target guarantees. Fid-based
+  rename/remove, mknod, statfs, xattrs, locks, cancellation, and session
+  migration remain unadvertised and return `EOPNOTSUPP` before semantic effects.
+- `w9pt::Session` remains connection-affine in memory. Committed filesystem
+  state and exact mutation results can be reopened by another engine instance,
+  but gateway/node loss still ends the stock 9P connection until durable
+  session inbox/outbox and reconnect work is implemented.
 
 ### PostgreSQL state adapter (`add-postgres-state-adapter`; SeaORM/public code-first revisions 2026-09-05)
 

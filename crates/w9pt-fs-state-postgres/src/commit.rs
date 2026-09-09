@@ -439,6 +439,22 @@ fn lock_keys(request: &CommitRequest) -> Vec<RecordKey> {
                 keys.insert(RecordKey::Filesystem(filesystem_id));
                 keys.insert(RecordKey::Inode(filesystem_id, *parent));
             }
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                destination,
+                ..
+            } => {
+                keys.insert(RecordKey::Filesystem(filesystem_id));
+                keys.insert(RecordKey::Inode(filesystem_id, *source_parent_inode_id));
+                keys.insert(RecordKey::Inode(
+                    filesystem_id,
+                    destination.parent_inode_id(),
+                ));
+                keys.insert(RecordKey::Inode(
+                    filesystem_id,
+                    destination.child_inode_id(),
+                ));
+            }
             _ => {}
         }
     }
@@ -643,6 +659,22 @@ fn validate_directory_transition(
                 Some(StateRecord::DirectoryEntry(entry)) => Some(entry),
                 _ => None,
             },
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                source_name,
+                ..
+            } => present(
+                records,
+                &RecordKey::DirectoryEntry(
+                    request.filesystem_id(),
+                    *source_parent_inode_id,
+                    source_name.clone(),
+                ),
+            )
+            .and_then(|record| match record {
+                StateRecord::DirectoryEntry(entry) => Some(entry),
+                _ => None,
+            }),
             _ => None,
         })
         .collect();
@@ -680,6 +712,25 @@ fn validate_directory_transition(
                     return Err(MalformedCommit::DirectoryCookieAllocation);
                 }
             }
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                source_name,
+                destination,
+            } => {
+                let source = RecordKey::DirectoryEntry(
+                    request.filesystem_id(),
+                    *source_parent_inode_id,
+                    source_name.clone(),
+                );
+                let Some(StateRecord::DirectoryEntry(current)) = present(records, &source) else {
+                    return Err(MalformedCommit::DirectoryCookieAllocation);
+                };
+                if current.cookie() != destination.cookie()
+                    || current.child_inode_id() != destination.child_inode_id()
+                {
+                    return Err(MalformedCommit::DirectoryCookieAllocation);
+                }
+            }
             StateChange::AdvanceDirectoryCookie { count } => {
                 declared = declared
                     .checked_add(count.get())
@@ -701,7 +752,7 @@ fn validate_monotonic_transition(
     if present(records, &RecordKey::Filesystem(request.filesystem_id())).is_none() {
         return Ok(());
     }
-    let namespace_parents: BTreeSet<_> = request
+    let mut namespace_parents: BTreeSet<_> = request
         .changes()
         .iter()
         .filter_map(|change| match change {
@@ -717,9 +768,18 @@ fn validate_monotonic_transition(
                 Some(StateRecord::DirectoryEntry(entry)) => Some(entry.parent_inode_id()),
                 _ => None,
             },
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                ..
+            } => Some(*source_parent_inode_id),
             _ => None,
         })
         .collect();
+    for change in request.changes() {
+        if let StateChange::MoveDirectoryEntry { destination, .. } = change {
+            namespace_parents.insert(destination.parent_inode_id());
+        }
+    }
     for parent in &namespace_parents {
         let advances = request.changes().iter().any(|change| match change {
             StateChange::BumpDirectoryGeneration(inode_id) => inode_id == parent,
@@ -806,6 +866,28 @@ fn directory_parent_transition_valid(
         return current.directory_parent() == replacement.directory_parent();
     };
     if old_parent == new_parent {
+        return true;
+    }
+    if request.changes().iter().any(|change| {
+        let StateChange::MoveDirectoryEntry {
+            source_parent_inode_id,
+            source_name,
+            destination,
+        } = change
+        else {
+            return false;
+        };
+        let source_key = RecordKey::DirectoryEntry(
+            request.filesystem_id(),
+            *source_parent_inode_id,
+            source_name.clone(),
+        );
+        matches!(present(records, &source_key), Some(StateRecord::DirectoryEntry(source))
+            if *source_parent_inode_id == old_parent
+                && destination.parent_inode_id() == new_parent
+                && destination.child_inode_id() == current.inode_id()
+                && destination.cookie() == source.cookie())
+    }) {
         return true;
     }
     let deleted = request.changes().iter().find_map(|change| {
@@ -1042,6 +1124,56 @@ async fn apply_change(
                 key,
             );
         }
+        StateChange::MoveDirectoryEntry {
+            source_parent_inode_id,
+            source_name,
+            destination,
+        } => {
+            let source_key = RecordKey::DirectoryEntry(
+                request.filesystem_id(),
+                *source_parent_inode_id,
+                source_name.clone(),
+            );
+            let Some(StateRecord::DirectoryEntry(source)) = present(records, &source_key) else {
+                return Ok(Some(missing_conflict(request, source_key)));
+            };
+            if source.cookie() != destination.cookie()
+                || source.child_inode_id() != destination.child_inode_id()
+            {
+                return Ok(Some(CommitOutcome::MalformedRequest(
+                    MalformedCommit::DirectoryCookieAllocation,
+                )));
+            }
+            let deleted = delete_record(transaction, &source_key)
+                .await
+                .map_err(CommitAttemptError::State)?;
+            if deleted == RowPresence::Absent {
+                return Ok(Some(missing_conflict(request, source_key)));
+            }
+            let destination_key = RecordKey::DirectoryEntry(
+                request.filesystem_id(),
+                destination.parent_inode_id(),
+                destination.name().clone(),
+            );
+            if present(records, &destination_key).is_some() {
+                let deleted = delete_record(transaction, &destination_key)
+                    .await
+                    .map_err(CommitAttemptError::State)?;
+                if deleted == RowPresence::Absent {
+                    return Ok(Some(missing_conflict(request, destination_key)));
+                }
+            }
+            let destination_record = StateRecord::DirectoryEntry(destination.clone());
+            let inserted =
+                insert_record(transaction, &destination_key, &destination_record, revision)
+                    .await
+                    .map_err(CommitAttemptError::State)?;
+            if inserted == RowPresence::Absent {
+                return Ok(Some(missing_conflict(request, destination_key)));
+            }
+            return Ok(None);
+        }
+        StateChange::RetainResult => return Ok(None),
         StateChange::AdvanceDirectoryCookie { count } => {
             let current = match present(records, &key) {
                 Some(StateRecord::Filesystem(record)) => record.next_directory_cookie(),
@@ -1931,6 +2063,15 @@ fn targeted_inode_ids(
                 }
                 collect_key_inode(key, &mut inodes);
             }
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                destination,
+                ..
+            } => {
+                inodes.insert(*source_parent_inode_id);
+                inodes.insert(destination.parent_inode_id());
+                inodes.insert(destination.child_inode_id());
+            }
             StateChange::BumpInodeGeneration(inode_id)
             | StateChange::BumpDirectoryGeneration(inode_id)
             | StateChange::AdjustLinkCount { inode_id, .. }
@@ -1949,7 +2090,8 @@ fn targeted_inode_ids(
             }
             StateChange::AdvanceDirectoryCookie { .. }
             | StateChange::AdvanceQidPath { .. }
-            | StateChange::BumpFilesystemPolicyGeneration => {}
+            | StateChange::BumpFilesystemPolicyGeneration
+            | StateChange::RetainResult => {}
         }
     }
     inodes
@@ -2203,6 +2345,14 @@ fn estimate_transaction_bytes(request: &CommitRequest) -> Option<usize> {
                 .checked_add(estimate_key(key)?)?
                 .checked_add(estimate_record(record)?)?,
             StateChange::Delete(key) => 64usize.checked_add(estimate_key(key)?)?,
+            StateChange::MoveDirectoryEntry {
+                source_name,
+                destination,
+                ..
+            } => 192usize
+                .checked_add(source_name.as_bytes().len())?
+                .checked_add(destination.name().as_bytes().len())?,
+            StateChange::RetainResult => 0,
             StateChange::PublishContent(publication) => {
                 let mut retained = 512usize
                     .checked_add(publication.prepared.content().manifest_key().as_str().len())?;

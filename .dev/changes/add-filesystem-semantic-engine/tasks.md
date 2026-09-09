@@ -1,6 +1,6 @@
 # Tasks: Add Filesystem Semantic Engine
 
-## Progress: [28/58]
+## Progress: [58/58]
 
 PostgreSQL development policy: schemas have no backward-compatibility guarantee.
 Checksum drift fails closed; operators reset development databases explicitly,
@@ -51,45 +51,55 @@ and migration/open never detect, import, upgrade, or perform that reset.
 
 ### 6. Walk and read-only semantics
 
-- [ ] 6.1 Implement export-root resolution and a helper that returns the stable root handle/QID plus the engine-derived capability set for an authenticated attach policy.
-- [ ] 6.2 Implement `Walk` for ordinary components, `.`, `..`, root confinement, non-empty partial success, directory/search checks, and bounded depth/name handling.
-- [ ] 6.3 Implement `Getattr` conversion for inode kind, permissions, caller-owned numeric identity mapping, size, link count, timestamps, generations, allocation estimates, and requested masks.
-- [ ] 6.4 Implement `Readlink` with kind, permission, target-length, UTF-8/wire, and configured result bounds.
-- [ ] 6.5 Implement `ReadDir` from persistent cookies and one-revision bounded pages, returning only complete entries whose semantic encoding fits the requested count.
+- [x] 6.1 Implement export-root resolution and a helper that returns the stable root handle/QID plus the engine-derived capability set for an authenticated attach policy.
+- [x] 6.2 Implement `Walk` for ordinary components, `.`, `..`, root confinement, non-empty partial success, directory/search checks, and bounded depth/name handling.
+- [x] 6.3 Implement `Getattr` conversion for inode kind, permissions, caller-owned numeric identity mapping, size, link count, timestamps, generations, allocation estimates, and requested masks.
+- [x] 6.4 Implement `Readlink` with kind, permission, target-length, UTF-8/wire, and configured result bounds.
+- [x] 6.5 Implement `ReadDir` from persistent cookies and one-revision bounded pages, returning only complete entries whose semantic encoding fits the requested count.
 
 ### 7. Open, create, and lifetime semantics
 
-- [ ] 7.1 Implement open-flag validation and conversion to portable access/append/directory state, rejecting unsupported combinations before mutation.
-- [ ] 7.2 Implement `Open` with permission revalidation, deterministic `OpenId`, atomic open/pin insertion, retained exact result, and replay.
-- [ ] 7.3 Implement `Create` as one atomic empty-inode/dentry/open/pin/QID/cookie/parent/result mutation with exclusive/truncate/read-only/setgid rules.
-- [ ] 7.4 Implement `O_TRUNC` on existing regular files through immutable preparation and one commit containing the open/pin plus content/timestamp/generation publication.
-- [ ] 7.5 Implement `Release` with open ownership validation, pin removal, orphan-count adjustment, last-pin orphan/inode retirement, replay safety, and no synchronous content deletion.
+- [x] 7.1 Implement open-flag validation and conversion to portable access/append/directory state, rejecting unsupported combinations before mutation.
+- [x] 7.2 Implement `Open` with permission revalidation, deterministic `OpenId`, atomic open/pin insertion, retained exact result, and replay.
+- [x] 7.3 Implement `Create` as one atomic empty-inode/dentry/open/pin/QID/cookie/parent/result mutation with exclusive/truncate/read-only/setgid rules.
+- [x] 7.4 Implement `O_TRUNC` on existing regular files through immutable preparation and one commit containing the open/pin plus content/timestamp/generation publication.
+- [x] 7.5 Implement `Release` with open ownership validation, pin removal, orphan-count adjustment, last-pin orphan/inode retirement, replay safety, and no synchronous content deletion.
 
 ### 8. Regular-file data, attributes, and durability
 
-- [ ] 8.1 Implement explicit no-atime `Read` through portable open resolution and one immutable `ContentRef`, including unpublished-empty EOF, exact positioned range behavior, and corruption-to-`EIO` mapping without publication.
-- [ ] 8.2 Implement positioned `Write` for published and new-file bases with access checks, checked counts, immutable preparation, atomic inode publication, and exact written-count replay.
-- [ ] 8.3 Implement append by choosing authoritative EOF, then recomputing EOF and repreparing after every content-base conflict without lost or overlapping acknowledgments.
-- [ ] 8.4 Implement `Setattr` for every selected non-size field with ownership/privilege checks and one atomic inode transition.
-- [ ] 8.5 Implement size-changing `Setattr` through prepared truncate plus the content-and-selected-attributes transition, including sparse initial extension, shrink, timestamp rules, and conflict retry.
-- [ ] 8.6 Implement data-only/full `Fsync` with open validation, content verification, target/state durability checks, and capability-safe rejection when the requested guarantee is unavailable.
+- [x] 8.1 Implement explicit no-atime `Read` through portable open resolution and one immutable `ContentRef`, including unpublished-empty EOF, exact positioned range behavior, and corruption-to-`EIO` mapping without publication.
+- [x] 8.2 Implement positioned `Write` for published and new-file bases with access checks, checked counts, immutable preparation, atomic inode publication, and exact written-count replay.
+- [x] 8.3 Implement append by choosing authoritative EOF, then recomputing EOF and repreparing after every content-base conflict without lost or overlapping acknowledgments.
+- [x] 8.4 Implement `Setattr` for every selected non-size field with ownership/privilege checks and one atomic inode transition.
+- [x] 8.5 Implement size-changing `Setattr` through prepared truncate plus the content-and-selected-attributes transition, including sparse initial extension, shrink, timestamp rules, and conflict retry.
+- [x] 8.6 Implement data-only/full `Fsync` with open validation, content verification, target/state durability checks, and capability-safe rejection when the requested guarantee is unavailable.
 
 ### 9. Directory and namespace mutations
 
-- [ ] 9.1 Implement `Mkdir` with deterministic inode/QID/cookie allocation, parent identity, setgid inheritance, permissions, parent generation/times, and one retained-result commit.
-- [ ] 9.2 Implement `Symlink` with bounded target, deterministic allocation, ownership/mode rules, parent updates, and exact replay.
-- [ ] 9.3 Implement `Link` with directory/cross-export rejection, destination absence, stable new cookie, link-count/timestamp updates, and atomic parent mutation.
-- [ ] 9.4 Implement `UnlinkAt` for files and directories with flag/kind checks, directory emptiness, sticky policy, link count, authoritative open-pin count, orphan creation, or atomic retirement.
-- [ ] 9.5 Implement `RenameAt` for same/cross-directory moves, replacement rules, preserved source cookie, overwritten target links/orphans, moved-directory parent, generations, and timestamps.
-- [ ] 9.6 Implement bounded ancestor validation and concurrent cycle/parent-change conflict tests for directory rename.
+- [x] 9.1 Implement `Mkdir` with deterministic inode/QID/cookie allocation, parent identity, setgid inheritance, permissions, parent generation/times, and one retained-result commit.
+- [x] 9.2 Implement `Symlink` with bounded target, deterministic allocation, ownership/mode rules, parent updates, and exact replay.
+- [x] 9.3 Implement `Link` with directory/cross-export rejection, destination absence, stable new cookie, link-count/timestamp updates, and atomic parent mutation.
+- [x] 9.4 Implement `UnlinkAt` for files and directories with flag/kind checks, directory emptiness, sticky policy, link count, authoritative open-pin count, orphan creation, or atomic retirement.
+- [x] 9.5 Implement `RenameAt` for same/cross-directory moves, replacement rules, preserved source cookie, overwritten target links/orphans, moved-directory parent, generations, and timestamps.
+- [x] 9.6 Implement bounded ancestor validation and concurrent cycle/parent-change conflict tests for directory rename.
 
 ### 10. Capability honesty, integration, and completion
 
-- [ ] 10.1 Implement capability derivation as the intersection of completed engine operations, export policy, state-store guarantees/topology, target guarantees, and configured providers.
-- [ ] 10.2 Prove fid-based rename/remove, mknod, statfs, xattr, lock, cancellation, and migration capabilities are omitted, deferred operations return `EOPNOTSUPP` before state/target mutation, and reads preserve explicit no-atime behavior.
-- [ ] 10.3 Build a deterministic full-stack harness using real `w9pt::Session` frames/effects/completions, independent memory state clients, memory target, policy, identities, timestamps, and fences.
-- [ ] 10.4 Add raw/block-split byte-vector and namespace-model suites covering aligned/unaligned/sparse/EOF/overflow I/O, walk, QID/cookie stability, hard links, rename replacement, unlink, and open-unlinked lifetime.
-- [ ] 10.5 Add two-engine concurrency schedules for overlapping/disjoint writes, append, truncate, renameat, link/unlink, permissions, policy changes, stale fences, and bounded retry exhaustion.
-- [ ] 10.6 Inject failure before/after payload, manifest, metadata commit/result publication, completion handoff, and response enqueue; reopen without engine-local state and prove complete old/new visibility plus exact replay.
-- [ ] 10.7 Document host driving, writer authority, connection-affine session limits, error/diagnostic handling, capability selection, unsupported slices, and the required future S3/transport/session work in crate/root documentation.
-- [ ] 10.8 Run `cargo test --workspace --all-targets`, PostgreSQL feature/version conformance, rustfmt, Clippy with warnings denied, dependency/license checks, and update `.dev/project.md` with the finalized semantic-engine boundary.
+- [x] 10.1 Implement capability derivation as the intersection of completed engine operations, export policy, state-store guarantees/topology, target guarantees, and configured providers.
+- [x] 10.2 Prove fid-based rename/remove, mknod, statfs, xattr, lock, cancellation, and migration capabilities are omitted, deferred operations return `EOPNOTSUPP` before state/target mutation, and reads preserve explicit no-atime behavior.
+- [x] 10.3 Build a deterministic full-stack harness using real `w9pt::Session` frames/effects/completions, independent memory state clients, memory target, policy, identities, timestamps, and fences.
+- [x] 10.4 Add raw/block-split byte-vector and namespace-model suites covering aligned/unaligned/sparse/EOF/overflow I/O, walk, QID/cookie stability, hard links, rename replacement, unlink, and open-unlinked lifetime.
+- [x] 10.5 Add two-engine concurrency schedules for overlapping/disjoint writes, append, truncate, renameat, link/unlink, permissions, policy changes, stale fences, and bounded retry exhaustion.
+- [x] 10.6 Inject failure before/after payload, manifest, metadata commit/result publication, completion handoff, and response enqueue; reopen without engine-local state and prove complete old/new visibility plus exact replay.
+- [x] 10.7 Document host driving, writer authority, connection-affine session limits, error/diagnostic handling, capability selection, unsupported slices, and the required future S3/transport/session work in crate/root documentation.
+- [x] 10.8 Run `cargo test --workspace --all-targets`, PostgreSQL feature/version conformance, rustfmt, Clippy with warnings denied, dependency/license checks, and update `.dev/project.md` with the finalized semantic-engine boundary.
+
+### Notes
+
+- 2026-09-09: `cargo test --workspace --all-targets --all-features --locked`,
+  PostgreSQL all-feature conformance, rustfmt, Clippy with warnings denied, and
+  rustdoc with warnings denied passed.
+- License metadata and the exact `w9pt-fs` depth-one dependency boundary passed.
+  RustSec passed under the repository policy after the all-feature/all-target
+  reachability guard proved the locked `rkyv 0.7.46` and `rsa 0.9.10` advisory
+  packages unreachable; only the existing CI-enforced exceptions were used.

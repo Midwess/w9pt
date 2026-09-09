@@ -1260,10 +1260,20 @@ fn validate_directory_cookie_transition(
         .changes()
         .iter()
         .filter_map(|change| {
-            let StateChange::Delete(key) = change else {
-                return None;
+            let key = match change {
+                StateChange::Delete(key) => key.clone(),
+                StateChange::MoveDirectoryEntry {
+                    source_parent_inode_id,
+                    source_name,
+                    ..
+                } => RecordKey::DirectoryEntry(
+                    request.filesystem_id(),
+                    *source_parent_inode_id,
+                    source_name.clone(),
+                ),
+                _ => return None,
             };
-            match records.get(key) {
+            match records.get(&key) {
                 Some(StateRecord::DirectoryEntry(entry)) => Some(entry),
                 _ => None,
             }
@@ -1301,6 +1311,25 @@ fn validate_directory_cookie_transition(
                     continue;
                 };
                 if current.cookie() != replacement.cookie() {
+                    return Err(MalformedCommit::DirectoryCookieAllocation);
+                }
+            }
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                source_name,
+                destination,
+            } => {
+                let source = RecordKey::DirectoryEntry(
+                    request.filesystem_id(),
+                    *source_parent_inode_id,
+                    source_name.clone(),
+                );
+                let Some(StateRecord::DirectoryEntry(current)) = records.get(&source) else {
+                    return Err(MalformedCommit::DirectoryCookieAllocation);
+                };
+                if current.cookie() != destination.cookie()
+                    || current.child_inode_id() != destination.child_inode_id()
+                {
                     return Err(MalformedCommit::DirectoryCookieAllocation);
                 }
             }
@@ -1379,7 +1408,7 @@ fn validate_monotonic_transitions(
     if !records.contains_key(&RecordKey::Filesystem(request.filesystem_id())) {
         return Ok(());
     }
-    let namespace_parents: std::collections::BTreeSet<_> = request
+    let mut namespace_parents: std::collections::BTreeSet<_> = request
         .changes()
         .iter()
         .filter_map(|change| match change {
@@ -1395,9 +1424,18 @@ fn validate_monotonic_transitions(
                 record: StateRecord::DirectoryEntry(entry),
                 ..
             } => Some(entry.parent_inode_id()),
+            StateChange::MoveDirectoryEntry {
+                source_parent_inode_id,
+                ..
+            } => Some(*source_parent_inode_id),
             _ => None,
         })
         .collect();
+    for change in request.changes() {
+        if let StateChange::MoveDirectoryEntry { destination, .. } = change {
+            namespace_parents.insert(destination.parent_inode_id());
+        }
+    }
 
     for parent in &namespace_parents {
         let advances = request.changes().iter().any(|change| match change {
@@ -1486,6 +1524,28 @@ fn directory_parent_transition_valid(
         return current.directory_parent() == replacement.directory_parent();
     };
     if old_parent == new_parent {
+        return true;
+    }
+    if request.changes().iter().any(|change| {
+        let StateChange::MoveDirectoryEntry {
+            source_parent_inode_id,
+            source_name,
+            destination,
+        } = change
+        else {
+            return false;
+        };
+        let source_key = RecordKey::DirectoryEntry(
+            request.filesystem_id(),
+            *source_parent_inode_id,
+            source_name.clone(),
+        );
+        matches!(records.get(&source_key), Some(StateRecord::DirectoryEntry(source))
+            if *source_parent_inode_id == old_parent
+                && destination.parent_inode_id() == new_parent
+                && destination.child_inode_id() == current.inode_id()
+                && destination.cookie() == source.cookie())
+    }) {
         return true;
     }
     let deleted = request.changes().iter().find_map(|change| {
@@ -1645,6 +1705,40 @@ fn apply_change(
                 )));
             }
         }
+        StateChange::MoveDirectoryEntry {
+            source_parent_inode_id,
+            source_name,
+            destination,
+        } => {
+            let source = RecordKey::DirectoryEntry(
+                filesystem_id,
+                *source_parent_inode_id,
+                source_name.clone(),
+            );
+            let Some(StateRecord::DirectoryEntry(current)) = records.remove(&source) else {
+                return Err(ApplyFailure::Conflict(CommitConflictKind::RecordMissing(
+                    source,
+                )));
+            };
+            if current.cookie() != destination.cookie()
+                || current.child_inode_id() != destination.child_inode_id()
+            {
+                return Err(ApplyFailure::Malformed(
+                    MalformedCommit::DirectoryCookieAllocation,
+                ));
+            }
+            let destination_key = RecordKey::DirectoryEntry(
+                filesystem_id,
+                destination.parent_inode_id(),
+                destination.name().clone(),
+            );
+            records.remove(&destination_key);
+            records.insert(
+                destination_key,
+                StateRecord::DirectoryEntry(destination.clone()).with_revision(revision),
+            );
+        }
+        StateChange::RetainResult => {}
         StateChange::AdvanceDirectoryCookie { count } => {
             mutate_record(records, &key, revision, |record| match record {
                 StateRecord::Filesystem(record) => record.advance_directory_cookie(*count),

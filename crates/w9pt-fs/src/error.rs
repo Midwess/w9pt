@@ -6,6 +6,33 @@ use w9pt::{FilesystemError, LinuxErrno};
 
 use crate::{AuthorizationError, HandleResolutionError, LedgerProbeError, MutationRunnerError};
 
+/// Caller-owned policy or deterministic identity provider failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EngineProviderFailure<P, I> {
+    /// Export or numeric-identity policy failed.
+    Policy(P),
+    /// Deterministic identity allocation failed.
+    Identity(I),
+}
+
+impl<P: core::fmt::Display, I: core::fmt::Display> core::fmt::Display
+    for EngineProviderFailure<P, I>
+{
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Policy(error) => write!(formatter, "policy provider failed: {error}"),
+            Self::Identity(error) => write!(formatter, "identity provider failed: {error}"),
+        }
+    }
+}
+
+impl<P, I> std::error::Error for EngineProviderFailure<P, I>
+where
+    P: std::error::Error + 'static,
+    I: std::error::Error + 'static,
+{
+}
+
 /// Missing or contradictory caller-owned execution context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionContextError {

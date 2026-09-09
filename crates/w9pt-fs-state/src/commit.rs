@@ -429,6 +429,20 @@ pub enum StateChange {
     },
     /// Delete a semantically keyed record that must exist.
     Delete(RecordKey),
+    /// Move one directory entry to a new key while preserving its cookie and child identity.
+    ///
+    /// Any destination entry is replaced atomically. Namespace planners separately update the
+    /// overwritten inode's link/orphan state in the same commit.
+    MoveDirectoryEntry {
+        /// Existing source parent.
+        source_parent_inode_id: InodeId,
+        /// Existing source component.
+        source_name: crate::EntryName,
+        /// Complete destination entry carrying the source cookie and child.
+        destination: crate::DirectoryEntryRecord,
+    },
+    /// Retain only the exact mutation result after a fully validated semantic no-op.
+    RetainResult,
     /// Allocate a consecutive range of non-reused directory cookies.
     AdvanceDirectoryCookie {
         /// Number of cookies allocated from the pre-state high-water mark.
@@ -479,6 +493,16 @@ impl StateChange {
     pub fn primary_key(&self, filesystem_id: FilesystemId) -> RecordKey {
         match self {
             Self::Insert { key, .. } | Self::Replace { key, .. } | Self::Delete(key) => key.clone(),
+            Self::MoveDirectoryEntry {
+                source_parent_inode_id,
+                source_name,
+                ..
+            } => RecordKey::DirectoryEntry(
+                filesystem_id,
+                *source_parent_inode_id,
+                source_name.clone(),
+            ),
+            Self::RetainResult => RecordKey::Filesystem(filesystem_id),
             Self::AdvanceDirectoryCookie { .. }
             | Self::AdvanceQidPath { .. }
             | Self::BumpFilesystemPolicyGeneration => RecordKey::Filesystem(filesystem_id),
@@ -506,6 +530,23 @@ impl StateChange {
     /// Returns every semantic record key changed by this operation.
     pub fn affected_keys(&self, filesystem_id: FilesystemId) -> Vec<RecordKey> {
         match self {
+            Self::MoveDirectoryEntry {
+                source_parent_inode_id,
+                source_name,
+                destination,
+            } => vec![
+                RecordKey::DirectoryEntry(
+                    filesystem_id,
+                    *source_parent_inode_id,
+                    source_name.clone(),
+                ),
+                RecordKey::DirectoryEntry(
+                    filesystem_id,
+                    destination.parent_inode_id(),
+                    destination.name().clone(),
+                ),
+            ],
+            Self::RetainResult => Vec::new(),
             Self::PublishXattrStaging(publication) => vec![
                 RecordKey::XattrStaging(filesystem_id, publication.staging_id),
                 RecordKey::Xattr(
@@ -732,6 +773,32 @@ impl CommitRequest {
                 StateChange::Delete(key) if key.family() == RecordFamily::ContentMetadata => {
                     return Err(MalformedCommit::ProtectedContentMetadata(key.clone()));
                 }
+                StateChange::MoveDirectoryEntry {
+                    source_parent_inode_id,
+                    source_name,
+                    destination,
+                } => {
+                    let source = RecordKey::DirectoryEntry(
+                        self.filesystem_id,
+                        *source_parent_inode_id,
+                        source_name.clone(),
+                    );
+                    let destination_key = RecordKey::DirectoryEntry(
+                        self.filesystem_id,
+                        destination.parent_inode_id(),
+                        destination.name().clone(),
+                    );
+                    StateRecord::DirectoryEntry(destination.clone())
+                        .validate_key(&destination_key)
+                        .map_err(MalformedCommit::InvalidRecord)?;
+                    source
+                        .validate_against_limits(limits)
+                        .map_err(MalformedCommit::Limit)?;
+                    destination_key
+                        .validate_against_limits(limits)
+                        .map_err(MalformedCommit::Limit)?;
+                }
+                StateChange::RetainResult => {}
                 StateChange::PublishContent(publication) => {
                     validate_publish_shape(publication, &self.mutation, limits)
                         .map_err(MalformedCommit::InvalidPublication)?;
@@ -930,6 +997,14 @@ fn estimate_change(change: &StateChange) -> Option<usize> {
             .checked_add(key.retained_bytes()?)?
             .checked_add(record.retained_bytes()?),
         StateChange::Delete(key) => 64usize.checked_add(key.retained_bytes()?),
+        StateChange::MoveDirectoryEntry {
+            source_name,
+            destination,
+            ..
+        } => 192usize
+            .checked_add(source_name.as_bytes().len())?
+            .checked_add(destination.name().as_bytes().len()),
+        StateChange::RetainResult => Some(0),
         StateChange::PublishContent(publication) => {
             let mut bytes = 512usize
                 .checked_add(publication.prepared.content().manifest_key().as_str().len())?;

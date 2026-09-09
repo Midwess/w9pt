@@ -2,7 +2,7 @@
 
 An embeddable 9P filesystem framework for pluggable storage backends.
 
-`w9pt` translates stock `9P2000.L` requests into owned, backend-neutral filesystem and policy effects. `w9pt-fs-storage` prepares immutable file content for caller-provided object stores, and `w9pt-fs-state` defines the authoritative metadata, transaction, mutation-replay, lease, fencing, and cache-invalidation contract that publishes those references with inode and namespace state.
+`w9pt` translates stock `9P2000.L` requests into owned, backend-neutral filesystem and policy effects. `w9pt-fs` executes those effects as checked filesystem semantics, `w9pt-fs-storage` prepares immutable file content for caller-provided object stores, and `w9pt-fs-state` defines the authoritative metadata, transaction, mutation-replay, lease, fencing, and cache-invalidation contract that publishes those references with inode and namespace state.
 
 ## Status
 
@@ -13,7 +13,7 @@ An embeddable 9P filesystem framework for pluggable storage backends.
 > aliases, readers, or migration paths. Rebuild dependents and recreate
 > development databases/object prefixes after an incompatible change.
 
-The Sans-I/O core implements framing, negotiation, the declared base/Linux operation matrix, tags, fids, out-of-order completions, cancellation, explicit shutdown, capabilities, and stable Linux errno replies. The storage crate implements bounded `raw` and sparse 32 KiB `block-split` content layouts over a runtime-neutral target contract. `w9pt-fs-storage-s3` implements that target contract for caller-configured Amazon S3 general-purpose buckets. The state crate provides checked portable records, bounded consistent reads, declarative serializable commits, deterministic memory authority, and reusable adapter conformance. `w9pt-fs-state-postgres` implements that contract on PostgreSQL 15–18. Transport, filesystem semantic-engine integration, durable session state, and production SQLite/etcd/SlateDB adapters remain future work.
+The Sans-I/O core implements framing, negotiation, the declared base/Linux operation matrix, tags, fids, out-of-order completions, cancellation, explicit shutdown, capabilities, and stable Linux errno replies. The semantic engine implements the complete regular-file, directory, symlink, open, namespace, attribute, and durability slice described below. The storage crate implements bounded `raw` and sparse 32 KiB `block-split` content layouts over a runtime-neutral target contract. `w9pt-fs-storage-s3` implements that target contract for caller-configured Amazon S3 general-purpose buckets. The state crate provides checked portable records, bounded consistent reads, declarative serializable commits, deterministic memory authority, and reusable adapter conformance. `w9pt-fs-state-postgres` implements that contract on PostgreSQL 15–18. Production host/transport integration, durable session state, and production SQLite/etcd/SlateDB adapters remain future work.
 
 ## Goals
 
@@ -43,15 +43,18 @@ embedding application
                   ▼
           w9pt Sans-I/O core crate
        9P codec + session state machine
-       filesystem semantics + typed effects
-                  │ effects/results
-          ┌───────┴──────────┐
-          ▼                  ▼
- transport adapters    backend adapters
- TCP/Unix/WebSocket    S3 first, then others
+                  │ filesystem effects
+                  ▼
+          w9pt-fs semantic engine
+             ┌────┴────┐
+             ▼         ▼
+      w9pt-fs-state  w9pt-fs-storage
+             │         │
+             ▼         ▼
+        PostgreSQL   S3/other target
 ```
 
-The core performs no I/O. It consumes input and completion events, then emits transport frames, storage requests, cancellation requests, and lifecycle events for the embedding application to execute.
+The protocol core and semantic engine perform no transport, runtime, database-driver, or target-SDK work. The host drives Session effects and engine futures over caller-owned state and target clients.
 
 The host application decides whether a session is driven synchronously, by Tokio or another executor, through WebSocket, or behind an OS filesystem adapter. `w9pt` does not require a particular executable architecture.
 

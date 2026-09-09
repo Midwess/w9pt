@@ -373,10 +373,11 @@ mod tests {
     use super::*;
     use w9pt::filesystem::OpenResult;
     use w9pt_fs_state::{
-        ClientIncarnationId, FencingToken, LeaseDeadline, LeaseId, ManualLeaseClock,
-        MutationResultKind, MutationRetention, RecordRevision, ResultFormatVersion, StateChange,
-        StateLimits, StateRevision, StateStoreOperation, WriterIncarnationId, WriterScopeId,
-        WriterTopology, testing::MemoryAuthority,
+        AcquireLeaseOutcome, AcquireWriterLease, ClientIncarnationId, FencingToken, LeaseDeadline,
+        LeaseDuration, LeaseId, LeaseOperationId, ManualLeaseClock, MutationResultKind,
+        MutationRetention, RecordRevision, ResultFormatVersion, StateChange, StateLimits,
+        StateRevision, StateStoreOperation, WriterIncarnationId, WriterScopeId, WriterTopology,
+        testing::{MemoryAuthority, MemoryTracePhase},
     };
     use w9pt_fs_storage::MutationId;
 
@@ -583,5 +584,63 @@ mod tests {
                 "planner mismatch reached the state commit boundary"
             );
         }
+    }
+
+    #[test]
+    fn definitive_conflict_stops_at_the_configured_bound() {
+        let filesystem_id = FilesystemId::from_u128(4);
+        let authority = MemoryAuthority::new(
+            WriterTopology::SerializableMultiWriter,
+            StateLimits::default(),
+            ManualLeaseClock::new(LeaseDeadline::new(0)),
+        );
+        let client = authority.open_client();
+        let acquire = AcquireWriterLease::new(
+            filesystem_id,
+            LeaseOperationId::from_u128(20),
+            WriterScopeId::from_u128(5),
+            WriterIncarnationId::from_u128(6),
+            LeaseId::from_u128(7),
+            LeaseDuration::new(100).unwrap(),
+            StateLimits::default(),
+        )
+        .unwrap();
+        let AcquireLeaseOutcome::Granted(grant) =
+            w9pt_fs_storage::testing::block_on(client.acquire_writer_lease(acquire)).unwrap()
+        else {
+            panic!("lease not granted")
+        };
+        let limits = EngineLimits::new(crate::EngineLimitValues {
+            max_conflict_retries: 0,
+            ..crate::EngineLimitValues::default()
+        })
+        .unwrap();
+        let mutation = context();
+        let request = planned_request(filesystem_id, mutation, grant.fence);
+        let outcome = w9pt_fs_storage::testing::block_on(run_mutation(
+            &client,
+            filesystem_id,
+            mutation,
+            grant.fence,
+            FilesystemResultKind::Released,
+            limits,
+            |_| core::future::ready(Ok::<_, core::convert::Infallible>(request.clone())),
+        ));
+        assert!(matches!(
+            outcome,
+            Err(MutationRunnerError::ConflictExhausted(_))
+        ));
+        assert_eq!(
+            authority
+                .trace()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event.operation == StateStoreOperation::Commit
+                        && event.phase == MemoryTracePhase::Started
+                })
+                .count(),
+            1
+        );
     }
 }
